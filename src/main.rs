@@ -2,9 +2,9 @@ use std::io::Write;
 
 // 从lib.rs导入所有需要的类型和常量
 use llm::{
-    Dataset, DatasetType, EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, MAX_SEQ_LEN,
-    OutputProjection, PerformanceMonitor, TransformerBlock, Vocab, load_model_binary,
-    save_model_binary, save_model_json,
+    Dataset, EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, MAX_SEQ_LEN, OutputProjection,
+    PerformanceMonitor, TransformerBlock, Vocab, load_model_binary, save_model_binary,
+    save_model_json,
 };
 
 // 🔥 导入训练性能优化模块
@@ -53,7 +53,6 @@ fn run_quick(
     let dataset = Dataset::new(
         String::from("data/pretraining_data.json"),
         String::from("data/chat_training_data.json"),
-        DatasetType::JSON,
     );
     perf_monitor.stop("加载训练数据");
 
@@ -324,7 +323,6 @@ fn train_new_model(perf_monitor: &mut PerformanceMonitor, freeze_attn: bool) -> 
     let dataset = Dataset::new(
         String::from("data/pretraining_data.json"),
         String::from("data/chat_training_data.json"),
-        DatasetType::JSON,
     );
     perf_monitor.stop("加载训练数据");
 
@@ -489,7 +487,6 @@ fn continue_training_loaded_model(
     let dataset = Dataset::new(
         String::from("data/pretraining_data.json"),
         String::from("data/chat_training_data.json"),
-        DatasetType::JSON,
     );
     perf_monitor.stop("加载训练数据");
 

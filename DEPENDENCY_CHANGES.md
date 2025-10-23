@@ -29,11 +29,7 @@
 
 ## 可选依赖
 
-### `csv` (默认禁用)
-- **原因**: 项目只使用 JSON 格式
-- **变更**: 
-  - 添加 `#[cfg(feature = "csv-support")]` 条件编译
-  - 可通过 `--features csv-support` 启用
+暂无。
 
 ## 性能影响
 
@@ -68,7 +64,7 @@
 - `src/feed_forward.rs`: 串行化操作，使用新的 `sample_normal`
 - `src/self_attention.rs`: 串行化操作，使用新的 `sample_normal`
 - `src/output_projection.rs`: 使用新的 `sample_normal`
-- `src/dataset_loader.rs`: 添加 CSV 条件编译
+- `src/dataset_loader.rs`: 数据加载逻辑统一为 JSON
 - `src/lib.rs`: 导出 `sample_normal`
 
 ### 测试状态

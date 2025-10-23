@@ -135,7 +135,7 @@
 以下测试因预存问题被跳过，与本次优化无关：
 - `test_dataset_new_json` - 需要训练数据文件
 - `test_json_save_and_load` - JSON 序列化的预存问题
-- `test_dataset_new_csv` - 需要 csv-support feature（已添加条件编译）
+
 
 ### 编译警告
 - `attention()` 函数未使用 - 保留用于向后兼容

@@ -57,7 +57,7 @@ pub mod vocab; // 词汇表：管理token和ID的映射关系 // 性能监控：
 // 重导出核心类型（简化外部使用）
 // ============================================================================
 
-pub use dataset_loader::{Dataset, DatasetType};
+pub use dataset_loader::Dataset;
 pub use embeddings::Embeddings;
 pub use llm::{LLM, Layer};
 pub use model_serialization::{

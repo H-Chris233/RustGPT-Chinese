@@ -6,10 +6,7 @@
 //! 3. 验证采样/beam search 缓冲区复用的分配次数下降
 //! 4. 记录峰值内存使用
 
-use llm::{
-    dataset_loader::{Dataset, DatasetType},
-    Embeddings, Layer, LLM, Vocab,
-};
+use llm::{Dataset, Embeddings, Layer, LLM, Vocab};
 use std::time::Instant;
 
 /// 统计内存分配信息（简化版本，通过多次运行对比时间）
@@ -36,7 +33,6 @@ fn bench_dataset_loading() -> BenchStats {
         let _dataset = Dataset::new(
             "data/pretraining_data.json".to_string(),
             "data/chat_training_data.json".to_string(),
-            DatasetType::JSON,
         );
         // Dataset 自动销毁
     }

@@ -5,8 +5,8 @@
 // 2. 加载并使用: cargo run --bin load_model
 
 use llm::{
-    Dataset, DatasetType, EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, OutputProjection,
-    TransformerBlock, Vocab, load_model_binary, save_model_binary,
+    Dataset, EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, OutputProjection, TransformerBlock, Vocab,
+    load_model_binary, save_model_binary,
 };
 use std::collections::HashSet;
 
@@ -70,7 +70,6 @@ fn train_and_save() -> Result<(), Box<dyn std::error::Error>> {
     let dataset = Dataset::new(
         String::from("data/pretraining_data.json"),
         String::from("data/chat_training_data.json"),
-        DatasetType::JSON,
     );
 
     // 2. 构建词汇表
@@ -219,7 +218,6 @@ fn continue_training() -> Result<(), Box<dyn std::error::Error>> {
     let dataset = Dataset::new(
         String::from("data/pretraining_data.json"),
         String::from("data/chat_training_data.json"),
-        DatasetType::JSON,
     );
 
     // 3. 继续训练
