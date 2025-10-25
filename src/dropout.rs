@@ -145,6 +145,14 @@ impl Layer for Dropout {
         "Dropout"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         if self.training && self.dropout_rate > 0.0 {
             let mask = self.create_mask(input.dim());

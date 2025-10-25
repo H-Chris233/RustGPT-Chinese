@@ -134,6 +134,14 @@ impl Layer for TransformerBlock {
         "TransformerBlock"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     /// **前向传播：Pre-LN Transformer 的数据流**
     ///
     /// # 算法步骤
