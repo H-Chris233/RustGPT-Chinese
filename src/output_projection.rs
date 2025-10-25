@@ -95,6 +95,14 @@ impl Layer for OutputProjection {
         "OutputProjection"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     /// **前向传播：将隐藏状态投影到词汇表空间**
     ///
     /// # 计算公式

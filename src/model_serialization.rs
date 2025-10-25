@@ -65,9 +65,17 @@ impl SerializableAdam {
             epsilon: 1e-8,
             timestep: adam.timestep,
             m_shape: adam.m.dim(),
-            m_data: adam.m.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+            m_data: adam
+                .m
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
             v_shape: adam.v.dim(),
-            v_data: adam.v.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+            v_data: adam
+                .v
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
         }
     }
 
@@ -233,7 +241,11 @@ impl SerializableLayer {
     fn serialize_embeddings(embeddings: &Embeddings) -> SerializableEmbeddings {
         SerializableEmbeddings {
             token_embeddings_shape: embeddings.token_embeddings.dim(),
-            token_embeddings_data: embeddings.token_embeddings.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+            token_embeddings_data: embeddings
+                .token_embeddings
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
             token_optimizer: SerializableAdam::from_adam(&embeddings.token_optimizer),
         }
     }
@@ -267,13 +279,29 @@ impl SerializableLayer {
                 num_heads: (*ptr).num_heads,
                 head_dim: (*ptr).head_dim,
                 w_q_shape: (*ptr).w_q.dim(),
-                w_q_data: (*ptr).w_q.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                w_q_data: (*ptr)
+                    .w_q
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 w_k_shape: (*ptr).w_k.dim(),
-                w_k_data: (*ptr).w_k.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                w_k_data: (*ptr)
+                    .w_k
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 w_v_shape: (*ptr).w_v.dim(),
-                w_v_data: (*ptr).w_v.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                w_v_data: (*ptr)
+                    .w_v
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 w_o_shape: (*ptr).w_o.dim(),
-                w_o_data: (*ptr).w_o.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                w_o_data: (*ptr)
+                    .w_o
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 optimizer_w_q: SerializableAdam::from_adam(&(*ptr).optimizer_w_q),
                 optimizer_w_k: SerializableAdam::from_adam(&(*ptr).optimizer_w_k),
                 optimizer_w_v: SerializableAdam::from_adam(&(*ptr).optimizer_w_v),
@@ -343,13 +371,29 @@ impl SerializableLayer {
 
             SerializableFeedForward {
                 w1_shape: (*ptr).w1.dim(),
-                w1_data: (*ptr).w1.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                w1_data: (*ptr)
+                    .w1
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 b1_shape: (*ptr).b1.dim(),
-                b1_data: (*ptr).b1.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                b1_data: (*ptr)
+                    .b1
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 w2_shape: (*ptr).w2.dim(),
-                w2_data: (*ptr).w2.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                w2_data: (*ptr)
+                    .w2
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 b2_shape: (*ptr).b2.dim(),
-                b2_data: (*ptr).b2.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                b2_data: (*ptr)
+                    .b2
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 optimizer_w1: SerializableAdam::from_adam(&(*ptr).optimizer_w1),
                 optimizer_b1: SerializableAdam::from_adam(&(*ptr).optimizer_b1),
                 optimizer_w2: SerializableAdam::from_adam(&(*ptr).optimizer_w2),
@@ -410,9 +454,17 @@ impl SerializableLayer {
             SerializableLayerNorm {
                 epsilon: (*ptr).epsilon,
                 gamma_shape: (*ptr).gamma.dim(),
-                gamma_data: (*ptr).gamma.iter().map(|&x| if x.is_finite() { x } else { 1.0 }).collect(),
+                gamma_data: (*ptr)
+                    .gamma
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 1.0 })
+                    .collect(),
                 beta_shape: (*ptr).beta.dim(),
-                beta_data: (*ptr).beta.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+                beta_data: (*ptr)
+                    .beta
+                    .iter()
+                    .map(|&x| if x.is_finite() { x } else { 0.0 })
+                    .collect(),
                 optimizer_gamma: SerializableAdam::from_adam(&(*ptr).optimizer_gamma),
                 optimizer_beta: SerializableAdam::from_adam(&(*ptr).optimizer_beta),
             }
@@ -460,9 +512,17 @@ impl SerializableLayer {
     fn serialize_output_projection(op: &OutputProjection) -> SerializableOutputProjection {
         SerializableOutputProjection {
             w_out_shape: op.w_out.dim(),
-            w_out_data: op.w_out.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+            w_out_data: op
+                .w_out
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
             b_out_shape: op.b_out.dim(),
-            b_out_data: op.b_out.iter().map(|&x| if x.is_finite() { x } else { 0.0 }).collect(),
+            b_out_data: op
+                .b_out
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
             optimizer: SerializableAdam::from_adam(&op.optimizer),
         }
     }

@@ -733,6 +733,14 @@ impl Layer for SelfAttention {
         "SelfAttention"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.cached_input = Some(input.clone());
         self.multi_head_attention(input)

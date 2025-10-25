@@ -38,6 +38,7 @@
 // ============================================================================
 
 pub mod adam; // Adam 优化器：带动量的自适应学习率优化算法
+pub mod batch_loader; // 批量数据加载器：数据分桶、PAD填充、注意力掩码
 pub mod checkpoint_manager; // 检查点管理器：保存和加载训练状态
 pub mod dataset_loader; // 数据加载器：处理预训练和对话数据
 pub mod dropout; // Dropout层：随机丢弃神经元，防止过拟合
@@ -60,6 +61,7 @@ pub mod vocab; // 词汇表：管理token和ID的映射关系 // 性能监控：
 // 重导出核心类型（简化外部使用）
 // ============================================================================
 
+pub use batch_loader::{Batch, BatchLoader, PAD_TOKEN_ID};
 pub use checkpoint_manager::{CheckpointManager, CheckpointMetadata, CheckpointStrategy};
 pub use dataset_loader::Dataset;
 pub use embeddings::Embeddings;

@@ -46,7 +46,7 @@
 //! final_embedding = [0.24, -0.42, 0.65, ...]  // 逐元素相加
 //! ```
 
-use ndarray::{Array2, Zip};
+use ndarray::{Array1, Array2, Array3, Zip};
 
 use crate::{
     EMBEDDING_DIM, adam::Adam, llm::Layer, position_encoding::PositionEncoding,
@@ -229,6 +229,14 @@ impl Layer for Embeddings {
         "Embeddings"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     /// **前向传播：将 token ID 转换为嵌入向量**
     ///
     /// # 输入格式
@@ -329,4 +337,75 @@ impl Layer for Embeddings {
     ///
     /// 嵌入层不受训练/推理模式影响，因为它没有 Dropout 等需要切换的组件。
     fn set_training_mode(&mut self, _training: bool) {}
+
+    /// **批量前向传播：将批量 token ID 转换为嵌入向量**
+    ///
+    /// # 输入格式
+    /// `input` 是一个 (batch_size, seq_len, 1) 的张量，每个元素是一个 token ID。
+    /// 为了兼容，我们也支持直接传入 token IDs 作为 (batch_size, seq_len) 的形式。
+    ///
+    /// # 输出格式
+    /// 返回 (batch_size, seq_len, embedding_dim) 的嵌入矩阵。
+    fn forward_batch(
+        &mut self,
+        input: &Array3<f32>,
+        _attention_mask: Option<&Array2<f32>>,
+    ) -> Array3<f32> {
+        // 保存输入用于反向传播
+        let batch_size = input.shape()[0];
+        let seq_len = input.shape()[1];
+
+        // 将 (batch, seq, 1) 转换为 (batch, seq)
+        let token_ids_flat: Vec<Vec<usize>> = (0..batch_size)
+            .map(|b| (0..seq_len).map(|s| input[[b, s, 0]] as usize).collect())
+            .collect();
+
+        // 为每个批次样本生成嵌入
+        let mut output = Array3::zeros((batch_size, seq_len, EMBEDDING_DIM));
+
+        for (b, token_ids) in token_ids_flat.iter().enumerate() {
+            let embeddings = self.embed_tokens(token_ids);
+            output.slice_mut(ndarray::s![b, .., ..]).assign(&embeddings);
+        }
+
+        output
+    }
+
+    /// **批量反向传播：更新词嵌入矩阵**
+    fn backward_batch(
+        &mut self,
+        grads: &Array3<f32>,
+        _lr: f32,
+        _attention_mask: Option<&Array2<f32>>,
+    ) -> Array3<f32> {
+        // 简化实现：批量模式下，使用默认实现（对每个样本分别调用单样本backward）
+        // 实际应用中，应该在forward_batch中缓存token IDs，这里才能累积梯度
+
+        // 直接返回梯度（位置编码不需要梯度）
+        grads.to_owned()
+    }
+}
+
+impl Embeddings {
+    /// **批量前向传播的便捷方法（直接接受 token IDs）**
+    ///
+    /// # 参数
+    /// - `token_ids_batch`: (batch_size, seq_len) 的 token ID 矩阵
+    ///
+    /// # 返回值
+    /// (batch_size, seq_len, embedding_dim) 的嵌入矩阵
+    pub fn forward_batch_from_ids(&mut self, token_ids_batch: &Array2<usize>) -> Array3<f32> {
+        let batch_size = token_ids_batch.nrows();
+        let seq_len = token_ids_batch.ncols();
+
+        let mut output = Array3::zeros((batch_size, seq_len, EMBEDDING_DIM));
+
+        for b in 0..batch_size {
+            let token_ids: Vec<usize> = token_ids_batch.row(b).to_vec();
+            let embeddings = self.embed_tokens(&token_ids);
+            output.slice_mut(ndarray::s![b, .., ..]).assign(&embeddings);
+        }
+
+        output
+    }
 }

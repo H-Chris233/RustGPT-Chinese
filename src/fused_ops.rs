@@ -200,6 +200,14 @@ impl Layer for FusedLayerNormLinear {
         "FusedLayerNormLinear"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.forward(input)
     }
@@ -325,6 +333,14 @@ impl FusedGELULinear {
 impl Layer for FusedGELULinear {
     fn layer_type(&self) -> &str {
         "FusedGELULinear"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {

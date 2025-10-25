@@ -140,6 +140,14 @@ impl Layer for FeedForward {
         "FeedForward"
     }
 
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
     /// **反向传播：计算梯度并更新参数**
     ///
     /// # 反向传播推导
