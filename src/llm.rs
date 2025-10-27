@@ -1669,13 +1669,18 @@ impl LLM {
         }
 
         if !self.supports_incremental() {
-            return self.generate_tokens_full(
+            let mut tokens = self.generate_tokens_full(
                 trimmed_prompt,
                 generation_limit,
                 temperature,
                 top_p,
                 top_k,
             );
+            let eos_id = self.vocab.eos_token_id();
+            if !tokens.iter().any(|&token| token == eos_id) {
+                tokens.push(eos_id);
+            }
+            return tokens;
         }
 
         let mut perf_monitor = PerformanceMonitor::new();
@@ -1720,9 +1725,101 @@ impl LLM {
         generated_tokens
     }
 
+    fn beam_search_legacy(&mut self, text: &str, beam_width: usize, max_length: usize) -> String {
+        if beam_width == 0 {
+            return String::new();
+        }
+
+        let initial_tokens = self.tokenize(text);
+        if initial_tokens.is_empty() {
+            return String::new();
+        }
+
+        let mut current_beams = vec![(initial_tokens.clone(), 0.0f32)];
+
+        for _ in initial_tokens.len()..max_length {
+            self.beam_candidates_buffer.clear();
+
+            for (seq, log_prob) in &current_beams {
+                let input = match Array2::from_shape_vec(
+                    (1, seq.len()),
+                    seq.iter().map(|&x| x as f32).collect(),
+                ) {
+                    Ok(matrix) => matrix,
+                    Err(err) => {
+                        log::error!("构造输入张量失败: {}", err);
+                        continue;
+                    }
+                };
+
+                let mut input_tensor = input;
+                for layer in &mut self.network {
+                    input_tensor = layer.forward(&input_tensor);
+                }
+
+                let probs = softmax(&input_tensor);
+                let last_token_probs = probs.row(probs.nrows() - 1);
+
+                self.sampling_idx_buffer.clear();
+                self.sampling_idx_buffer.extend(
+                    last_token_probs
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, &prob)| (prob, idx)),
+                );
+
+                self.sampling_idx_buffer
+                    .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+
+                for i in 0..beam_width.min(self.sampling_idx_buffer.len()) {
+                    let (prob, token_id) = self.sampling_idx_buffer[i];
+                    if prob > 0.0 {
+                        let mut new_seq = seq.clone();
+                        new_seq.push(token_id);
+                        let new_log_prob = log_prob + prob.ln();
+                        self.beam_candidates_buffer.push((new_seq, new_log_prob));
+                    }
+                }
+            }
+
+            if self.beam_candidates_buffer.is_empty() {
+                break;
+            }
+
+            self.beam_candidates_buffer
+                .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+            current_beams = self
+                .beam_candidates_buffer
+                .iter()
+                .take(beam_width)
+                .cloned()
+                .collect();
+
+            if current_beams
+                .iter()
+                .any(|(seq, _)| seq.last() == Some(&self.vocab.eos_token_id()))
+            {
+                break;
+            }
+        }
+
+        if let Some((best_seq, _)) = current_beams
+            .iter()
+            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
+        {
+            self.tokens_to_text(best_seq)
+        } else {
+            String::new()
+        }
+    }
+
     /// Beam search implementation
     /// 使用推理会话与 KV 缓存避免重复计算
     fn beam_search(&mut self, text: &str, beam_width: usize, max_length: usize) -> String {
+        if !self.supports_incremental() {
+            return self.beam_search_legacy(text, beam_width, max_length);
+        }
+
         if beam_width == 0 {
             return String::new();
         }
