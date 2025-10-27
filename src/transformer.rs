@@ -127,6 +127,25 @@ impl TransformerBlock {
             norm2: LayerNorm::new(embedding_dim),
         }
     }
+
+    /// 推理路径：在 KV 缓存开启时使用增量前向传播
+    pub fn forward_inference(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        let norm1_out = self.norm1.normalize(input);
+        let attention_out = if self.attention.use_kv_cache {
+            self.attention.forward_with_kv_cache(&norm1_out)
+        } else {
+            self.attention.forward(&norm1_out)
+        };
+        let dropout1_out = self.dropout1.forward(&attention_out);
+
+        let x = input + &dropout1_out;
+
+        let norm2_out = self.norm2.normalize(&x);
+        let feed_forward_out = self.feed_forward.forward(&norm2_out);
+        let dropout2_out = self.dropout2.forward(&feed_forward_out);
+
+        &x + &dropout2_out
+    }
 }
 
 impl Layer for TransformerBlock {
