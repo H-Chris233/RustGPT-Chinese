@@ -1,6 +1,8 @@
 use std::cmp::Ordering;
+use std::collections::BinaryHeap;
+use std::time::Instant;
 
-use ndarray::{Array1, Array2, Array3, Axis};
+use ndarray::{Array1, Array2, Array3, ArrayView1, Axis};
 use rand::{rng, Rng};
 
 use crate::{
@@ -9,6 +11,151 @@ use crate::{
     utils::{log_softmax, softmax},
     Embeddings, PerformanceMonitor, Vocab, EMBEDDING_DIM, HIDDEN_DIM, MAX_SEQ_LEN, SOFTMAX_EPSILON,
 };
+
+#[derive(Clone)]
+struct ProbEntry {
+    prob: f32,
+    idx: usize,
+}
+
+impl PartialEq for ProbEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.idx == other.idx && self.prob.to_bits() == other.prob.to_bits()
+    }
+}
+
+impl Eq for ProbEntry {}
+
+impl PartialOrd for ProbEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ProbEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .prob
+            .total_cmp(&self.prob)
+            .then_with(|| self.idx.cmp(&other.idx))
+    }
+}
+
+#[derive(Clone)]
+struct SessionSnapshot {
+    processed_tokens: usize,
+    kv_caches: Vec<Option<(Array2<f32>, Array2<f32>)>>,
+}
+
+pub struct InferenceSession<'a> {
+    llm: &'a mut LLM,
+    processed_tokens: usize,
+    max_context_length: usize,
+    temperature: f32,
+    top_p: f32,
+    top_k: usize,
+    previous_training_mode: bool,
+    kv_cache_was_enabled: bool,
+}
+
+impl<'a> InferenceSession<'a> {
+    pub fn new(llm: &'a mut LLM, temperature: f32, top_p: f32, top_k: usize) -> Self {
+        let previous_training_mode = llm.training;
+        let kv_cache_was_enabled = llm.is_kv_cache_enabled();
+        let max_context_length = llm.max_context_length;
+
+        llm.set_training_mode(false);
+        llm.enable_kv_cache();
+        llm.clear_kv_cache();
+
+        Self {
+            llm,
+            processed_tokens: 0,
+            max_context_length,
+            temperature,
+            top_p,
+            top_k,
+            previous_training_mode,
+            kv_cache_was_enabled,
+        }
+    }
+
+    pub fn prime_tokens(&mut self, tokens: &[usize]) -> Option<Array2<f32>> {
+        if tokens.is_empty() {
+            return None;
+        }
+
+        self.llm.clear_kv_cache();
+        self.processed_tokens = 0;
+
+        let mut last_logits = None;
+        for &token in tokens {
+            last_logits = Some(self.advance_with_token(token));
+        }
+
+        last_logits
+    }
+
+    pub fn advance_with_token(&mut self, token_id: usize) -> Array2<f32> {
+        if self.processed_tokens >= self.max_context_length {
+            log::warn!(
+                "上下文长度超过阈值({}), 自动重置 KV 缓存",
+                self.max_context_length
+            );
+            self.llm.clear_kv_cache();
+            self.processed_tokens = 0;
+        }
+
+        let logits = self.llm.inference_step(token_id, self.processed_tokens);
+        self.processed_tokens += 1;
+        logits
+    }
+
+    pub fn sample_next_token(&mut self, logits: &Array2<f32>) -> usize {
+        let probs = softmax(logits);
+        let adjusted = LLM::apply_temperature(&probs, self.temperature);
+
+        let candidates = if self.top_k > 0 {
+            self.llm.top_k_sampling(&adjusted, self.top_k)
+        } else {
+            self.llm.top_p_sampling(&adjusted, self.top_p)
+        };
+
+        candidates.into_iter().next().unwrap_or(0)
+    }
+
+    pub fn snapshot(&mut self) -> SessionSnapshot {
+        SessionSnapshot {
+            processed_tokens: self.processed_tokens,
+            kv_caches: self.llm.capture_kv_cache(),
+        }
+    }
+
+    pub fn restore(&mut self, snapshot: &SessionSnapshot) {
+        self.processed_tokens = snapshot.processed_tokens;
+        self.llm.restore_kv_cache(&snapshot.kv_caches);
+    }
+
+    pub fn processed_tokens(&self) -> usize {
+        self.processed_tokens
+    }
+}
+
+impl<'a> Drop for InferenceSession<'a> {
+    fn drop(&mut self) {
+        if self.previous_training_mode {
+            self.llm.set_training_mode(true);
+        } else {
+            self.llm.set_training_mode(false);
+        }
+
+        if !self.kv_cache_was_enabled {
+            self.llm.disable_kv_cache();
+        }
+
+        self.llm.clear_kv_cache();
+    }
+}
 
 /// Layer trait - 支持单样本和批量处理
 ///
@@ -230,6 +377,114 @@ impl LLM {
 }
 
 impl LLM {
+    fn for_each_transformer_block_mut<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut TransformerBlock),
+    {
+        for layer in &mut self.network {
+            if let Some(block) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
+                f(block);
+            }
+        }
+    }
+
+    fn for_each_transformer_block<F>(&self, mut f: F)
+    where
+        F: FnMut(&TransformerBlock),
+    {
+        for layer in &self.network {
+            if let Some(block) = layer.as_any().downcast_ref::<TransformerBlock>() {
+                f(block);
+            }
+        }
+    }
+
+    fn is_kv_cache_enabled(&self) -> bool {
+        for layer in &self.network {
+            if let Some(block) = layer.as_any().downcast_ref::<TransformerBlock>() {
+                return block.attention.use_kv_cache;
+            }
+        }
+        false
+    }
+
+    fn capture_kv_cache(&self) -> Vec<Option<(Array2<f32>, Array2<f32>)>> {
+        let mut caches = Vec::new();
+        self.for_each_transformer_block(|block| {
+            caches.push(
+                block
+                    .attention
+                    .kv_cache
+                    .as_ref()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+        });
+        caches
+    }
+
+    fn restore_kv_cache(&mut self, caches: &[Option<(Array2<f32>, Array2<f32>)>]) {
+        let mut idx = 0usize;
+        self.for_each_transformer_block_mut(|block| {
+            if let Some(cache) = caches.get(idx) {
+                block.attention.kv_cache = cache.as_ref().map(|(k, v)| (k.clone(), v.clone()));
+            } else {
+                block.attention.kv_cache = None;
+            }
+            idx += 1;
+        });
+    }
+
+    fn inference_step(&mut self, token_id: usize, position: usize) -> Array2<f32> {
+        let embedding_output = {
+            let embeddings = self
+                .network
+                .first_mut()
+                .expect("网络至少包含嵌入层")
+                .as_any_mut()
+                .downcast_mut::<Embeddings>()
+                .expect("首层必须是 Embeddings");
+            embeddings.embed_tokens_with_offset(&[token_id], position)
+        };
+
+        let mut hidden = embedding_output;
+
+        for layer in self.network.iter_mut().skip(1) {
+            if let Some(block) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
+                hidden = block.forward_inference(&hidden);
+            } else {
+                hidden = layer.forward(&hidden);
+            }
+        }
+
+        hidden
+    }
+
+    fn select_top_k_from_row(&mut self, row: ArrayView1<'_, f32>, k: usize) -> Vec<(usize, f32)> {
+        self.sampling_idx_buffer.clear();
+        self.sampling_idx_buffer
+            .extend(row.iter().enumerate().map(|(idx, &prob)| (prob, idx)));
+
+        let top_k = k.min(self.sampling_idx_buffer.len());
+        if top_k == 0 {
+            return Vec::new();
+        }
+
+        let nth = top_k - 1;
+        self.sampling_idx_buffer
+            .select_nth_unstable_by(nth, |a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+
+        let top_slice = &mut self.sampling_idx_buffer[..top_k];
+        top_slice.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        top_slice.iter().map(|&(prob, idx)| (idx, prob)).collect()
+    }
+
+    fn supports_incremental(&self) -> bool {
+        self.network
+            .first()
+            .and_then(|layer| layer.as_any().downcast_ref::<Embeddings>())
+            .is_some()
+    }
+
     pub fn network_description(&self) -> String {
         self.network
             .iter()
@@ -273,7 +528,17 @@ impl LLM {
         top_p: f32,
         top_k: usize,
     ) -> String {
-        self.forward_with_sampling(text, temperature, top_p, top_k)
+        let prompt_tokens = self.tokenize(text);
+        let max_new_tokens = MAX_SEQ_LEN.saturating_sub(prompt_tokens.len());
+        let generated_tokens = self.generate_tokens_incremental(
+            &prompt_tokens,
+            max_new_tokens,
+            temperature,
+            top_p,
+            top_k,
+        );
+
+        self.tokens_to_text(&generated_tokens)
     }
 
     pub fn predict_with_context(
@@ -283,26 +548,32 @@ impl LLM {
         top_p: f32,
         top_k: usize,
     ) -> String {
-        // Tokenize the new input
         let new_tokens = self.tokenize(text);
 
-        // Combine context with new input
-        let mut all_tokens = self.context_window.clone();
-        all_tokens.extend_from_slice(&new_tokens);
+        let mut combined_tokens = self.context_window.clone();
+        combined_tokens.extend_from_slice(&new_tokens);
 
-        // Ensure we don't exceed the maximum sequence length
-        if all_tokens.len() > MAX_SEQ_LEN {
-            let start_idx = all_tokens.len() - MAX_SEQ_LEN;
-            all_tokens = all_tokens[start_idx..].to_vec();
+        if combined_tokens.len() > self.max_context_length {
+            let start_idx = combined_tokens.len() - self.max_context_length;
+            combined_tokens = combined_tokens[start_idx..].to_vec();
         }
 
-        let result = self.generate_with_context(&all_tokens, temperature, top_p, top_k);
+        let available = self
+            .max_context_length
+            .saturating_sub(combined_tokens.len());
+        let max_new_tokens = available.min(20);
+        let generated_tokens = self.generate_tokens_incremental(
+            &combined_tokens,
+            max_new_tokens,
+            temperature,
+            top_p,
+            top_k,
+        );
 
         self.add_to_context(&new_tokens);
-        let result_tokens = self.tokenize(&result);
-        self.add_to_context(&result_tokens);
+        self.add_to_context(&generated_tokens);
 
-        result
+        self.tokens_to_text(&generated_tokens)
     }
 
     pub fn predict_with_beam_search(
@@ -322,74 +593,17 @@ impl LLM {
         top_p: f32,
         top_k: usize,
     ) -> String {
-        let mut tokenized = self.tokenize(text);
-        let mut output_tokens: Vec<usize> = Vec::new();
+        let prompt_tokens = self.tokenize(text);
+        let max_new_tokens = MAX_SEQ_LEN.saturating_sub(prompt_tokens.len());
+        let generated_tokens = self.generate_tokens_incremental(
+            &prompt_tokens,
+            max_new_tokens,
+            temperature,
+            top_p,
+            top_k,
+        );
 
-        if tokenized.is_empty() {
-            return String::new();
-        }
-
-        let input_len = tokenized.len();
-
-        if input_len >= MAX_SEQ_LEN {
-            return String::new();
-        }
-
-        for _ in 0..(MAX_SEQ_LEN - input_len) {
-            let token_input = match Array2::from_shape_vec(
-                (1, tokenized.len()),
-                tokenized.iter().map(|&x| x as f32).collect(),
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!("构造输入张量失败: {}", e);
-                    break;
-                }
-            };
-            let mut input = token_input;
-
-            for layer in &mut self.network {
-                input = layer.forward(&input);
-            }
-
-            let logits = input;
-
-            if logits.shape()[0] == 0 {
-                break;
-            }
-
-            let last_logit = logits
-                .row(logits.shape()[0] - 1)
-                .to_owned()
-                .insert_axis(Axis(0));
-
-            let probs = softmax(&last_logit);
-
-            let adjusted_probs = Self::apply_temperature(&probs, temperature);
-
-            let tokens = if top_k > 0 {
-                self.top_k_sampling(&adjusted_probs, top_k)
-            } else {
-                self.top_p_sampling(&adjusted_probs, top_p)
-            };
-
-            let next_token = tokens[tokens.len() - 1];
-
-            output_tokens.push(next_token);
-            tokenized.push(next_token);
-
-            if next_token == self.vocab.encode("</s>").unwrap() {
-                break;
-            }
-        }
-
-        let token_strs = output_tokens
-            .iter()
-            .map(|t| self.vocab.decode[t].clone())
-            .collect::<Vec<String>>();
-
-        let raw_output = token_strs.join(" ");
-        self.post_process_chinese_text(&raw_output)
+        self.tokens_to_text(&generated_tokens)
     }
 
     #[allow(dead_code)]
@@ -1092,62 +1306,23 @@ impl LLM {
     /// KV缓存可以显著加速推理速度（10-100倍），但不能用于训练。
     /// 适用场景：交互式对话生成、逐token生成等
     pub fn enable_kv_cache(&mut self) {
-        for layer in &mut self.network {
-            // 只对SelfAttention层启用KV缓存
-            // TransformerBlock内部包含SelfAttention，需要特殊处理
-            // 这里我们通过layer_type判断
-            if layer.layer_type() == "TransformerBlock" {
-                // TransformerBlock需要向下传递enable命令
-                // 由于Layer trait没有enable_kv_cache方法，
-                // 我们需要在TransformerBlock中单独实现
-                // 暂时通过unsafe转换实现
-                unsafe {
-                    let ptr = layer.as_mut() as *mut dyn Layer
-                        as *mut crate::transformer::TransformerBlock;
-                    (*ptr).attention.enable_kv_cache();
-                }
-            }
-        }
+        self.for_each_transformer_block_mut(|block| block.attention.enable_kv_cache());
     }
 
     /// 禁用所有transformer层的KV缓存
     pub fn disable_kv_cache(&mut self) {
-        for layer in &mut self.network {
-            if layer.layer_type() == "TransformerBlock" {
-                unsafe {
-                    let ptr = layer.as_mut() as *mut dyn Layer
-                        as *mut crate::transformer::TransformerBlock;
-                    (*ptr).attention.disable_kv_cache();
-                }
-            }
-        }
+        self.for_each_transformer_block_mut(|block| block.attention.disable_kv_cache());
     }
 
     /// 清空所有transformer层的KV缓存（保持启用状态）
     pub fn clear_kv_cache(&mut self) {
-        for layer in &mut self.network {
-            if layer.layer_type() == "TransformerBlock" {
-                unsafe {
-                    let ptr = layer.as_mut() as *mut dyn Layer
-                        as *mut crate::transformer::TransformerBlock;
-                    (*ptr).attention.clear_kv_cache();
-                }
-            }
-        }
+        self.for_each_transformer_block_mut(|block| block.attention.clear_kv_cache());
     }
 
     /// 统一设置所有 TransformerBlock 的 SelfAttention 是否冻结参数更新
     /// 用于在不修改网络结构的前提下，快速排查训练不稳定问题
     pub fn set_attention_freeze_updates(&mut self, freeze: bool) {
-        for layer in &mut self.network {
-            if layer.layer_type() == "TransformerBlock" {
-                unsafe {
-                    let ptr = layer.as_mut() as *mut dyn Layer
-                        as *mut crate::transformer::TransformerBlock;
-                    (*ptr).attention.freeze_updates = freeze;
-                }
-            }
-        }
+        self.for_each_transformer_block_mut(|block| block.attention.freeze_updates = freeze);
     }
 
     /// Get current context as token IDs
@@ -1259,39 +1434,27 @@ impl LLM {
     /// Top-k sampling: only consider the k most probable tokens
     /// 优化版本：复用内部缓冲区减少分配
     fn top_k_sampling(&mut self, probs: &Array2<f32>, k: usize) -> Vec<usize> {
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(probs.nrows());
 
         for row in probs.rows() {
-            // 复用 sampling_idx_buffer
-            self.sampling_idx_buffer.clear();
-            self.sampling_idx_buffer
-                .extend(row.iter().enumerate().map(|(idx, &prob)| (prob, idx)));
+            let top_entries = self.select_top_k_from_row(row, k);
 
-            // Sort by probability in descending order and take top k
-            self.sampling_idx_buffer
-                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-            let top_k_len = k.min(self.sampling_idx_buffer.len());
-
-            // 复用 sampling_prob_buffer
             self.sampling_prob_buffer.clear();
             self.sampling_prob_buffer
                 .resize(self.vocab.words.len(), 0.0);
-            let mut sum = 0.0;
 
-            for i in 0..top_k_len {
-                let (prob, idx) = self.sampling_idx_buffer[i];
-                self.sampling_prob_buffer[idx] = prob;
-                sum += prob;
+            let mut sum = 0.0;
+            for (idx, prob) in &top_entries {
+                self.sampling_prob_buffer[*idx] = *prob;
+                sum += *prob;
             }
 
-            // Normalize the probabilities
             if sum > 0.0 {
-                for p in &mut self.sampling_prob_buffer {
-                    *p /= sum;
+                for value in &mut self.sampling_prob_buffer {
+                    *value /= sum;
                 }
             }
 
-            // Sample from the top-k distribution
             result.push(self.sample_from_probs(&self.sampling_prob_buffer));
         }
 
@@ -1300,52 +1463,63 @@ impl LLM {
 
     /// Top-p (nucleus) sampling: consider the smallest set of tokens whose cumulative probability
     /// exceeds p
-    /// 优化版本：复用内部缓冲区减少分配
+    /// 优化版本：使用部分排序避免全量排序
     fn top_p_sampling(&mut self, probs: &Array2<f32>, p: f32) -> Vec<usize> {
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(probs.nrows());
+        let target_p = p.clamp(SOFTMAX_EPSILON, 1.0);
 
         for row in probs.rows() {
-            // 复用 sampling_idx_buffer
-            self.sampling_idx_buffer.clear();
-            self.sampling_idx_buffer
-                .extend(row.iter().enumerate().map(|(idx, &prob)| (prob, idx)));
+            let mut heap = BinaryHeap::new();
+            let mut best_entry: Option<ProbEntry> = None;
 
-            self.sampling_idx_buffer
-                .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
-
-            // Find the smallest set of tokens whose cumulative probability exceeds p
-            let mut cumulative_prob = 0.0;
-            let mut selected_count = 0;
-
-            for &(prob, _) in &self.sampling_idx_buffer {
-                cumulative_prob += prob;
-                selected_count += 1;
-
-                if cumulative_prob >= p {
-                    break;
+            for (idx, &prob) in row.iter().enumerate() {
+                if prob.is_nan() {
+                    continue;
+                }
+                let entry = ProbEntry { prob, idx };
+                if best_entry.as_ref().map_or(true, |best| entry > *best) {
+                    best_entry = Some(entry.clone());
+                }
+                if prob > 0.0 {
+                    heap.push(entry);
                 }
             }
 
-            // 复用 sampling_prob_buffer
             self.sampling_prob_buffer.clear();
             self.sampling_prob_buffer
                 .resize(self.vocab.words.len(), 0.0);
-            let mut sum = 0.0;
 
-            for i in 0..selected_count {
-                let (prob, idx) = self.sampling_idx_buffer[i];
-                self.sampling_prob_buffer[idx] = prob;
-                sum += prob;
-            }
+            let mut cumulative = 0.0;
+            let mut selected_entries: Vec<ProbEntry> = Vec::new();
 
-            // Normalize the probabilities
-            if sum > 0.0 {
-                for p_val in &mut self.sampling_prob_buffer {
-                    *p_val /= sum;
+            while cumulative < target_p {
+                match heap.pop() {
+                    Some(entry) => {
+                        cumulative += entry.prob;
+                        selected_entries.push(entry);
+                    }
+                    None => break,
                 }
             }
 
-            // Sample from the selected distribution
+            if selected_entries.is_empty() {
+                if let Some(entry) = best_entry {
+                    selected_entries.push(entry);
+                }
+            }
+
+            let mut sum = 0.0;
+            for entry in &selected_entries {
+                self.sampling_prob_buffer[entry.idx] = entry.prob;
+                sum += entry.prob;
+            }
+
+            if sum > 0.0 {
+                for value in &mut self.sampling_prob_buffer {
+                    *value /= sum;
+                }
+            }
+
             result.push(self.sample_from_probs(&self.sampling_prob_buffer));
         }
 
@@ -1379,40 +1553,213 @@ impl LLM {
         probs.len() - 1
     }
 
-    /// Beam search implementation
-    /// 优化版本：复用candidates缓冲区减少分配
-    fn beam_search(&mut self, text: &str, beam_width: usize, max_length: usize) -> String {
-        // Tokenize the input text
+    fn generate_tokens_full(
+        &mut self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> Vec<usize> {
+        if prompt_tokens.is_empty() || max_new_tokens == 0 {
+            return Vec::new();
+        }
+
+        let mut perf_monitor = PerformanceMonitor::new();
+        perf_monitor.start("inference_generation");
+        let generation_start = Instant::now();
+
+        let mut tokenized = prompt_tokens.to_vec();
+        let mut output_tokens = Vec::with_capacity(max_new_tokens);
+        let eos_id = self.vocab.eos_token_id();
+
+        for _ in 0..max_new_tokens {
+            if tokenized.len() >= self.max_context_length {
+                break;
+            }
+
+            let input_vec: Vec<f32> = tokenized.iter().map(|&x| x as f32).collect();
+            let token_input = match Array2::from_shape_vec((1, tokenized.len()), input_vec) {
+                Ok(matrix) => matrix,
+                Err(err) => {
+                    log::error!("构造输入张量失败: {}", err);
+                    break;
+                }
+            };
+
+            let mut input = token_input;
+            for layer in &mut self.network {
+                input = layer.forward(&input);
+            }
+
+            if input.shape()[0] == 0 {
+                break;
+            }
+
+            let last_logit = input
+                .row(input.shape()[0] - 1)
+                .to_owned()
+                .insert_axis(Axis(0));
+
+            let probs = softmax(&last_logit);
+            let adjusted_probs = Self::apply_temperature(&probs, temperature);
+
+            let next_token = if top_k > 0 {
+                self.top_k_sampling(&adjusted_probs, top_k)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(0)
+            } else {
+                self.top_p_sampling(&adjusted_probs, top_p)
+                    .into_iter()
+                    .next()
+                    .unwrap_or(0)
+            };
+
+            output_tokens.push(next_token);
+            tokenized.push(next_token);
+
+            if next_token == eos_id {
+                break;
+            }
+        }
+
+        perf_monitor.stop("inference_generation");
+        let tokens_generated = output_tokens.len();
+        let elapsed = generation_start.elapsed().as_secs_f32();
+        if tokens_generated > 0 && elapsed > 0.0 {
+            println!(
+                "⚡ 推理吞吐量: {:.2} tokens/s ({} tokens)",
+                tokens_generated as f32 / elapsed,
+                tokens_generated
+            );
+        }
+
+        output_tokens
+    }
+
+    fn generate_tokens_incremental(
+        &mut self,
+        prompt_tokens: &[usize],
+        max_new_tokens: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> Vec<usize> {
+        if prompt_tokens.is_empty() || max_new_tokens == 0 {
+            return Vec::new();
+        }
+
+        let max_context = self.max_context_length;
+        let prompt_len = prompt_tokens.len();
+        let start_idx = prompt_len.saturating_sub(max_context);
+        let trimmed_prompt = &prompt_tokens[start_idx..];
+
+        if trimmed_prompt.is_empty() {
+            return Vec::new();
+        }
+
+        let max_allowed_by_context = max_context.saturating_sub(trimmed_prompt.len());
+        if max_allowed_by_context == 0 {
+            return Vec::new();
+        }
+        let generation_limit = max_new_tokens.min(max_allowed_by_context);
+        if generation_limit == 0 {
+            return Vec::new();
+        }
+
+        if !self.supports_incremental() {
+            let mut tokens = self.generate_tokens_full(
+                trimmed_prompt,
+                generation_limit,
+                temperature,
+                top_p,
+                top_k,
+            );
+            let eos_id = self.vocab.eos_token_id();
+            if !tokens.iter().any(|&token| token == eos_id) {
+                tokens.push(eos_id);
+            }
+            return tokens;
+        }
+
+        let mut perf_monitor = PerformanceMonitor::new();
+        perf_monitor.start("inference_generation");
+        let generation_start = Instant::now();
+
+        let eos_id = self.vocab.eos_token_id();
+        let mut session = InferenceSession::new(self, temperature, top_p, top_k);
+        let mut logits = match session.prime_tokens(trimmed_prompt) {
+            Some(logits) => logits,
+            None => {
+                perf_monitor.stop("inference_generation");
+                drop(session);
+                return Vec::new();
+            }
+        };
+
+        let mut generated_tokens = Vec::with_capacity(generation_limit);
+
+        for _ in 0..generation_limit {
+            let next_token = session.sample_next_token(&logits);
+            generated_tokens.push(next_token);
+
+            logits = session.advance_with_token(next_token);
+            if next_token == eos_id {
+                break;
+            }
+        }
+
+        perf_monitor.stop("inference_generation");
+
+        let tokens_generated = generated_tokens.len();
+        let elapsed = generation_start.elapsed().as_secs_f32();
+        if tokens_generated > 0 && elapsed > 0.0 {
+            println!(
+                "⚡ 推理吞吐量: {:.2} tokens/s ({} tokens)",
+                tokens_generated as f32 / elapsed,
+                tokens_generated
+            );
+        }
+
+        generated_tokens
+    }
+
+    fn beam_search_legacy(&mut self, text: &str, beam_width: usize, max_length: usize) -> String {
+        if beam_width == 0 {
+            return String::new();
+        }
+
         let initial_tokens = self.tokenize(text);
         if initial_tokens.is_empty() {
             return String::new();
         }
 
-        // Initialize beam with the initial sequence
-        let mut current_beams = vec![(initial_tokens.clone(), 0.0f32)]; // (sequence, log_probability)
+        let mut current_beams = vec![(initial_tokens.clone(), 0.0f32)];
 
         for _ in initial_tokens.len()..max_length {
-            // 复用 beam_candidates_buffer
             self.beam_candidates_buffer.clear();
 
             for (seq, log_prob) in &current_beams {
-                // Get model prediction for the current sequence
-                let input =
-                    Array2::from_shape_vec((1, seq.len()), seq.iter().map(|&x| x as f32).collect())
-                        .unwrap();
+                let input = match Array2::from_shape_vec(
+                    (1, seq.len()),
+                    seq.iter().map(|&x| x as f32).collect(),
+                ) {
+                    Ok(matrix) => matrix,
+                    Err(err) => {
+                        log::error!("构造输入张量失败: {}", err);
+                        continue;
+                    }
+                };
 
                 let mut input_tensor = input;
                 for layer in &mut self.network {
                     input_tensor = layer.forward(&input_tensor);
                 }
 
-                let logits = input_tensor;
-                let probs = softmax(&logits);
-
-                // Get the probabilities for the last token position
+                let probs = softmax(&input_tensor);
                 let last_token_probs = probs.row(probs.nrows() - 1);
 
-                // 复用 sampling_idx_buffer 获取 top-k candidates
                 self.sampling_idx_buffer.clear();
                 self.sampling_idx_buffer.extend(
                     last_token_probs
@@ -1424,20 +1771,21 @@ impl LLM {
                 self.sampling_idx_buffer
                     .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
 
-                // Add candidates with updated sequences and log probabilities
                 for i in 0..beam_width.min(self.sampling_idx_buffer.len()) {
                     let (prob, token_id) = self.sampling_idx_buffer[i];
                     if prob > 0.0 {
-                        // Only consider non-zero probability tokens
                         let mut new_seq = seq.clone();
                         new_seq.push(token_id);
-                        let new_log_prob = log_prob + prob.ln(); // Add log probabilities
+                        let new_log_prob = log_prob + prob.ln();
                         self.beam_candidates_buffer.push((new_seq, new_log_prob));
                     }
                 }
             }
 
-            // Sort candidates by log probability and keep the top beam_width
+            if self.beam_candidates_buffer.is_empty() {
+                break;
+            }
+
             self.beam_candidates_buffer
                 .sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
             current_beams = self
@@ -1447,113 +1795,196 @@ impl LLM {
                 .cloned()
                 .collect();
 
-            // Check if any beam has generated an end token
-            if current_beams.iter().any(|(seq, _)| {
-                if let Some(&last_token) = seq.last() {
-                    self.vocab.decode.get(&last_token) == Some(&"</s>".to_string())
-                } else {
-                    false
-                }
-            }) {
+            if current_beams
+                .iter()
+                .any(|(seq, _)| seq.last() == Some(&self.vocab.eos_token_id()))
+            {
                 break;
             }
         }
 
-        // Select the beam with the highest probability
         if let Some((best_seq, _)) = current_beams
             .iter()
             .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal))
         {
-            // Convert token IDs back to text
-            let token_strs = best_seq
-                .iter()
-                .map(|&t| self.vocab.decode[&t].clone())
-                .filter(|s| s != "</s>") // Remove end token
-                .collect::<Vec<String>>();
-
-            // Apply post-processing to improve fluency and accuracy
-            let raw_output = token_strs.join(" ");
-            self.post_process_chinese_text(&raw_output)
+            self.tokens_to_text(best_seq)
         } else {
-            String::new() // Return empty string if no valid sequence is found
+            String::new()
         }
     }
 
-    /// Generate text based on the given context tokens
-    fn generate_with_context(
-        &mut self,
-        context_tokens: &[usize],
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
-    ) -> String {
-        let mut tokenized = context_tokens.to_vec();
-        let mut output_tokens: Vec<usize> = Vec::new();
+    /// Beam search implementation
+    /// 使用推理会话与 KV 缓存避免重复计算
+    fn beam_search(&mut self, text: &str, beam_width: usize, max_length: usize) -> String {
+        if !self.supports_incremental() {
+            return self.beam_search_legacy(text, beam_width, max_length);
+        }
 
-        if tokenized.is_empty() {
+        if beam_width == 0 {
             return String::new();
         }
 
-        let input_len = tokenized.len();
-
-        if input_len >= MAX_SEQ_LEN {
+        let initial_tokens = self.tokenize(text);
+        if initial_tokens.is_empty() {
             return String::new();
         }
 
-        let max_new_tokens = 20.min(MAX_SEQ_LEN - input_len);
+        let max_context = self.max_context_length;
+        let prompt_len = initial_tokens.len();
+        let start_idx = prompt_len.saturating_sub(max_context);
+        let trimmed_prompt = &initial_tokens[start_idx..];
 
-        for _ in 0..max_new_tokens {
-            let token_input = match Array2::from_shape_vec(
-                (1, tokenized.len()),
-                tokenized.iter().map(|&x| x as f32).collect(),
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::error!("构造输入张量失败: {}", e);
-                    break;
+        let prompt_base_len = trimmed_prompt.len();
+        let target_length = max_length.max(prompt_base_len).min(self.max_context_length);
+
+        if target_length <= prompt_base_len {
+            return self.tokens_to_text(trimmed_prompt);
+        }
+
+        #[derive(Clone)]
+        struct BeamCandidate {
+            tokens: Vec<usize>,
+            log_prob: f32,
+            state: SessionSnapshot,
+            logits: Array2<f32>,
+        }
+
+        let mut perf_monitor = PerformanceMonitor::new();
+        perf_monitor.start("inference_generation");
+        let generation_start = Instant::now();
+
+        let eos_id = self.vocab.eos_token_id();
+        let mut session = InferenceSession::new(self, 1.0, 1.0, 0);
+        let initial_logits = match session.prime_tokens(trimmed_prompt) {
+            Some(logits) => logits,
+            None => {
+                perf_monitor.stop("inference_generation");
+                drop(session);
+                return self.tokens_to_text(trimmed_prompt);
+            }
+        };
+
+        let mut beams = vec![BeamCandidate {
+            tokens: trimmed_prompt.to_vec(),
+            log_prob: 0.0,
+            state: session.snapshot(),
+            logits: initial_logits,
+        }];
+
+        let max_steps = target_length - trimmed_prompt.len();
+        let mut buffer: Vec<(f32, usize)> = Vec::new();
+
+        for _ in 0..max_steps {
+            let mut expanded: Vec<BeamCandidate> = Vec::new();
+
+            for candidate in &beams {
+                let is_complete = candidate.tokens.len() >= target_length
+                    || candidate.tokens.last() == Some(&eos_id);
+                if is_complete {
+                    expanded.push(candidate.clone());
+                    continue;
                 }
-            };
-            let mut input = token_input;
 
-            for layer in &mut self.network {
-                input = layer.forward(&input);
+                session.restore(&candidate.state);
+                let probs = softmax(&candidate.logits);
+                let last_row = probs.row(probs.nrows() - 1);
+
+                buffer.clear();
+                buffer.extend(last_row.iter().enumerate().map(|(idx, &prob)| (prob, idx)));
+
+                let top = beam_width.min(buffer.len());
+                if top == 0 {
+                    expanded.push(candidate.clone());
+                    continue;
+                }
+
+                let nth = top - 1;
+                buffer.select_nth_unstable_by(nth, |a, b| {
+                    b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
+                });
+                buffer[..top]
+                    .sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+
+                for &(prob, token_idx) in buffer[..top].iter() {
+                    if prob <= 0.0 {
+                        continue;
+                    }
+
+                    let log_prob = candidate.log_prob + prob.max(SOFTMAX_EPSILON).ln();
+
+                    session.restore(&candidate.state);
+                    let next_logits = session.advance_with_token(token_idx);
+                    let snapshot = session.snapshot();
+
+                    let mut new_tokens = candidate.tokens.clone();
+                    new_tokens.push(token_idx);
+
+                    expanded.push(BeamCandidate {
+                        tokens: new_tokens,
+                        log_prob,
+                        state: snapshot,
+                        logits: next_logits,
+                    });
+                }
             }
 
-            let logits = input;
-
-            if logits.shape()[0] == 0 {
+            if expanded.is_empty() {
                 break;
             }
 
-            let last_logit = logits
-                .row(logits.shape()[0] - 1)
-                .to_owned()
-                .insert_axis(Axis(0));
+            expanded.sort_by(|a, b| {
+                b.log_prob
+                    .partial_cmp(&a.log_prob)
+                    .unwrap_or(Ordering::Equal)
+            });
+            beams = expanded.into_iter().take(beam_width).collect();
 
-            let probs = softmax(&last_logit);
-
-            let adjusted_probs = Self::apply_temperature(&probs, temperature);
-
-            let tokens = if top_k > 0 {
-                self.top_k_sampling(&adjusted_probs, top_k)
-            } else {
-                self.top_p_sampling(&adjusted_probs, top_p)
-            };
-
-            let next_token = tokens[tokens.len() - 1];
-
-            output_tokens.push(next_token);
-            tokenized.push(next_token);
-
-            if next_token == self.vocab.eos_token_id() {
+            let all_complete = beams.iter().all(|candidate| {
+                candidate.tokens.len() >= target_length || candidate.tokens.last() == Some(&eos_id)
+            });
+            if all_complete {
                 break;
             }
         }
 
-        let token_strs = output_tokens
+        perf_monitor.stop("inference_generation");
+
+        let best_candidate = beams
             .iter()
-            .map(|t| self.vocab.decode[t].clone())
-            .collect::<Vec<String>>();
+            .max_by(|a, b| {
+                a.log_prob
+                    .partial_cmp(&b.log_prob)
+                    .unwrap_or(Ordering::Equal)
+            })
+            .cloned();
+
+        drop(session);
+
+        if let Some(best) = best_candidate {
+            let generated_tokens = best.tokens.len().saturating_sub(prompt_base_len);
+            let elapsed = generation_start.elapsed().as_secs_f32();
+            if generated_tokens > 0 && elapsed > 0.0 {
+                println!(
+                    "⚡ 推理吞吐量: {:.2} tokens/s ({} tokens)",
+                    generated_tokens as f32 / elapsed,
+                    generated_tokens
+                );
+            }
+            self.tokens_to_text(&best.tokens)
+        } else {
+            String::new()
+        }
+    }
+
+    fn tokens_to_text(&self, tokens: &[usize]) -> String {
+        if tokens.is_empty() {
+            return String::new();
+        }
+
+        let token_strs: Vec<String> = tokens
+            .iter()
+            .filter_map(|&token| self.vocab.decode.get(&token).cloned())
+            .collect();
 
         let raw_output = token_strs.join(" ");
         self.post_process_chinese_text(&raw_output)

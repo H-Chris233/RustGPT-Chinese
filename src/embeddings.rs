@@ -46,7 +46,7 @@
 //! final_embedding = [0.24, -0.42, 0.65, ...]  // 逐元素相加
 //! ```
 
-use ndarray::{Array1, Array2, Array3, Zip};
+use ndarray::{Array2, Array3, Zip};
 
 use crate::{
     EMBEDDING_DIM, adam::Adam, llm::Layer, position_encoding::PositionEncoding,
@@ -221,6 +221,51 @@ impl Embeddings {
 
         // 步骤 3：逐元素相加
         token_embeds + position_embeds
+    }
+
+    /// 计算带位移的嵌入表示，用于增量推理场景
+    ///
+    /// # 参数
+    /// - `token_ids`: 待嵌入的 token 序列
+    /// - `start_position`: 序列起始绝对位置（用于正确添加位置编码）
+    pub fn embed_tokens_with_offset(
+        &mut self,
+        token_ids: &[usize],
+        start_position: usize,
+    ) -> Array2<f32> {
+        if token_ids.is_empty() {
+            return Array2::zeros((0, EMBEDDING_DIM));
+        }
+
+        let token_embeds = Self::get_token_embeddings(&self.token_embeddings, token_ids);
+        let seq_len = token_ids.len();
+        let max_position = self.position_encoder.encoding.nrows();
+
+        {
+            use ndarray::s;
+            let mut cache_slice = self.position_cache.slice_mut(s![0..seq_len, ..]);
+            for (idx, mut row) in cache_slice.outer_iter_mut().enumerate() {
+                let absolute_pos = start_position + idx;
+                let clamped_pos = if absolute_pos < max_position {
+                    absolute_pos
+                } else {
+                    log::warn!(
+                        "位置编码越界: absolute_pos={} (max={}), 自动使用最后一行位置编码",
+                        absolute_pos,
+                        max_position
+                    );
+                    max_position.saturating_sub(1)
+                };
+                row.assign(&self.position_encoder.encoding.row(clamped_pos));
+            }
+        }
+
+        let position_slice = self
+            .position_cache
+            .slice(ndarray::s![0..seq_len, ..])
+            .to_owned();
+
+        token_embeds + position_slice
     }
 }
 
