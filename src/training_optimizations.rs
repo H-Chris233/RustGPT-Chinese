@@ -495,8 +495,9 @@ impl LLM {
             }
 
             //  周期性保存检查点（如果配置了）
+            //  注意：对于BestAndLast策略，即使loss不是best也要保存last checkpoint
             if let Some(ref mut manager) = checkpoint_manager {
-                if manager.should_save(epoch, avg_loss) && avg_loss >= best_loss {
+                if manager.should_save(epoch, avg_loss) {
                     let metadata = crate::checkpoint_manager::CheckpointMetadata {
                         epoch,
                         loss: avg_loss,
