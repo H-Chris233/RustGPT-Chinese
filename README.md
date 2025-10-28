@@ -31,13 +31,21 @@ This is just a toy project that demonstrates how Chinese LLMs work under the hoo
 
 ## 🆕 Recent Updates
 
-### v0.3.1 - 训练性能优化 (2025-10-16)
-- 🚀 **阶段1训练优化** - 训练时间减少40%，收敛质量提升30%
-- ✅ **数据预处理缓存** - 避免重复tokenization，优化20-30%
-- ✅ **余弦退火学习率** - 带重启的调度策略，收敛更快更稳定
-- ✅ **早停机制** - 自动检测收敛，节省10-40%训练时间
-- ✅ **增强训练监控** - Loss, PPL, LR, Grad, Speed, ETA完整监控
-- ✅ **梯度累积** - 4步累积，训练稳定性提升40%
+### v0.4.0 - Checkpoint Management & Training Resume (2025-10-28)
+- 🚀 **Checkpoint Manager** - Supports Best/Last/Periodic saving strategies with automatic cleanup
+- ✅ **Complete State Saving** - Model parameters + Adam optimizer state (m, v, timestep) for true resume
+- ✅ **Early Stopping Integration** - Auto-saves best checkpoint, auto-rollback to best state on early stop
+- ✅ **Resume Training** - Resume from checkpoints with full training continuity
+- ✅ **CLI Parameter Support** - `--resume`, `--resume-from`, `--checkpoint-dir` and more
+- ✅ **Integration Tests** - Verifies loss continuity after save/restore (< 0.1% difference)
+
+### v0.3.1 - Training Performance Optimization (2025-10-16)
+- 🚀 **Phase 1 Training Optimizations** - 40% faster training, 30% better convergence
+- ✅ **Data Preprocessing Cache** - Avoid repeated tokenization, 20-30% speedup
+- ✅ **Cosine Annealing LR** - Learning rate scheduling with restarts, faster convergence
+- ✅ **Early Stopping** - Auto-detect convergence, save 10-40% training time
+- ✅ **Enhanced Training Monitor** - Loss, PPL, LR, Grad, Speed, ETA full monitoring
+- ✅ **Gradient Accumulation** - 4-step accumulation, 40% improved stability
 
 ### v0.3.0 - Model Optimization for Small Datasets (2025-10-15)
 - ✅ **Reduced Model Size** - Optimized for limited training data: 2 layers (was 4), 256 embedding dim (was 512)
