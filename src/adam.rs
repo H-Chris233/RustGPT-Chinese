@@ -38,19 +38,14 @@ use crate::EPSILON;
 pub struct Adam {
     /// **一阶矩衰减率 (β₁)**，默认 0.9
     pub beta1: f32,
-    
     /// **二阶矩衰减率 (β₂)**，默认 0.999
     pub beta2: f32,
-    
     /// **数值稳定性常量 (ε)**，防止除零
     pub epsilon: f32,
-    
     /// **时间步数**，用于偏差校正
     pub timestep: usize,
-    
     /// **一阶矩（梯度的指数移动平均）**
     pub m: Array2<f32>,
-    
     /// **二阶矩（梯度平方的指数移动平均）**
     pub v: Array2<f32>,
 }
@@ -92,17 +87,17 @@ impl Adam {
     pub fn step(&mut self, params: &mut Array2<f32>, grads: &Array2<f32>, lr: f32) {
         // 1. 增加时间步
         self.timestep += 1;
-        
+
         // 2. 更新一阶矩（动量）：m_t = β₁ * m_{t-1} + (1 - β₁) * g_t
         self.m = &self.m * self.beta1 + &(grads * (1.0 - self.beta1));
-        
+
         // 3. 更新二阶矩（RMSprop）：v_t = β₂ * v_{t-1} + (1 - β₂) * g_t²
         self.v = &self.v * self.beta2 + &(grads.mapv(|x| x * x) * (1.0 - self.beta2));
 
         // 4. 偏差校正
         // m̂_t = m_t / (1 - β₁^t) - 修正初始时刻的低估
         let m_hat = &self.m / (1.0 - self.beta1.powi(self.timestep as i32));
-        
+
         // v̂_t = v_t / (1 - β₂^t) - 修正初始时刻的低估
         let v_hat = &self.v / (1.0 - self.beta2.powi(self.timestep as i32));
 

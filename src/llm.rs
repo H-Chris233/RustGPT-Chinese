@@ -2100,13 +2100,21 @@ impl LLM {
             "梯度累积(单线程归约)"
         };
 
-        perf_monitor.start(label);
+        let track_perf = use_parallel && gradient_bucket.len() > 1;
+
+        if track_perf {
+            perf_monitor.start(label);
+        }
+
         let aggregated = if use_parallel && gradient_bucket.len() > 1 {
             Self::aggregate_gradients_parallel(gradient_bucket.as_slice())
         } else {
             Self::aggregate_gradients_sequential(gradient_bucket.as_slice())
         };
-        perf_monitor.stop(label);
+
+        if track_perf {
+            perf_monitor.stop(label);
+        }
 
         gradient_bucket.clear();
 
