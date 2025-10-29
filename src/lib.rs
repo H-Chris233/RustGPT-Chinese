@@ -47,15 +47,19 @@ pub mod feed_forward; // 前馈网络：Transformer中的全连接层部分
 pub mod fused_ops; // 算子融合：LayerNorm+Linear、GELU+Linear等融合操作
 pub mod layer_norm; // 层归一化：稳定训练的归一化技术
 pub mod llm; // 语言模型主类：整合所有组件的核心模型
+pub mod loss_scaler; // 动态损失缩放：混合精度训练的梯度溢出防护
+pub mod mixed_precision; // 混合精度配置：FP16/BF16 训练支持
+pub mod mixed_precision_trainer; // 混合精度训练器：集成训练流程
 pub mod model_serialization; // 模型序列化：保存和加载模型权重
 pub mod output_projection; // 输出投影层：将隐藏状态映射到词汇表概率
-pub mod performance_monitor;
+pub mod performance_monitor; // 性能监控：记录和分析训练/推理性能
 pub mod position_encoding; // 位置编码：为序列注入位置信息
+pub mod precision_convert; // 精度转换：FP32/FP16/BF16 互转工具
 pub mod self_attention; // 自注意力机制：Transformer的核心组件
 pub mod training_optimizations; // 训练优化：缓存、学习率调度、早停等
 pub mod transformer; // Transformer块：注意力+前馈的完整模块
 pub mod utils; // 工具函数：通用辅助函数
-pub mod vocab; // 词汇表：管理token和ID的映射关系 // 性能监控：记录和分析训练/推理性能
+pub mod vocab; // 词汇表：管理token和ID的映射关系
 
 // ============================================================================
 // 重导出核心类型（简化外部使用）
@@ -66,6 +70,9 @@ pub use checkpoint_manager::{CheckpointManager, CheckpointMetadata, CheckpointSt
 pub use dataset_loader::Dataset;
 pub use embeddings::Embeddings;
 pub use llm::{LLM, Layer};
+pub use loss_scaler::LossScaler;
+pub use mixed_precision::{MixedPrecisionConfig, PrecisionType};
+pub use mixed_precision_trainer::MixedPrecisionTrainer;
 pub use model_serialization::{
     load_model_auto, load_model_binary, load_model_json, save_model_binary, save_model_json,
 };
