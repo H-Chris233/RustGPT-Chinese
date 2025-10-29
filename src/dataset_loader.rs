@@ -31,7 +31,6 @@ use std::fs;
 pub struct Dataset {
     /// 预训练数据：用于学习世界知识和语言模式
     pub pretraining_data: Vec<String>,
-    
     /// 对话训练数据：用于学习对话和指令遵循能力
     pub chat_training_data: Vec<String>,
 }
