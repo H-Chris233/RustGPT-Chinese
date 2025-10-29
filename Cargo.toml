@@ -3,6 +3,7 @@ name = "llm"
 version = "0.4.0"
 # 2024 = latest edition
 edition = "2024"
+description = "RustGPT-Chinese - 从零开始构建的中文大语言模型，纯Rust实现，基于Transformer架构"
 
 [dependencies]
 bincode = "2.0.1"
