@@ -98,6 +98,14 @@ VOCAB_SIZE: 30000       // Target vocab size (dynamically built from data)
 - **⚡ 算子融合**: FusedLayerNormLinear、FusedGELULinear 减少中间张量分配
 - **📊 性能监控**: 缓存命中率统计，便于性能分析
 
+**v0.5.0 混合精度训练**:
+- **🎯 FP16/BF16 支持**: 前向和反向传播使用低精度计算
+- **⚖️ 双权重系统**: Master 权重（FP32）+ Working 副本（FP16/BF16）
+- **📈 动态损失缩放**: 自动调整缩放因子，防止梯度下溢/溢出
+- **🛡️ 自动回退**: 检测持续不稳定时自动切换回 FP32
+- **📊 完整监控**: 精度类型、缩放因子、溢出率实时显示
+- **验证测试**: `cargo run --example mixed_precision_test`
+
 **v0.3.1 训练优化**:
 - Smaller model = fewer parameters = better fit for 200-500 training samples
 - Reduces risk of severe underfitting when training data is limited
@@ -252,6 +260,116 @@ Key files to examine:
 - `src/llm.rs:122` - Beam search implementation
 - `src/llm.rs:742` - Chinese text post-processing
 - `src/main.rs:124` - Interactive mode with beam search
+
+## Mixed Precision Training (v0.5.0)
+
+### Overview
+
+RustGPT-Chinese supports FP16/BF16 mixed precision training to accelerate training and reduce memory usage while maintaining numerical stability through dynamic loss scaling.
+
+### Quick Start
+
+```rust
+use llm::{LLM, MixedPrecisionConfig, MixedPrecisionTrainer};
+
+// Create FP16 configuration
+let config = MixedPrecisionConfig::fp16();
+let mut trainer = MixedPrecisionTrainer::new(config);
+
+// Train with mixed precision
+let mut llm = LLM::default();
+trainer.train_monitored(&mut llm, tokenized_data, 100, 0.001, 30);
+```
+
+### Key Features
+
+1. **Precision Types**:
+   - `FP16`: Half precision (16-bit), 50% memory, good for most tasks
+   - `BF16`: BFloat16 (16-bit), same dynamic range as FP32, better stability
+   - `FP32`: Full precision (32-bit), baseline/fallback
+
+2. **Dynamic Loss Scaling**:
+   - Automatically adjusts scale factor to prevent gradient underflow
+   - Detects overflow (NaN/Inf) and skips corrupted updates
+   - Grows scale when training is stable
+   - Backs off scale when overflow occurs
+
+3. **Dual-Weight System**:
+   - Master weights: Always FP32 (high precision)
+   - Working copy: FP16/BF16 for computation (low precision)
+   - Gradients accumulated in FP32 after unscaling
+
+4. **Auto-Fallback**:
+   - Detects persistent instability (e.g., 5 consecutive overflows)
+   - Automatically switches back to FP32
+   - Logs fallback events for debugging
+
+### Configuration Examples
+
+```rust
+// BF16 with custom parameters
+let config = MixedPrecisionConfig::bf16()
+    .with_loss_scale(32768.0)           // Initial scale
+    .with_growth_params(2.0, 2000)       // Growth factor and interval
+    .with_backoff_factor(0.5)            // Backoff on overflow
+    .with_auto_fallback(true, 5);        // Enable fallback after 5 overflows
+
+// Disable mixed precision (pure FP32)
+let config = MixedPrecisionConfig::disabled();
+```
+
+### Monitoring
+
+Training logs show:
+- Current precision type (FP16/BF16/FP32)
+- Loss scale factor
+- Overflow count and rate
+- Fallback events
+
+```
+[MIXED PRECISION] Training with precision: FP16, loss scale: 65536
+Epoch 10: Loss = 3.89, LR = 0.000995, Precision = FP16, Scale = 65536.0, Overflows = 2/110 (1.82%)
+[OVERFLOW] Step 125: Loss scale reduced from 65536.0 to 32768.0 (overflow #3/125)
+[SCALE] Loss scale increased from 32768.0 to 65536.0 after 2000 stable steps
+```
+
+### Validation
+
+Run the validation test:
+```bash
+cargo run --example mixed_precision_test
+```
+
+This compares FP32, FP16, and BF16 training on a small model and verifies:
+- Loss convergence (< 5% difference from FP32)
+- Perplexity stability (< 3% difference)
+- Overflow rate (< 10%)
+
+### Best Practices
+
+1. **Start with BF16**: Better numerical stability than FP16
+2. **Monitor overflow rate**: Should stay below 10%
+3. **Compare with FP32**: Validate loss curves match
+4. **Use auto-fallback**: Prevents training failure
+5. **Check logs**: Watch for [OVERFLOW] and [FALLBACK] events
+
+### Implementation Files
+
+- `src/mixed_precision.rs` - Configuration and precision types
+- `src/loss_scaler.rs` - Dynamic loss scaling implementation
+- `src/mixed_precision_trainer.rs` - Training loop integration
+- `src/precision_convert.rs` - FP32 ↔ FP16/BF16 conversion utilities
+- `examples/mixed_precision_test.rs` - Validation script
+- `docs/MIXED_PRECISION.md` - Detailed documentation
+
+### Troubleshooting
+
+- **High overflow rate (>10%)**: Use BF16 or lower learning rate
+- **Loss not converging**: Switch to FP32 or increase loss scale
+- **Frequent fallback**: Increase fallback threshold or use FP32
+- **Scale keeps decreasing**: Check for gradient explosion, reduce LR
+
+For more details, see `docs/MIXED_PRECISION.md`.
 
 ## Performance Optimization Features (v0.4.0)
 
