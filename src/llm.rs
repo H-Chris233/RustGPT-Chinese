@@ -1146,11 +1146,39 @@ impl LLM {
                 }
 
                 // 前向传播（批量）- 使用循环对每个样本单独处理
-                let mut batch_outputs = Vec::with_capacity(input_batch.batch_size);
+                //
+                // 注意：input_batch 中包含 PAD 位置，但 targets 是基于真实长度构建的。
+                // 如果直接用整个 input_batch 前向传播，会导致：
+                // 1) logits 行数 > target 长度
+                // 2) 反向传播梯度与目标长度不匹配
+                //
+                // 因此我们在每个样本内，根据 attention_mask 计算真实长度，
+                // 只取真实 token 做前向与反向传播。
+                let mut batch_outputs: Vec<Option<Array2<f32>>> =
+                    Vec::with_capacity(input_batch.batch_size);
+                let mut batch_targets = Vec::with_capacity(input_batch.batch_size);
 
                 for b in 0..input_batch.batch_size {
+                    // 通过 attention_mask 计算真实长度（去除 PAD）
+                    let real_len = input_batch
+                        .attention_mask
+                        .row(b)
+                        .iter()
+                        .filter(|&&x| x > 0.0)
+                        .count();
+
+                    if real_len == 0 {
+                        batch_outputs.push(None);
+                        batch_targets.push(Vec::new());
+                        continue;
+                    }
+
                     let sample_tokens = input_batch.tokens.row(b);
-                    let sample_ids: Vec<usize> = sample_tokens.to_vec();
+                    let sample_ids: Vec<usize> = sample_tokens
+                        .iter()
+                        .take(real_len)
+                        .copied()
+                        .collect();
 
                     // 单样本前向传播
                     let mut input: Array2<f32> = Array2::zeros((1, sample_ids.len()));
@@ -1165,34 +1193,42 @@ impl LLM {
                         input = layer.forward(&input);
                     }
 
-                    batch_outputs.push(input);
+                    batch_outputs.push(Some(input));
+                    batch_targets.push(targets.get(b).cloned().unwrap_or_default());
                 }
 
                 // 计算损失和反向传播（对每个样本）
                 let mut batch_loss = 0.0;
 
-                for (b, logits) in batch_outputs.iter().enumerate() {
-                    if b >= targets.len() || targets[b].is_empty() {
+                for (b, maybe_logits) in batch_outputs.iter().enumerate() {
+                    let Some(logits) = maybe_logits else {
+                        continue;
+                    };
+
+                    let target_ids = &batch_targets[b];
+                    if target_ids.is_empty() {
                         continue;
                     }
 
                     let log_probs = log_softmax(logits);
 
+                    // 安全检查：logits 的时间步数应与 target 长度一致
+                    if log_probs.nrows() != target_ids.len() {
+                        eprintln!(
+                            "⚠️  跳过异常样本：logits步数({}) != target长度({})",
+                            log_probs.nrows(),
+                            target_ids.len()
+                        );
+                        continue;
+                    }
+
                     // 只计算非 PAD 位置的损失
-                    let target_ids = &targets[b];
                     let loss = Self::cross_entropy_from_log_probs(&log_probs, target_ids);
                     batch_loss += loss;
 
                     // 计算梯度
                     let probs = log_probs.mapv(|x| x.exp());
                     let mut sample_grad = Self::compute_gradients_step(&probs, target_ids);
-
-                    // 应用注意力掩码到梯度（将PAD位置梯度清零）
-                    for s in 0..sample_grad.nrows() {
-                        if input_batch.attention_mask[[b, s]] < 0.5 {
-                            sample_grad.row_mut(s).fill(0.0);
-                        }
-                    }
 
                     total_grad_norm += Self::compute_grad_norm(&sample_grad);
                     Self::clip_gradients(&mut sample_grad, 1.0);
