@@ -31,6 +31,7 @@ impl LLM {
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
 
             let mut total_loss = 0.0;
+            let mut sample_count = 0usize;
 
             //  直接使用缓存的tokenized数据，无需重复tokenize
             for training_row in &tokenized_data {
@@ -63,12 +64,18 @@ impl LLM {
                 for layer in self.network.iter_mut().rev() {
                     grads_output = layer.backward(&grads_output, current_lr);
                 }
+
+                sample_count += 1;
             }
 
             println!(
                 "Epoch  {}:  Loss  =  {:.4},  LR  =  {:.6}",
                 epoch,
-                total_loss / tokenized_data.len() as f32,
+                if sample_count > 0 {
+                    total_loss / sample_count as f32
+                } else {
+                    0.0
+                },
                 current_lr
             );
         }
@@ -76,7 +83,7 @@ impl LLM {
         self.set_training_mode(false);
     }
 
-    ///  改进的训练方法：使用余弦退火学习率
+    ///  改进的训练方法：使用余弦退火学习率 + 线性 Warmup
     pub fn train_with_cosine_lr(
         &mut self,
         tokenized_data: Vec<Vec<usize>>,
@@ -87,10 +94,13 @@ impl LLM {
         self.set_training_mode(true);
 
         for epoch in 0..epochs {
-            //  🔥  使用余弦退火学习率
-            let current_lr = Self::cosine_annealing_lr(initial_lr, epoch, epochs, num_restarts);
+            //  🔥  使用余弦退火学习率 + Warmup
+            let warmup_epochs = Self::recommend_warmup_epochs(epochs);
+            let current_lr =
+                Self::cosine_with_warmup_lr(initial_lr, epoch, epochs, num_restarts, warmup_epochs);
 
             let mut total_loss = 0.0;
+            let mut sample_count = 0usize;
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
@@ -118,6 +128,8 @@ impl LLM {
                 for layer in self.network.iter_mut().rev() {
                     grads_output = layer.backward(&grads_output, current_lr);
                 }
+
+                sample_count += 1;
             }
 
             //  每10个epoch打印一次，减少输出
@@ -125,7 +137,11 @@ impl LLM {
                 println!(
                     "Epoch  {}:  Loss  =  {:.4},  LR  =  {:.6}",
                     epoch,
-                    total_loss / tokenized_data.len() as f32,
+                    if sample_count > 0 {
+                        total_loss / sample_count as f32
+                    } else {
+                        0.0
+                    },
                     current_lr
                 );
             }
@@ -156,9 +172,12 @@ impl LLM {
         let mut best_epoch = 0;
 
         for epoch in 0..max_epochs {
-            let current_lr = Self::cosine_annealing_lr(initial_lr, epoch, max_epochs, 2);
+            let warmup_epochs = Self::recommend_warmup_epochs(max_epochs);
+            let current_lr =
+                Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 2, warmup_epochs);
 
             let mut total_loss = 0.0;
+            let mut sample_count = 0usize;
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
@@ -186,9 +205,15 @@ impl LLM {
                 for layer in self.network.iter_mut().rev() {
                     grads_output = layer.backward(&grads_output, current_lr);
                 }
+
+                sample_count += 1;
             }
 
-            let avg_loss = total_loss / tokenized_data.len() as f32;
+            let avg_loss = if sample_count > 0 {
+                total_loss / sample_count as f32
+            } else {
+                0.0
+            };
 
             if epoch % 10 == 0 || epoch == max_epochs - 1 {
                 println!(
