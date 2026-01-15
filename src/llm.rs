@@ -679,6 +679,7 @@ impl LLM {
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
 
             let mut total_loss = 0.0;
+            let mut sample_count = 0usize;
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
@@ -718,12 +719,18 @@ impl LLM {
                 if next_token == self.vocab.encode("</s>").unwrap() {
                     continue;
                 }
+
+                sample_count += 1;
             }
 
             println!(
                 "Epoch {}: Loss = {:.4}, LR = {:.6}",
                 epoch,
-                total_loss / tokenized_data.len() as f32,
+                if sample_count > 0 {
+                    total_loss / sample_count as f32
+                } else {
+                    0.0
+                },
                 current_lr
             );
         }
@@ -843,6 +850,52 @@ impl LLM {
         min_lr + 0.5 * (initial_lr - min_lr) * (1.0 + (std::f32::consts::PI * progress).cos())
     }
 
+    /// 余弦退火学习率调度（带热身）
+    ///
+    /// # 核心思想
+    /// - **热身阶段 (Warmup)**：学习率从 0 线性升到 initial_lr，避免训练初期震荡
+    /// - **退火阶段 (Cosine)**：热身结束后进入余弦退火
+    ///
+    /// # 参数
+    /// - `initial_lr`: 初始学习率上限
+    /// - `epoch`: 当前 epoch
+    /// - `total_epochs`: 总 epoch 数
+    /// - `num_restarts`: 余弦退火的重启次数
+    /// - `warmup_epochs`: 热身轮数（建议占总训练 3%-10%）
+    pub fn cosine_with_warmup_lr(
+        initial_lr: f32,
+        epoch: usize,
+        total_epochs: usize,
+        num_restarts: usize,
+        warmup_epochs: usize,
+    ) -> f32 {
+        if total_epochs == 0 {
+            return initial_lr;
+        }
+
+        let warmup_epochs = warmup_epochs.min(total_epochs);
+        if warmup_epochs == 0 {
+            return Self::cosine_annealing_lr(initial_lr, epoch, total_epochs, num_restarts);
+        }
+
+        if epoch < warmup_epochs {
+            return initial_lr * (epoch + 1) as f32 / warmup_epochs as f32;
+        }
+
+        let adjusted_epoch = epoch - warmup_epochs;
+        let adjusted_total = total_epochs.saturating_sub(warmup_epochs).max(1);
+        Self::cosine_annealing_lr(initial_lr, adjusted_epoch, adjusted_total, num_restarts)
+    }
+
+    /// 计算推荐的 warmup 轮数（默认 5%）
+    pub(crate) fn recommend_warmup_epochs(total_epochs: usize) -> usize {
+        if total_epochs == 0 {
+            return 0;
+        }
+        let warmup = ((total_epochs as f32) * 0.05).ceil() as usize;
+        warmup.clamp(1, total_epochs)
+    }
+
     /// 计算梯度L2范数
     pub fn compute_grad_norm(grads: &Array2<f32>) -> f32 {
         grads.iter().map(|&x| x * x).sum::<f32>().sqrt()
@@ -934,8 +987,10 @@ impl LLM {
         for epoch in 0..max_epochs {
             let epoch_start = std::time::Instant::now();
 
-            // 🔥 余弦退火学习率调度（禁用重启以提升稳定性）
-            let current_lr = Self::cosine_annealing_lr(initial_lr, epoch, max_epochs, 0);
+            // 🔥 余弦退火 + Warmup（禁用重启以提升稳定性）
+            let warmup_epochs = Self::recommend_warmup_epochs(max_epochs);
+            let current_lr =
+                Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
             let mut total_loss = 0.0;
             let mut total_grad_norm = 0.0;
@@ -1079,6 +1134,7 @@ impl LLM {
     /// - ✅ 批量处理：显著提升训练速度
     /// - ✅ 动态填充：每个批次填充到该批次的最大长度
     /// - ✅ 注意力掩码：确保 PAD 不参与梯度计算
+    /// - ✅ 前向裁剪：每个样本只前向真实 token，避免 PAD 干扰注意力
     /// - ✅ 数据分桶：减少填充开销
     /// - ✅ 所有监控和优化特性（余弦退火、早停等）
     ///
@@ -1129,8 +1185,10 @@ impl LLM {
         for epoch in 0..max_epochs {
             let epoch_start = std::time::Instant::now();
 
-            // 余弦退火学习率
-            let current_lr = Self::cosine_annealing_lr(initial_lr, epoch, max_epochs, 0);
+            // 余弦退火 + Warmup
+            let warmup_epochs = Self::recommend_warmup_epochs(max_epochs);
+            let current_lr =
+                Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
             let mut total_loss = 0.0;
             let mut total_grad_norm = 0.0;
@@ -1149,8 +1207,15 @@ impl LLM {
                 let mut batch_outputs = Vec::with_capacity(input_batch.batch_size);
 
                 for b in 0..input_batch.batch_size {
+                    // 只取真实 token（避免 PAD 参与前向计算）
+                    let target_len = targets.get(b).map_or(0, |t| t.len());
+                    if target_len == 0 {
+                        continue;
+                    }
+
                     let sample_tokens = input_batch.tokens.row(b);
-                    let sample_ids: Vec<usize> = sample_tokens.to_vec();
+                    let sample_ids: Vec<usize> =
+                        sample_tokens.iter().take(target_len).copied().collect();
 
                     // 单样本前向传播
                     let mut input: Array2<f32> = Array2::zeros((1, sample_ids.len()));
@@ -1178,7 +1243,7 @@ impl LLM {
 
                     let log_probs = log_softmax(logits);
 
-                    // 只计算非 PAD 位置的损失
+                    // 只计算真实 token 对齐的损失
                     let target_ids = &targets[b];
                     let loss = Self::cross_entropy_from_log_probs(&log_probs, target_ids);
                     batch_loss += loss;
@@ -1186,13 +1251,6 @@ impl LLM {
                     // 计算梯度
                     let probs = log_probs.mapv(|x| x.exp());
                     let mut sample_grad = Self::compute_gradients_step(&probs, target_ids);
-
-                    // 应用注意力掩码到梯度（将PAD位置梯度清零）
-                    for s in 0..sample_grad.nrows() {
-                        if input_batch.attention_mask[[b, s]] < 0.5 {
-                            sample_grad.row_mut(s).fill(0.0);
-                        }
-                    }
 
                     total_grad_norm += Self::compute_grad_norm(&sample_grad);
                     Self::clip_gradients(&mut sample_grad, 1.0);
