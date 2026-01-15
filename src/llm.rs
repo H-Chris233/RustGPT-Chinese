@@ -1204,7 +1204,17 @@ impl LLM {
                 }
 
                 // 前向传播（批量）- 使用循环对每个样本单独处理
-                let mut batch_outputs = Vec::with_capacity(input_batch.batch_size);
+                //
+                // 注意：input_batch 中包含 PAD 位置，但 targets 是基于真实长度构建的。
+                // 如果直接用整个 input_batch 前向传播，会导致：
+                // 1) logits 行数 > target 长度
+                // 2) 反向传播梯度与目标长度不匹配
+                //
+                // 因此我们在每个样本内，根据 attention_mask 计算真实长度，
+                // 只取真实 token 做前向与反向传播。
+                let mut batch_outputs: Vec<Option<Array2<f32>>> =
+                    Vec::with_capacity(input_batch.batch_size);
+                let mut batch_targets = Vec::with_capacity(input_batch.batch_size);
 
                 for b in 0..input_batch.batch_size {
                     // 只取真实 token（避免 PAD 参与前向计算）
@@ -1230,14 +1240,20 @@ impl LLM {
                         input = layer.forward(&input);
                     }
 
-                    batch_outputs.push(input);
+                    batch_outputs.push(Some(input));
+                    batch_targets.push(targets.get(b).cloned().unwrap_or_default());
                 }
 
                 // 计算损失和反向传播（对每个样本）
                 let mut batch_loss = 0.0;
 
-                for (b, logits) in batch_outputs.iter().enumerate() {
-                    if b >= targets.len() || targets[b].is_empty() {
+                for (b, maybe_logits) in batch_outputs.iter().enumerate() {
+                    let Some(logits) = maybe_logits else {
+                        continue;
+                    };
+
+                    let target_ids = &batch_targets[b];
+                    if target_ids.is_empty() {
                         continue;
                     }
 
