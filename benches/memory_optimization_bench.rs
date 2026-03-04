@@ -31,8 +31,8 @@ fn bench_dataset_loading() -> BenchStats {
 
     for _ in 0..iterations {
         let _dataset = Dataset::new(
-            "data/pretraining_data.json".to_string(),
-            "data/chat_training_data.json".to_string(),
+            "data/pretraining".to_string(),
+            "data/chat".to_string(),
         );
         // Dataset 自动销毁
     }

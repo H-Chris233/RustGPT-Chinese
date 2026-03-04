@@ -111,13 +111,13 @@ The training process has two phases with v0.3.1 performance optimizations:
 1. **Vocabulary Building**: Processes both pre-training and chat training data using jieba-rs to extract all unique tokens (Chinese words, idioms, punctuation, special tokens)
 
 2. **Pre-training** (max 500 epochs, LR=0.001 with cosine annealing):
-   - Loads data from `data/pretraining_data.json`
+   - Loads data from `data/pretraining/` (all `*.json` files)
    - Learns Chinese world knowledge and factual statements
    - **🚀 v0.3.1优化**: 余弦退火学习率调度（2次重启），早停机制（patience=30）
    - Uses `train_monitored()` method with all optimizations
 
 3. **Instruction Tuning** (max 500 epochs, LR=0.0005 with cosine annealing):
-   - Loads data from `data/chat_training_data.json`
+   - Loads data from `data/chat/` (all `*.json` files)
    - Learns conversational Chinese patterns
    - **🚀 v0.3.1优化**: 梯度累积（4步），完整训练监控，早停机制
    - Uses `train_monitored()` method with all optimizations
@@ -228,8 +228,8 @@ Defined in `vocab.rs`:
 ### Modifying Training Data
 
 Training data is loaded from JSON files in `data/`:
-- `data/pretraining_data.json` - Array of Chinese factual statements (no `</s>` tokens in v0.3.0)
-- `data/chat_training_data.json` - Array of conversational exchanges (no `</s>` tokens in v0.3.0)
+- `data/pretraining/` - Directory of JSON arrays (e.g. `set1.json`, `dataset2.json`, ...)
+- `data/chat/` - Directory of JSON arrays (e.g. `set1.json`, `dataset2.json`, ...)
 - `data/chinese_idioms.json` - Array of 4-character Chinese idioms
 
 Format: Simple JSON arrays of strings.

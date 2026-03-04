@@ -5,8 +5,8 @@ use llm::Dataset;
 #[test]
 fn test_dataset_new_json() {
     let dataset = Dataset::new(
-        "data/pretraining_data.json".to_string(),
-        "data/chat_training_data.json".to_string(),
+        "data/pretraining".to_string(),
+        "data/chat".to_string(),
     );
     assert!(
         !dataset.pretraining_data.is_empty(),

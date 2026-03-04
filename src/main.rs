@@ -61,8 +61,8 @@ fn run_quick(
 
     perf_monitor.start("加载训练数据");
     let dataset = Dataset::new(
-        String::from("data/pretraining_data.json"),
-        String::from("data/chat_training_data.json"),
+        String::from("data/pretraining"),
+        String::from("data/chat"),
     );
     perf_monitor.stop("加载训练数据");
 
@@ -189,8 +189,8 @@ fn main() {
                     // 加载训练数据
                     perf_monitor.start("加载训练数据");
                     let dataset = Dataset::new(
-                        String::from("data/pretraining_data.json"),
-                        String::from("data/chat_training_data.json"),
+                        String::from("data/pretraining"),
+                        String::from("data/chat"),
                     );
                     perf_monitor.stop("加载训练数据");
 
@@ -456,8 +456,8 @@ fn main() {
 fn train_new_model(perf_monitor: &mut PerformanceMonitor, freeze_attn: bool) -> LLM {
     perf_monitor.start("加载训练数据");
     let dataset = Dataset::new(
-        String::from("data/pretraining_data.json"),
-        String::from("data/chat_training_data.json"),
+        String::from("data/pretraining"),
+        String::from("data/chat"),
     );
     perf_monitor.stop("加载训练数据");
 
@@ -620,8 +620,8 @@ fn continue_training_loaded_model(
     // 加载数据
     perf_monitor.start("加载训练数据");
     let dataset = Dataset::new(
-        String::from("data/pretraining_data.json"),
-        String::from("data/chat_training_data.json"),
+        String::from("data/pretraining"),
+        String::from("data/chat"),
     );
     perf_monitor.stop("加载训练数据");
 

@@ -68,8 +68,8 @@ fn train_and_save() -> Result<(), Box<dyn std::error::Error>> {
     // 1. 加载数据
     println!("📂 加载训练数据...");
     let dataset = Dataset::new(
-        String::from("data/pretraining_data.json"),
-        String::from("data/chat_training_data.json"),
+        String::from("data/pretraining"),
+        String::from("data/chat"),
     );
 
     // 2. 构建词汇表
@@ -216,8 +216,8 @@ fn continue_training() -> Result<(), Box<dyn std::error::Error>> {
     // 2. 加载数据
     println!("📂 加载训练数据...");
     let dataset = Dataset::new(
-        String::from("data/pretraining_data.json"),
-        String::from("data/chat_training_data.json"),
+        String::from("data/pretraining"),
+        String::from("data/chat"),
     );
 
     // 3. 继续训练
