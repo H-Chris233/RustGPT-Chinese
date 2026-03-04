@@ -24,8 +24,7 @@
 //! ```
 //!
 //! ### 目录模式（推荐）
-//! 传入目录路径时，会加载目录下所有 `.json` 文件（按文件名中的数字序号排序），并将合并后的语料按
-//! `DATASET_TOTAL_MULTIPLIER` 进行重复采样扩展。
+//! 传入目录路径时，会加载目录下所有 `.json` 文件（按文件名中的数字序号排序）并合并语料。
 //!
 //! 例如：
 //! - `data/pretraining/set1.json`
@@ -35,20 +34,13 @@
 //! 以后新增 `dataset4.json` / `dataset5.json` / `dataset6.json` 会自动被加载器纳入训练。
 //!
 //! ### 文件模式（兼容）
-//! 传入单个文件路径时，会自动尝试追加同目录下的 `*_extra.json`（若存在），然后再按
-//! `DATASET_TOTAL_MULTIPLIER` 扩展。
+//! 传入单个文件路径时，会自动尝试追加同目录下的 `*_extra.json`（若存在）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// 数据集 JSON 文件大小上限（防止恶意/损坏文件导致 OOM）。
 const MAX_DATASET_JSON_BYTES: u64 = 128 * 1024 * 1024; // 128MiB
-/// 训练时使用的数据量相对基础数据集的倍数（通过重复采样实现）。
-///
-/// 说明：为满足“数据集总量扩大”的需求，这里会将加载到的语料重复采样到指定倍数。
-const DATASET_TOTAL_MULTIPLIER: usize = 8;
-/// 防止误配置/误加载导致内存爆炸：扩展后的数据条目上限。
-const MAX_EXPANDED_DATASET_ITEMS: usize = 1_000_000;
 
 /// **数据集结构体**
 ///
@@ -85,17 +77,16 @@ impl Dataset {
     }
 }
 
-/// **从 JSON 文件加载数据（并按需扩展）**
+/// **从 JSON 文件加载数据**
 ///
 /// 读取 `path` 指向的 JSON 字符串数组，并支持：
 /// - 自动追加同目录下的 `*_extra.json`（若存在）
-/// - 将最终语料重复采样到“基础语料”的指定倍数（见 `DATASET_TOTAL_MULTIPLIER`）
 ///
 /// # 参数
 /// - `path`: JSON 文件路径
 ///
 /// # 返回值
-/// - 成功：包含所有字符串的向量（已按倍数扩展）
+/// - 成功：包含所有字符串的向量
 /// - 失败：空向量，并记录错误日志
 ///
 /// # 示例
@@ -135,8 +126,6 @@ fn load_dataset_from_file(path: &str) -> Vec<String> {
         }
     }
 
-    let base_len = data.len();
-    expand_dataset_to_multiplier(&mut data, DATASET_TOTAL_MULTIPLIER, base_len);
     data
 }
 
@@ -172,8 +161,6 @@ fn load_dataset_from_dir(dir: &str) -> Vec<String> {
         log::error!("数据目录全部为空或解析失败: {}", dir);
         return Vec::new();
     }
-
-    expand_dataset_to_multiplier(&mut data, DATASET_TOTAL_MULTIPLIER, base_len);
     data
 }
 
@@ -220,43 +207,6 @@ fn build_extra_dataset_path(path: &str) -> Option<PathBuf> {
     };
 
     Some(parent.join(extra_file))
-}
-
-fn expand_dataset_to_multiplier(data: &mut Vec<String>, multiplier: usize, base_len: usize) {
-    if multiplier <= 1 {
-        return;
-    }
-
-    let Some(target_len) = base_len.checked_mul(multiplier) else {
-        log::error!("数据集目标长度计算溢出，跳过扩展");
-        return;
-    };
-
-    if target_len > MAX_EXPANDED_DATASET_ITEMS {
-        log::error!(
-            "扩展后的数据集条目数过大(>{})，跳过扩展",
-            MAX_EXPANDED_DATASET_ITEMS
-        );
-        return;
-    }
-
-    if data.len() >= target_len {
-        data.truncate(target_len);
-        return;
-    }
-
-    // 用当前 data 作为“种子”，重复采样直到达到目标长度（extra 语料也会参与重复采样）。
-    let seed = data.clone();
-    if seed.is_empty() {
-        return;
-    }
-
-    data.reserve(target_len.saturating_sub(data.len()));
-    while data.len() < target_len {
-        let remaining = target_len - data.len();
-        let take = remaining.min(seed.len());
-        data.extend_from_slice(&seed[..take]);
-    }
 }
 
 /// **从 JSON 文件加载数据**
