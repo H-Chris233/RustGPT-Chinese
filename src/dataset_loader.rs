@@ -25,6 +25,9 @@
 
 use std::fs;
 
+/// 数据集 JSON 文件大小上限（防止恶意/损坏文件导致 OOM）。
+const MAX_DATASET_JSON_BYTES: u64 = 128 * 1024 * 1024; // 128MiB
+
 /// **数据集结构体**
 ///
 /// 包含预训练数据和对话训练数据两部分。
@@ -76,6 +79,23 @@ impl Dataset {
 /// ["句子1", "句子2", "句子3"]
 /// ```
 fn get_data_from_json(path: &str) -> Vec<String> {
+    // 先做文件大小上限校验，避免一次性 read_to_string 导致内存耗尽
+    match fs::metadata(path) {
+        Ok(meta) if meta.len() > MAX_DATASET_JSON_BYTES => {
+            log::error!(
+                "数据文件过大(>{} bytes)，拒绝加载: {}",
+                MAX_DATASET_JSON_BYTES,
+                path
+            );
+            return Vec::new();
+        }
+        Ok(_) => {}
+        Err(e) => {
+            log::error!("读取数据文件元信息失败 ({}): {}", path, e);
+            return Vec::new();
+        }
+    }
+
     match fs::read_to_string(path) {
         Ok(data_json) => match serde_json::from_str::<Vec<String>>(&data_json) {
             Ok(data) => data,

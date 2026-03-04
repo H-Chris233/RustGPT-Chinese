@@ -12,6 +12,7 @@
 //! - 词汇表
 
 use std::fs;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use bincode::{Decode, Encode};
@@ -19,6 +20,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::llm::LLM;
 use crate::model_serialization::SerializableModel;
+use crate::transformer::TransformerBlock;
+
+/// 反序列化输入大小上限（防止恶意/损坏文件导致 OOM）。
+const BINCODE_DECODE_LIMIT_BYTES: usize = 512 * 1024 * 1024; // 512MiB
 
 /// 检查点元数据
 #[derive(Clone, Debug, Encode, Decode, Serialize, Deserialize)]
@@ -195,7 +200,11 @@ impl CheckpointManager {
             metadata: crate::model_serialization::ModelMetadata {
                 embedding_dim: crate::EMBEDDING_DIM,
                 hidden_dim: crate::HIDDEN_DIM,
-                num_transformer_blocks: 2,
+                num_transformer_blocks: llm
+                    .network
+                    .iter()
+                    .filter(|layer| layer.as_any().is::<TransformerBlock>())
+                    .count(),
                 vocab_size: llm.vocab.len(),
                 max_seq_len: llm.max_context_length,
                 training_info: None,
@@ -207,19 +216,56 @@ impl CheckpointManager {
             metadata: metadata.clone(),
         };
 
-        // 保存为二进制格式
-        let file =
-            fs::File::create(&checkpoint_path).map_err(|e| format!("创建检查点文件失败: {}", e))?;
+        // 保存为二进制格式（原子写入：tmp -> rename）
+        //
+        // 说明：
+        // - 避免进程中断/并发覆盖导致生成截断文件（常见症状：UnexpectedEof）
+        // - rename 在类 Unix 上原子；Windows 上若目标已存在则先删除
+        let tmp_checkpoint_path = checkpoint_path.with_extension("bin.tmp");
+        let file = fs::File::create(&tmp_checkpoint_path)
+            .map_err(|e| format!("创建检查点临时文件失败: {}", e))?;
         let mut writer = std::io::BufWriter::new(file);
 
         bincode::encode_into_std_write(&checkpoint, &mut writer, bincode::config::standard())
             .map_err(|e| format!("序列化检查点失败: {}", e))?;
+        writer
+            .flush()
+            .map_err(|e| format!("写入检查点失败(Flush): {}", e))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| format!("写入检查点失败(Sync): {}", e))?;
+        drop(writer);
 
-        // 同时保存JSON格式的元数据（方便查看）
+        if checkpoint_path.exists() {
+            fs::remove_file(&checkpoint_path)
+                .map_err(|e| format!("覆盖旧检查点失败: {}", e))?;
+        }
+        fs::rename(&tmp_checkpoint_path, &checkpoint_path)
+            .map_err(|e| format!("提交检查点文件失败(Rename): {}", e))?;
+
+        // 同时保存JSON格式的元数据（方便查看，同样使用原子写入）
         let metadata_path = checkpoint_path.with_extension("json");
-        let metadata_json = serde_json::to_string_pretty(&metadata)
+        let tmp_metadata_path = metadata_path.with_extension("json.tmp");
+        let file = fs::File::create(&tmp_metadata_path)
+            .map_err(|e| format!("创建元数据临时文件失败: {}", e))?;
+        let mut writer = std::io::BufWriter::new(file);
+        serde_json::to_writer_pretty(&mut writer, &metadata)
             .map_err(|e| format!("序列化元数据失败: {}", e))?;
-        fs::write(&metadata_path, metadata_json).map_err(|e| format!("保存元数据失败: {}", e))?;
+        writer
+            .flush()
+            .map_err(|e| format!("写入元数据失败(Flush): {}", e))?;
+        writer
+            .get_ref()
+            .sync_all()
+            .map_err(|e| format!("写入元数据失败(Sync): {}", e))?;
+        drop(writer);
+
+        if metadata_path.exists() {
+            fs::remove_file(&metadata_path).map_err(|e| format!("覆盖旧元数据失败: {}", e))?;
+        }
+        fs::rename(&tmp_metadata_path, &metadata_path)
+            .map_err(|e| format!("提交元数据文件失败(Rename): {}", e))?;
 
         log::info!(
             "📦 检查点已保存: {} (epoch={}, loss={:.4}{})",
@@ -248,11 +294,11 @@ impl CheckpointManager {
         log::info!("📂 正在加载检查点: {}", path.display());
 
         let file = fs::File::open(path).map_err(|e| format!("打开检查点文件失败: {}", e))?;
-        let mut reader = std::io::BufReader::new(file);
+        let mut reader = std::io::BufReader::new(file).take(BINCODE_DECODE_LIMIT_BYTES as u64);
 
-        let checkpoint: Checkpoint =
-            bincode::decode_from_std_read(&mut reader, bincode::config::standard())
-                .map_err(|e| format!("反序列化检查点失败: {}", e))?;
+        let config = bincode::config::standard().with_limit::<BINCODE_DECODE_LIMIT_BYTES>();
+        let checkpoint: Checkpoint = bincode::decode_from_std_read(&mut reader, config)
+            .map_err(|e| format!("反序列化检查点失败: {}", e))?;
 
         // 重建模型
         let mut network: Vec<Box<dyn crate::llm::Layer>> = Vec::new();

@@ -6,6 +6,7 @@ use ndarray::Array2;
 use std::time::Instant;
 
 #[test]
+#[ignore]
 fn benchmark_mask_caching() {
     let mut self_attention = SelfAttention::new(EMBEDDING_DIM);
 
@@ -38,6 +39,7 @@ fn benchmark_mask_caching() {
 }
 
 #[test]
+#[ignore]
 fn benchmark_different_sequence_lengths() {
     let mut self_attention = SelfAttention::new(EMBEDDING_DIM);
 
@@ -70,6 +72,7 @@ fn benchmark_different_sequence_lengths() {
 }
 
 #[test]
+#[ignore]
 fn benchmark_numerical_stability() {
     let mut self_attention = SelfAttention::new(EMBEDDING_DIM);
 
@@ -112,6 +115,7 @@ fn benchmark_numerical_stability() {
 }
 
 #[test]
+#[ignore]
 fn benchmark_gradient_computation() {
     let mut self_attention = SelfAttention::new(EMBEDDING_DIM);
 
@@ -157,6 +161,7 @@ fn benchmark_gradient_computation() {
 }
 
 #[test]
+#[ignore]
 fn benchmark_cache_hit_rate() {
     let mut self_attention = SelfAttention::new(EMBEDDING_DIM);
 

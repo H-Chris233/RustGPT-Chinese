@@ -99,6 +99,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -110,6 +111,10 @@ use serde::{Deserialize, Serialize};
 
 use std::fs;
 use std::num::NonZeroUsize;
+
+/// 词表/词典类 JSON 文件大小上限（防止恶意/损坏文件导致 OOM）。
+const MAX_VOCAB_JSON_BYTES: u64 = 64 * 1024 * 1024; // 64MiB
+const MAX_IDIOMS_JSON_BYTES: u64 = 16 * 1024 * 1024; // 16MiB
 
 /// **全局成语集合**
 ///
@@ -243,6 +248,14 @@ fn jieba_instance() -> &'static Jieba {
 /// - `Err`: 文件读取或 JSON 解析错误
 fn load_common_idioms_from_file() -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let idioms_file_path = "data/chinese_idioms.json";
+    let meta = fs::metadata(idioms_file_path)?;
+    if meta.len() > MAX_IDIOMS_JSON_BYTES {
+        return Err(format!(
+            "成语词典文件过大(>{} bytes): {}",
+            MAX_IDIOMS_JSON_BYTES, idioms_file_path
+        )
+        .into());
+    }
     let idioms_json = fs::read_to_string(idioms_file_path)?;
     let idioms: Vec<String> = serde_json::from_str(&idioms_json)?;
     Ok(HashSet::from_iter(idioms))
@@ -1116,7 +1129,7 @@ impl Vocab {
     /// 推理时加载已保存的词汇表，避免重新构建（节省时间）。
     pub fn load_from_file<P: AsRef<Path>>(path: P) -> std::io::Result<Self> {
         let file = File::open(path)?;
-        let reader = std::io::BufReader::new(file);
+        let reader = std::io::BufReader::new(file).take(MAX_VOCAB_JSON_BYTES);
         let vocab: Vocab = serde_json::from_reader(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         Ok(vocab)

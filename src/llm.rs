@@ -42,7 +42,10 @@ impl Ord for ProbEntry {
 }
 
 #[derive(Clone)]
-struct SessionSnapshot {
+/// 推理会话的快照（用于保存/恢复 KV cache 与已处理 token 数）。
+///
+/// 该类型需要是公开的，否则 `InferenceSession::snapshot/restore` 的 public API 会泄漏私有类型。
+pub struct SessionSnapshot {
     processed_tokens: usize,
     kv_caches: Vec<Option<(Array2<f32>, Array2<f32>)>>,
 }

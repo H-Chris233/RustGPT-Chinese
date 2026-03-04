@@ -19,7 +19,7 @@
 // ============================================================================
 
 use std::fs::File;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
 
 use bincode::{Decode, Encode};
@@ -40,6 +40,21 @@ use crate::{
     transformer::TransformerBlock,
     vocab::Vocab,
 };
+
+/// 反序列化输入大小上限（防止恶意/损坏文件导致 OOM）。
+///
+/// 说明：
+/// - 这里的限制主要用于“解码阶段的资源上限控制”，并不等同于模型实际大小；
+/// - 如需支持更大的模型/检查点，可在后续改为可配置（例如环境变量），但当前按 KISS 先给出保守上限。
+const BINCODE_DECODE_LIMIT_BYTES: usize = 512 * 1024 * 1024; // 512MiB
+const JSON_DECODE_LIMIT_BYTES: u64 = 256 * 1024 * 1024; // 256MiB
+
+fn count_transformer_blocks(network: &[Box<dyn Layer>]) -> usize {
+    network
+        .iter()
+        .filter(|layer| layer.as_any().is::<TransformerBlock>())
+        .count()
+}
 
 // ============================================================================
 // Adam 优化器状态序列化
@@ -200,30 +215,25 @@ pub enum SerializableLayer {
 
 impl SerializableLayer {
     pub fn from_layer(layer: &Box<dyn Layer>) -> Result<Self, String> {
-        match layer.layer_type() {
-            "Embeddings" => {
-                let embeddings =
-                    unsafe { &*(layer.as_ref() as *const dyn Layer as *const Embeddings) };
-                Ok(SerializableLayer::Embeddings(Self::serialize_embeddings(
-                    embeddings,
-                )))
-            }
-            "TransformerBlock" => {
-                let transformer =
-                    unsafe { &*(layer.as_ref() as *const dyn Layer as *const TransformerBlock) };
-                Ok(SerializableLayer::TransformerBlock(
-                    Self::serialize_transformer_block(transformer),
-                ))
-            }
-            "OutputProjection" => {
-                let output_proj =
-                    unsafe { &*(layer.as_ref() as *const dyn Layer as *const OutputProjection) };
-                Ok(SerializableLayer::OutputProjection(
-                    Self::serialize_output_projection(output_proj),
-                ))
-            }
-            other => Err(format!("Unsupported layer type: {}", other)),
+        if let Some(embeddings) = layer.as_any().downcast_ref::<Embeddings>() {
+            return Ok(SerializableLayer::Embeddings(Self::serialize_embeddings(
+                embeddings,
+            )));
         }
+
+        if let Some(transformer) = layer.as_any().downcast_ref::<TransformerBlock>() {
+            return Ok(SerializableLayer::TransformerBlock(
+                Self::serialize_transformer_block(transformer),
+            ));
+        }
+
+        if let Some(output_proj) = layer.as_any().downcast_ref::<OutputProjection>() {
+            return Ok(SerializableLayer::OutputProjection(
+                Self::serialize_output_projection(output_proj),
+            ));
+        }
+
+        Err(format!("Unsupported layer type: {}", layer.layer_type()))
     }
 
     pub fn to_layer(&self, vocab_size: usize) -> Box<dyn Layer> {
@@ -271,42 +281,38 @@ impl SerializableLayer {
     }
 
     fn serialize_self_attention(attention: &SelfAttention) -> SerializableSelfAttention {
-        unsafe {
-            let ptr = attention as *const SelfAttention;
-
-            SerializableSelfAttention {
-                embedding_dim: (*ptr).embedding_dim,
-                num_heads: (*ptr).num_heads,
-                head_dim: (*ptr).head_dim,
-                w_q_shape: (*ptr).w_q.dim(),
-                w_q_data: (*ptr)
-                    .w_q
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                w_k_shape: (*ptr).w_k.dim(),
-                w_k_data: (*ptr)
-                    .w_k
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                w_v_shape: (*ptr).w_v.dim(),
-                w_v_data: (*ptr)
-                    .w_v
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                w_o_shape: (*ptr).w_o.dim(),
-                w_o_data: (*ptr)
-                    .w_o
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                optimizer_w_q: SerializableAdam::from_adam(&(*ptr).optimizer_w_q),
-                optimizer_w_k: SerializableAdam::from_adam(&(*ptr).optimizer_w_k),
-                optimizer_w_v: SerializableAdam::from_adam(&(*ptr).optimizer_w_v),
-                optimizer_w_o: SerializableAdam::from_adam(&(*ptr).optimizer_w_o),
-            }
+        SerializableSelfAttention {
+            embedding_dim: attention.embedding_dim,
+            num_heads: attention.num_heads,
+            head_dim: attention.head_dim,
+            w_q_shape: attention.w_q.dim(),
+            w_q_data: attention
+                .w_q
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            w_k_shape: attention.w_k.dim(),
+            w_k_data: attention
+                .w_k
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            w_v_shape: attention.w_v.dim(),
+            w_v_data: attention
+                .w_v
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            w_o_shape: attention.w_o.dim(),
+            w_o_data: attention
+                .w_o
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            optimizer_w_q: SerializableAdam::from_adam(&attention.optimizer_w_q),
+            optimizer_w_k: SerializableAdam::from_adam(&attention.optimizer_w_k),
+            optimizer_w_v: SerializableAdam::from_adam(&attention.optimizer_w_v),
+            optimizer_w_o: SerializableAdam::from_adam(&attention.optimizer_w_o),
         }
     }
 
@@ -366,39 +372,35 @@ impl SerializableLayer {
     }
 
     fn serialize_feed_forward(ff: &FeedForward) -> SerializableFeedForward {
-        unsafe {
-            let ptr = ff as *const FeedForward;
-
-            SerializableFeedForward {
-                w1_shape: (*ptr).w1.dim(),
-                w1_data: (*ptr)
-                    .w1
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                b1_shape: (*ptr).b1.dim(),
-                b1_data: (*ptr)
-                    .b1
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                w2_shape: (*ptr).w2.dim(),
-                w2_data: (*ptr)
-                    .w2
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                b2_shape: (*ptr).b2.dim(),
-                b2_data: (*ptr)
-                    .b2
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                optimizer_w1: SerializableAdam::from_adam(&(*ptr).optimizer_w1),
-                optimizer_b1: SerializableAdam::from_adam(&(*ptr).optimizer_b1),
-                optimizer_w2: SerializableAdam::from_adam(&(*ptr).optimizer_w2),
-                optimizer_b2: SerializableAdam::from_adam(&(*ptr).optimizer_b2),
-            }
+        SerializableFeedForward {
+            w1_shape: ff.w1.dim(),
+            w1_data: ff
+                .w1
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            b1_shape: ff.b1.dim(),
+            b1_data: ff
+                .b1
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            w2_shape: ff.w2.dim(),
+            w2_data: ff
+                .w2
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            b2_shape: ff.b2.dim(),
+            b2_data: ff
+                .b2
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            optimizer_w1: SerializableAdam::from_adam(&ff.optimizer_w1),
+            optimizer_b1: SerializableAdam::from_adam(&ff.optimizer_b1),
+            optimizer_w2: SerializableAdam::from_adam(&ff.optimizer_w2),
+            optimizer_b2: SerializableAdam::from_adam(&ff.optimizer_b2),
         }
     }
 
@@ -448,26 +450,22 @@ impl SerializableLayer {
     }
 
     fn serialize_layer_norm(ln: &LayerNorm) -> SerializableLayerNorm {
-        unsafe {
-            let ptr = ln as *const LayerNorm;
-
-            SerializableLayerNorm {
-                epsilon: (*ptr).epsilon,
-                gamma_shape: (*ptr).gamma.dim(),
-                gamma_data: (*ptr)
-                    .gamma
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 1.0 })
-                    .collect(),
-                beta_shape: (*ptr).beta.dim(),
-                beta_data: (*ptr)
-                    .beta
-                    .iter()
-                    .map(|&x| if x.is_finite() { x } else { 0.0 })
-                    .collect(),
-                optimizer_gamma: SerializableAdam::from_adam(&(*ptr).optimizer_gamma),
-                optimizer_beta: SerializableAdam::from_adam(&(*ptr).optimizer_beta),
-            }
+        SerializableLayerNorm {
+            epsilon: ln.epsilon,
+            gamma_shape: ln.gamma.dim(),
+            gamma_data: ln
+                .gamma
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 1.0 })
+                .collect(),
+            beta_shape: ln.beta.dim(),
+            beta_data: ln
+                .beta
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect(),
+            optimizer_gamma: SerializableAdam::from_adam(&ln.optimizer_gamma),
+            optimizer_beta: SerializableAdam::from_adam(&ln.optimizer_beta),
         }
     }
 
@@ -555,17 +553,13 @@ impl SerializableLayer {
     }
 
     fn serialize_transformer_block(tb: &TransformerBlock) -> SerializableTransformerBlock {
-        unsafe {
-            let ptr = tb as *const TransformerBlock;
-
-            SerializableTransformerBlock {
-                attention: Self::serialize_self_attention(&(*ptr).attention),
-                feed_forward: Self::serialize_feed_forward(&(*ptr).feed_forward),
-                dropout1: Self::serialize_dropout(&(*ptr).dropout1),
-                dropout2: Self::serialize_dropout(&(*ptr).dropout2),
-                norm1: Self::serialize_layer_norm(&(*ptr).norm1),
-                norm2: Self::serialize_layer_norm(&(*ptr).norm2),
-            }
+        SerializableTransformerBlock {
+            attention: Self::serialize_self_attention(&tb.attention),
+            feed_forward: Self::serialize_feed_forward(&tb.feed_forward),
+            dropout1: Self::serialize_dropout(&tb.dropout1),
+            dropout2: Self::serialize_dropout(&tb.dropout2),
+            norm1: Self::serialize_layer_norm(&tb.norm1),
+            norm2: Self::serialize_layer_norm(&tb.norm2),
         }
     }
 
@@ -646,7 +640,7 @@ pub fn save_model_binary<P: AsRef<Path>>(
         metadata: ModelMetadata {
             embedding_dim: EMBEDDING_DIM,
             hidden_dim: HIDDEN_DIM,
-            num_transformer_blocks: 4,
+            num_transformer_blocks: count_transformer_blocks(&model.network),
             vocab_size: model.vocab.len(),
             max_seq_len: model.max_context_length,
             training_info: None,
@@ -659,6 +653,7 @@ pub fn save_model_binary<P: AsRef<Path>>(
 
     let config = bincode::config::standard();
     bincode::encode_into_std_write(&serializable_model, &mut writer, config)?;
+    writer.flush()?;
     println!(" ✓");
 
     let file_size = std::fs::metadata(path.as_ref())?.len();
@@ -674,9 +669,9 @@ pub fn load_model_binary<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::er
     println!("   路径: {:?}", path.as_ref());
 
     let file = File::open(path.as_ref())?;
-    let mut reader = BufReader::new(file);
+    let mut reader = BufReader::new(file).take(BINCODE_DECODE_LIMIT_BYTES as u64);
 
-    let config = bincode::config::standard();
+    let config = bincode::config::standard().with_limit::<BINCODE_DECODE_LIMIT_BYTES>();
     let serializable_model: SerializableModel = bincode::decode_from_std_read(&mut reader, config)?;
 
     println!("   ✓ 文件读取成功");
@@ -742,7 +737,7 @@ pub fn save_model_json<P: AsRef<Path>>(
         metadata: ModelMetadata {
             embedding_dim: EMBEDDING_DIM,
             hidden_dim: HIDDEN_DIM,
-            num_transformer_blocks: 4,
+            num_transformer_blocks: count_transformer_blocks(&model.network),
             vocab_size: model.vocab.len(),
             max_seq_len: model.max_context_length,
             training_info: None,
@@ -751,8 +746,9 @@ pub fn save_model_json<P: AsRef<Path>>(
 
     print!("   写入 JSON 文件...");
     let file = File::create(path.as_ref())?;
-    let writer = BufWriter::new(file);
-    serde_json::to_writer_pretty(writer, &serializable_model)?;
+    let mut writer = BufWriter::new(file);
+    serde_json::to_writer_pretty(&mut writer, &serializable_model)?;
+    writer.flush()?;
     println!(" ✓");
 
     let file_size = std::fs::metadata(path.as_ref())?.len();
@@ -769,7 +765,7 @@ pub fn load_model_json<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::erro
     println!("   路径: {:?}", path.as_ref());
 
     let file = File::open(path.as_ref())?;
-    let reader = BufReader::new(file);
+    let reader = BufReader::new(file).take(JSON_DECODE_LIMIT_BYTES);
     let serializable_model: SerializableModel = serde_json::from_reader(reader)?;
 
     println!("   ✓ 文件读取成功");
