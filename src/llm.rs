@@ -673,7 +673,8 @@ impl LLM {
 
         let tokenized_data = data
             .iter()
-            .map(|input| self.tokenize(input))
+            // 教学要点：训练序列应包含 BOS/EOS，否则模型难以学会“什么时候结束”。
+            .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
             .collect::<Vec<Vec<usize>>>();
 
         for epoch in 0..epochs {
@@ -715,14 +716,6 @@ impl LLM {
                 for layer in self.network.iter_mut().rev() {
                     grads_output = layer.backward(&grads_output, current_lr);
                 }
-
-                let tokens = Self::greedy_decode(&probs);
-                let next_token = tokens[tokens.len() - 1];
-
-                if next_token == self.vocab.encode("</s>").unwrap() {
-                    continue;
-                }
-
                 sample_count += 1;
             }
 
@@ -904,6 +897,68 @@ impl LLM {
         grads.iter().map(|&x| x * x).sum::<f32>().sqrt()
     }
 
+    // =====================================================================
+    // 梯度累积：跨层统一调度（网络级别）
+    // =====================================================================
+    //
+    // 设计说明（教育项目优先）：
+    // - 本项目的 `Layer::backward()` 设计为“反向传播 + 立刻更新参数（Adam step）”。
+    // - 为了实现正确的梯度累积，我们不能简单把多个样本的 logits 梯度攒起来再 backward 一次，
+    //   因为各层 backward 依赖 forward 缓存（cached_input 等），缓存会被覆盖，导致数学错误。
+    // - 正确做法是：每个 micro-batch 立即 backward（保证缓存对应），但把 *参数梯度* 累积，
+    //   最终对平均梯度做一次参数更新。
+    //
+    // 由于网络里使用 `Box<dyn Layer>`（动态分发），我们在这里对已知层类型做 downcast，
+    // 并调用其 `*_accumulate / step_accumulated` 教学实现。
+    //
+    // 当前网络结构（src/main.rs）固定为：
+    // Embeddings -> TransformerBlock* -> OutputProjection
+    fn zero_grad_accum(&mut self) {
+        for layer in &mut self.network {
+            if let Some(emb) = layer.as_any_mut().downcast_mut::<Embeddings>() {
+                emb.zero_grad_accum();
+            } else if let Some(tb) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
+                tb.zero_grad_accum();
+            } else if let Some(op) = layer.as_any_mut().downcast_mut::<OutputProjection>() {
+                op.zero_grad_accum();
+            }
+        }
+    }
+
+    fn backward_accumulate(&mut self, grads_output: &Array2<f32>) -> Array2<f32> {
+        let mut grads = grads_output.clone();
+        for layer in self.network.iter_mut().rev() {
+            grads = if let Some(op) = layer.as_any_mut().downcast_mut::<OutputProjection>() {
+                op.backward_accumulate(&grads)
+            } else if let Some(tb) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
+                tb.backward_accumulate(&grads)
+            } else if let Some(emb) = layer.as_any_mut().downcast_mut::<Embeddings>() {
+                emb.backward_accumulate(&grads)
+            } else {
+                // 理论上不会发生（网络结构固定），但保底：直接 backward（会更新参数）。
+                // 这里打印 error，避免“悄悄错”。
+                log::error!(
+                    "Layer {} 未实现梯度累积接口，已回退为立即更新（accumulation_steps 将不再严格等价）",
+                    layer.layer_type()
+                );
+                layer.backward(&grads, 0.0)
+            };
+        }
+        grads
+    }
+
+    fn step_accumulated(&mut self, lr: f32, scale: f32) {
+        for layer in &mut self.network {
+            if let Some(emb) = layer.as_any_mut().downcast_mut::<Embeddings>() {
+                emb.step_accumulated(lr, scale);
+            } else if let Some(tb) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
+                tb.step_accumulated(lr, scale);
+            } else if let Some(op) = layer.as_any_mut().downcast_mut::<OutputProjection>() {
+                op.step_accumulated(lr, scale);
+            }
+        }
+    }
+
     /// 完整优化的训练方法（集成并行预处理与监控）
     ///
     /// # 特性
@@ -912,7 +967,7 @@ impl LLM {
     /// - ✅ 余弦退火学习率调度
     /// - ✅ 早停机制
     /// - ✅ 增强训练监控（困惑度、梯度范数、训练速度）
-    /// - ✅ Rayon scope 梯度归约（可根据数据量自动回退）
+    /// - ✅ 正确的梯度累积（accumulation_steps > 1 时：micro-batch 逐次 backward + 参数梯度累加，最终一次更新）
     ///
     /// # 参数
     /// - `data`: 训练数据
@@ -933,30 +988,22 @@ impl LLM {
     ) -> usize {
         self.set_training_mode(true);
 
-        const MIN_PARALLEL_TOKENIZE: usize = 16;
-        const MIN_PARALLEL_GRAD: usize = 8;
-
         let mut perf_monitor = PerformanceMonitor::new();
         let effective_accum_steps = accumulation_steps.max(1);
 
         println!("📝 正在预处理训练数据...");
         let preprocess_start = std::time::Instant::now();
 
-        let should_parallel_preprocess =
-            self.parallel_training && data.len() >= MIN_PARALLEL_TOKENIZE;
-
-        let preprocess_label = if should_parallel_preprocess {
-            "tokenization_parallel"
-        } else {
-            "tokenization_single_thread"
-        };
-
-        perf_monitor.start(preprocess_label);
+        // 说明：
+        // - 早期版本的注释中提到“Rayon 并行 tokenization”，但当前仓库并未引入 rayon 依赖；
+        // - 为避免教学误导，我们在这里采用明确的单线程实现，并保留计时监控。
+        perf_monitor.start("tokenization_single_thread");
         let tokenized_data: Vec<Vec<usize>> = data
             .iter()
-            .map(|input| Self::tokenize_with_vocab(&self.vocab, input))
+            // 训练序列必须包含 BOS/EOS（否则模型学不到“何时结束”）
+            .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
             .collect();
-        perf_monitor.stop(preprocess_label);
+        perf_monitor.stop("tokenization_single_thread");
 
         println!(
             "✅ 数据预处理完成，共 {} 个序列（耗时 {:.2}s）",
@@ -964,22 +1011,12 @@ impl LLM {
             preprocess_start.elapsed().as_secs_f32()
         );
 
-        if self.parallel_training && !should_parallel_preprocess {
-            println!("⚠️  样本数较少，tokenization 自动回退为单线程模式");
-        }
-
-        let use_parallel_gradients = self.parallel_training
-            && effective_accum_steps > 1
-            && tokenized_data.len() >= MIN_PARALLEL_GRAD;
-
         println!(
-            "🧵 梯度归约模式: {} (accumulation_steps={})",
-            if use_parallel_gradients {
-                "rayon 并行"
-            } else if self.parallel_training {
-                "单线程（自动回退）"
+            "🧮 梯度累积: {} (accumulation_steps={})",
+            if effective_accum_steps > 1 {
+                "启用：micro-batch 累积后一次更新"
             } else {
-                "单线程（手动配置）"
+                "关闭：每个样本一次更新"
             },
             effective_accum_steps
         );
@@ -998,27 +1035,13 @@ impl LLM {
             let mut total_loss = 0.0;
             let mut total_grad_norm = 0.0;
             let mut sample_count = 0usize;
-
-            let mut gradient_bucket: Vec<Array2<f32>> = Vec::with_capacity(effective_accum_steps);
-            let mut bucket_expected_len: Option<usize> = None;
+            let mut accum_counter = 0usize;
+            // 每个 epoch 重新开始累积
+            self.zero_grad_accum();
 
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
-                }
-
-                let seq_len = training_row.len() - 1;
-
-                if let Some(expected) = bucket_expected_len {
-                    if expected != seq_len && !gradient_bucket.is_empty() {
-                        self.apply_accumulated_gradients(
-                            &mut gradient_bucket,
-                            current_lr,
-                            use_parallel_gradients,
-                            &mut perf_monitor,
-                        );
-                        bucket_expected_len = None;
-                    }
                 }
 
                 // 前向传播
@@ -1046,29 +1069,27 @@ impl LLM {
 
                 Self::clip_gradients(&mut grads_output, 1.0);
 
-                bucket_expected_len.get_or_insert(seq_len);
-                gradient_bucket.push(grads_output);
-
-                if gradient_bucket.len() >= effective_accum_steps {
-                    self.apply_accumulated_gradients(
-                        &mut gradient_bucket,
-                        current_lr,
-                        use_parallel_gradients,
-                        &mut perf_monitor,
-                    );
-                    bucket_expected_len = None;
+                // ==========================
+                // 正确的梯度累积实现
+                // ==========================
+                //
+                // 关键点：
+                // - 必须对每个 micro-batch 立即执行 backward（否则层内 cached_* 会被后续样本覆盖）；
+                // - 但不立刻更新参数，而是把参数梯度累加到各层的累积 buffer；
+                // - 当累积步数到达阈值时，再统一对“平均梯度”执行一次参数更新（scale=1/steps）。
+                self.backward_accumulate(&grads_output);
+                accum_counter += 1;
+                if accum_counter >= effective_accum_steps {
+                    self.step_accumulated(current_lr, 1.0 / accum_counter as f32);
+                    accum_counter = 0;
                 }
 
                 sample_count += 1;
             }
 
-            if !gradient_bucket.is_empty() {
-                self.apply_accumulated_gradients(
-                    &mut gradient_bucket,
-                    current_lr,
-                    use_parallel_gradients,
-                    &mut perf_monitor,
-                );
+            // 处理最后一个“不满 accumulation_steps”的尾批次
+            if accum_counter > 0 {
+                self.step_accumulated(current_lr, 1.0 / accum_counter as f32);
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
@@ -1170,7 +1191,8 @@ impl LLM {
         // Tokenize 所有数据
         let tokenized_data: Vec<Vec<usize>> = data
             .iter()
-            .map(|input| Self::tokenize_with_vocab(&self.vocab, input))
+            // 训练序列必须包含 BOS/EOS（否则模型学不到“何时结束”）
+            .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
             .collect();
 
         println!(
@@ -1206,31 +1228,28 @@ impl LLM {
                     continue;
                 }
 
-                // 前向传播（批量）- 使用循环对每个样本单独处理
+                // 重要：本项目的各层 backward 依赖 forward 缓存（cached_input 等）。
+                // 因此在“同一模型实例”上做多个样本的 forward 后再统一 backward，会导致缓存被覆盖，
+                // 从而出现梯度与激活不匹配的严重错误。
                 //
-                // 注意：input_batch 中包含 PAD 位置，但 targets 是基于真实长度构建的。
-                // 如果直接用整个 input_batch 前向传播，会导致：
-                // 1) logits 行数 > target 长度
-                // 2) 反向传播梯度与目标长度不匹配
+                // 为了保证正确性，这里采用最清晰的做法：
+                // - 对 batch 内每个样本执行：forward -> loss -> backward（立刻更新参数）。
                 //
-                // 因此我们在每个样本内，根据 attention_mask 计算真实长度，
-                // 只取真实 token 做前向与反向传播。
-                let mut batch_outputs: Vec<Option<Array2<f32>>> =
-                    Vec::with_capacity(input_batch.batch_size);
-                let mut batch_targets = Vec::with_capacity(input_batch.batch_size);
-
+                // 这在数学上等价于“批内样本的顺序 SGD”，不是严格的“batch 梯度平均后更新一次”。
+                // 但它是正确的，并且符合教学项目“先正确、再优化”的原则。
                 for b in 0..input_batch.batch_size {
-                    // 只取真实 token（避免 PAD 参与前向计算）
-                    let target_len = targets.get(b).map_or(0, |t| t.len());
+                    let target_ids = targets.get(b).cloned().unwrap_or_default();
+                    let target_len = target_ids.len();
                     if target_len == 0 {
                         continue;
                     }
 
+                    // 只取真实 token（避免 PAD 参与前向计算）
                     let sample_tokens = input_batch.tokens.row(b);
                     let sample_ids: Vec<usize> =
                         sample_tokens.iter().take(target_len).copied().collect();
 
-                    // 单样本前向传播
+                    // forward
                     let mut input: Array2<f32> = Array2::zeros((1, sample_ids.len()));
                     input.row_mut(0).assign(
                         &sample_ids
@@ -1243,47 +1262,27 @@ impl LLM {
                         input = layer.forward(&input);
                     }
 
-                    batch_outputs.push(Some(input));
-                    batch_targets.push(targets.get(b).cloned().unwrap_or_default());
-                }
+                    let logits = input;
+                    let log_probs = log_softmax(&logits);
 
-                // 计算损失和反向传播（对每个样本）
-                let mut batch_loss = 0.0;
+                    // loss
+                    let loss = Self::cross_entropy_from_log_probs(&log_probs, &target_ids);
+                    total_loss += loss;
 
-                for (b, maybe_logits) in batch_outputs.iter().enumerate() {
-                    let Some(logits) = maybe_logits else {
-                        continue;
-                    };
-
-                    let target_ids = &batch_targets[b];
-                    if target_ids.is_empty() {
-                        continue;
-                    }
-
-                    let log_probs = log_softmax(logits);
-
-                    // 只计算真实 token 对齐的损失
-                    let target_ids = &targets[b];
-                    let loss = Self::cross_entropy_from_log_probs(&log_probs, target_ids);
-                    batch_loss += loss;
-
-                    // 计算梯度
+                    // grads (dL/dlogits)
                     let probs = log_probs.mapv(|x| x.exp());
-                    let mut sample_grad = Self::compute_gradients_step(&probs, target_ids);
+                    let mut grads = Self::compute_gradients_step(&probs, &target_ids);
 
-                    total_grad_norm += Self::compute_grad_norm(&sample_grad);
-                    Self::clip_gradients(&mut sample_grad, 1.0);
+                    total_grad_norm += Self::compute_grad_norm(&grads);
+                    Self::clip_gradients(&mut grads, 1.0);
 
-                    // 反向传播
-                    let mut grads = sample_grad;
+                    // backward + update
                     for layer in self.network.iter_mut().rev() {
                         grads = layer.backward(&grads, current_lr);
                     }
 
                     sample_count += 1;
                 }
-
-                total_loss += batch_loss;
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
@@ -1467,7 +1466,76 @@ impl LLM {
         tokens
     }
 
+    /// 将文本编码为“训练用 token 序列”：自动注入 BOS/EOS，并做长度截断。
+    ///
+    /// # 为什么训练必须有 BOS/EOS？
+    /// - 生成阶段通常用 `eos_token_id()` 作为停止条件；
+    /// - 如果训练数据里从不出现 EOS，模型就学不到“何时结束”，只能靠 max_len 强行截断；
+    /// - 对教学项目来说，这是非常典型、也非常容易被忽略的坑。
+    ///
+    /// # 具体策略（KISS 版本）
+    /// 1. 先按 `tokenize_with_vocab()` 做基础分词/编码；
+    /// 2. 序列非空时：开头插入 `<|bos|>`，末尾追加 `</s>`；
+    /// 3. 若超过 `MAX_SEQ_LEN`：保留 `BOS + 最后 N 个内容 token + EOS`（更偏向保留“最近上下文”）。
+    pub fn tokenize_training_with_vocab(vocab: &Vocab, text: &str) -> Vec<usize> {
+        let mut tokens = Self::tokenize_with_vocab(vocab, text);
+        if tokens.is_empty() {
+            return tokens;
+        }
+
+        let bos = vocab.bos_token_id();
+        let eos = vocab.eos_token_id();
+
+        if tokens.first().copied() != Some(bos) {
+            tokens.insert(0, bos);
+        }
+        if tokens.last().copied() != Some(eos) {
+            tokens.push(eos);
+        }
+
+        if tokens.len() <= MAX_SEQ_LEN {
+            return tokens;
+        }
+
+        // tokens: [BOS, ...content..., EOS]
+        let keep_content = MAX_SEQ_LEN.saturating_sub(2);
+        let content = &tokens[1..tokens.len().saturating_sub(1)];
+        let start = content.len().saturating_sub(keep_content);
+
+        let mut truncated = Vec::with_capacity(MAX_SEQ_LEN);
+        truncated.push(bos);
+        truncated.extend_from_slice(&content[start..]);
+        truncated.push(eos);
+        truncated
+    }
+
+    /// 将文本编码为“推理/提示词用 token 序列”：可选注入 BOS，但不自动追加 EOS。
+    ///
+    /// 说明：
+    /// - 训练时我们强制注入 BOS/EOS；推理时如果也注入 BOS，模型行为更一致；
+    /// - 但不注入 EOS：否则提示词会被模型理解为“已经结束”，影响生成。
+    pub fn tokenize_prompt_with_vocab(vocab: &Vocab, text: &str) -> Vec<usize> {
+        let mut tokens = Self::tokenize_with_vocab(vocab, text);
+        if tokens.is_empty() {
+            return tokens;
+        }
+
+        let bos = vocab.bos_token_id();
+        if tokens.first().copied() != Some(bos) {
+            tokens.insert(0, bos);
+        }
+
+        if tokens.len() > MAX_SEQ_LEN {
+            // 推理场景：保留末尾上下文（更贴近对话系统）
+            tokens = tokens[tokens.len() - MAX_SEQ_LEN..].to_vec();
+        }
+        tokens
+    }
+
     pub fn tokenize(&self, text: &str) -> Vec<usize> {
+        // 保持行为最小惊讶原则（KISS）：
+        // - `tokenize()` 只负责“把文本编码成 token ids”，不隐式注入特殊 token；
+        // - 训练场景请使用 `tokenize_training_with_vocab()`（显式注入 BOS/EOS）。
         Self::tokenize_with_vocab(&self.vocab, text)
     }
 
@@ -2100,17 +2168,38 @@ impl LLM {
         (ch as u32) >= 0x4E00 && (ch as u32) <= 0x9FFF
     }
 
-    fn cross_entropy_from_log_probs(log_probs: &Array2<f32>, target: &[usize]) -> f32 {
+    pub(crate) fn cross_entropy_from_log_probs(log_probs: &Array2<f32>, target: &[usize]) -> f32 {
         // 使用 log_softmax 输出计算交叉熵，避免对概率取对数的数值不稳定
         let mut loss = 0.0;
-        let n_targets = target.len() as f32;
+        let mut n_targets = 0usize;
 
         for (row_idx, &target_idx) in target.iter().enumerate() {
+            // 约定：PAD token id 固定为 0（见 vocab.rs / batch_loader.rs）。
+            // PAD 不应该参与 loss（否则会把“补齐的空白”当成训练信号）。
+            if target_idx == 0 {
+                continue;
+            }
+
+            if row_idx >= log_probs.shape()[0] || target_idx >= log_probs.shape()[1] {
+                log::warn!(
+                    "cross_entropy_from_log_probs 越界：row_idx={}, target_idx={}, log_probs_shape={:?}",
+                    row_idx,
+                    target_idx,
+                    log_probs.dim()
+                );
+                continue;
+            }
+
             let lp = log_probs[[row_idx, target_idx]];
             loss -= lp; // NLL: -log p(target)
+            n_targets += 1;
         }
 
-        loss / n_targets
+        if n_targets == 0 {
+            0.0
+        } else {
+            loss / (n_targets as f32)
+        }
     }
 
     /// 计算交叉熵损失（从softmax概率）
@@ -2141,13 +2230,30 @@ impl LLM {
             return grads; // 返回原始梯度，避免崩溃
         }
 
-        let batch_size = target.len() as f32;
+        let mut n_targets = 0usize;
 
         for (row_idx, &target_idx) in target.iter().enumerate() {
+            if target_idx == 0 {
+                continue; // PAD 不参与梯度
+            }
+
+            if target_idx >= grads.shape()[1] {
+                log::warn!(
+                    "compute_gradients_step 越界：row_idx={}, target_idx={}, probs_shape={:?}",
+                    row_idx,
+                    target_idx,
+                    probs.dim()
+                );
+                continue;
+            }
+
             grads[[row_idx, target_idx]] -= 1.0;
+            n_targets += 1;
         }
 
-        grads.mapv_inplace(|x| x / batch_size);
+        if n_targets > 0 {
+            grads.mapv_inplace(|x| x / (n_targets as f32));
+        }
         grads
     }
 
@@ -2160,62 +2266,6 @@ impl LLM {
         }
     }
 
-    fn apply_accumulated_gradients(
-        &mut self,
-        gradient_bucket: &mut Vec<Array2<f32>>,
-        current_lr: f32,
-        use_parallel: bool,
-        perf_monitor: &mut PerformanceMonitor,
-    ) {
-        if gradient_bucket.is_empty() {
-            return;
-        }
-
-        let label = if use_parallel && gradient_bucket.len() > 1 {
-            "梯度累积(并行归约)"
-        } else {
-            "梯度累积(单线程归约)"
-        };
-
-        let track_perf = use_parallel && gradient_bucket.len() > 1;
-
-        if track_perf {
-            perf_monitor.start(label);
-        }
-
-        let aggregated = if use_parallel && gradient_bucket.len() > 1 {
-            Self::aggregate_gradients_parallel(gradient_bucket.as_slice())
-        } else {
-            Self::aggregate_gradients_sequential(gradient_bucket.as_slice())
-        };
-
-        if track_perf {
-            perf_monitor.stop(label);
-        }
-
-        gradient_bucket.clear();
-
-        let mut current_grad = aggregated;
-        for layer in self.network.iter_mut().rev() {
-            current_grad = layer.backward(&current_grad, current_lr);
-        }
-    }
-
-    fn aggregate_gradients_sequential(gradients: &[Array2<f32>]) -> Array2<f32> {
-        if gradients.is_empty() {
-            return Array2::zeros((0, 0));
-        }
-
-        let mut acc = gradients[0].clone();
-        for grad in &gradients[1..] {
-            acc += grad;
-        }
-        acc.mapv_inplace(|x| x / gradients.len() as f32);
-        acc
-    }
-
-    fn aggregate_gradients_parallel(gradients: &[Array2<f32>]) -> Array2<f32> {
-        // 简化实现：对于小模型，串行聚合性能足够好
-        Self::aggregate_gradients_sequential(gradients)
-    }
+    // 说明：旧版实现中存在 “logits 梯度累积后只 backward 一次” 的数学错误（缓存覆盖）。
+    // 为了避免误用，我们已完全移除旧的梯度桶聚合函数。
 }

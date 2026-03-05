@@ -93,13 +93,24 @@ pub struct LayerNorm {
     // ========== Adam 优化器 ==========
     pub optimizer_gamma: Adam,
     pub optimizer_beta: Adam,
+
+    // =====================================================================
+    // 梯度累积支持（Gradient Accumulation）
+    // =====================================================================
+    //
+    // 说明：
+    // - LayerNorm 的可训练参数只有 γ/β，两者的梯度形状都是 (1, embedding_dim)。
+    // - 为了支持“正确的梯度累积”，我们在每个 micro-batch 的 backward 时计算并累加梯度，
+    //   而不是立刻更新参数；累积周期结束后再统一做一次 Adam step。
+    pub grad_gamma_accum: Array2<f32>,
+    pub grad_beta_accum: Array2<f32>,
 }
 
 impl LayerNorm {
     /// **创建新的层归一化层**
     ///
     /// # 参数
-    /// - `embedding_dim`: 特征维度（512）
+    /// - `embedding_dim`: 特征维度（与 EMBEDDING_DIM 一致）
     ///
     /// # 初始化策略
     /// - **γ (gamma)**: 初始化为全1（保持原始尺度）
@@ -117,7 +128,84 @@ impl LayerNorm {
             cached_std: None,
             optimizer_gamma: Adam::new((1, embedding_dim)),
             optimizer_beta: Adam::new((1, embedding_dim)),
+            grad_gamma_accum: Array2::zeros((1, embedding_dim)),
+            grad_beta_accum: Array2::zeros((1, embedding_dim)),
         }
+    }
+
+    /// 清空梯度累积 buffer。
+    pub fn zero_grad_accum(&mut self) {
+        self.grad_gamma_accum.fill(0.0);
+        self.grad_beta_accum.fill(0.0);
+    }
+
+    /// 仅计算并累积参数梯度，不更新参数（用于梯度累积）。
+    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        let (Some(input), Some(mean), Some(std)) = (
+            self.cached_input.as_ref(),
+            self.cached_mean.as_ref(),
+            self.cached_std.as_ref(),
+        ) else {
+            log::warn!("LayerNorm.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
+            return grads.clone();
+        };
+
+        let (grad_input, grad_gamma, grad_beta) =
+            Self::compute_grads(input, mean, std, grads, &self.gamma, self.epsilon);
+
+        self.grad_gamma_accum += &grad_gamma;
+        self.grad_beta_accum += &grad_beta;
+
+        grad_input
+    }
+
+    /// 对累积的梯度执行一次参数更新，并清空累积 buffer。
+    pub fn step_accumulated(&mut self, lr: f32, scale: f32) {
+        let grad_gamma_scaled = &self.grad_gamma_accum * scale;
+        let grad_beta_scaled = &self.grad_beta_accum * scale;
+
+        self.optimizer_gamma
+            .step(&mut self.gamma, &grad_gamma_scaled, lr);
+        self.optimizer_beta
+            .step(&mut self.beta, &grad_beta_scaled, lr);
+
+        self.zero_grad_accum();
+    }
+
+    fn compute_grads(
+        input: &Array2<f32>,
+        mean: &Array2<f32>,
+        std: &Array2<f32>,
+        grads: &Array2<f32>,
+        gamma: &Array2<f32>,
+        epsilon: f32,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+        let normalized = (input - mean) / (std + epsilon);
+        let n_features = input.shape()[1] as f32;
+
+        let grad_gamma = (&normalized * grads).sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_beta = grads.sum_axis(Axis(0)).insert_axis(Axis(0));
+
+        let grad_normalized = gamma * grads;
+
+        let grad_input = {
+            let variance = std * std + epsilon;
+            let grad_var = (&grad_normalized * &normalized)
+                .sum_axis(Axis(1))
+                .insert_axis(Axis(1))
+                * (-0.5)
+                / variance.mapv(|x| x * x.sqrt());
+            let grad_mean = grad_normalized.sum_axis(Axis(1)).insert_axis(Axis(1)) * (-1.0)
+                / (std + epsilon)
+                + &grad_var * (input - mean).sum_axis(Axis(1)).insert_axis(Axis(1)) * (-2.0)
+                    / n_features;
+
+            &grad_normalized / (std + epsilon)
+                + &grad_var * 2.0 * (input - mean) / n_features
+                + &grad_mean / n_features
+        };
+
+        (grad_input, grad_gamma, grad_beta)
     }
 
     /// **执行层归一化**
@@ -203,30 +291,8 @@ impl Layer for LayerNorm {
             return grads.clone();
         };
 
-        let normalized = (input - mean) / (std + self.epsilon);
-        let n_features = input.shape()[1] as f32;
-
-        let grad_gamma = (&normalized * grads).sum_axis(Axis(0)).insert_axis(Axis(0));
-        let grad_beta = grads.sum_axis(Axis(0)).insert_axis(Axis(0));
-
-        let grad_normalized = &self.gamma * grads;
-
-        let grad_input = {
-            let variance = std * std + self.epsilon;
-            let grad_var = (&grad_normalized * &normalized)
-                .sum_axis(Axis(1))
-                .insert_axis(Axis(1))
-                * (-0.5)
-                / variance.mapv(|x| x * x.sqrt());
-            let grad_mean = grad_normalized.sum_axis(Axis(1)).insert_axis(Axis(1)) * (-1.0)
-                / (std + self.epsilon)
-                + &grad_var * (input - mean).sum_axis(Axis(1)).insert_axis(Axis(1)) * (-2.0)
-                    / n_features;
-
-            &grad_normalized / (std + self.epsilon)
-                + &grad_var * 2.0 * (input - mean) / n_features
-                + &grad_mean / n_features
-        };
+        let (grad_input, grad_gamma, grad_beta) =
+            Self::compute_grads(input, mean, std, grads, &self.gamma, self.epsilon);
 
         self.optimizer_gamma.step(&mut self.gamma, &grad_gamma, lr);
         self.optimizer_beta.step(&mut self.beta, &grad_beta, lr);

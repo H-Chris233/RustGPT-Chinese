@@ -5,9 +5,9 @@
 //! ## 网络结构
 //!
 //! FFN 是一个简单的两层全连接网络，包含：
-//! 1. **扩展层**：512 → 1024（embedding_dim → hidden_dim）
+//! 1. **扩展层**：embedding_dim → hidden_dim
 //! 2. **ReLU 激活**：引入非线性
-//! 3. **压缩层**：1024 → 512（hidden_dim → embedding_dim）
+//! 3. **压缩层**：hidden_dim → embedding_dim
 //!
 //! ## 数学表示
 //!
@@ -16,12 +16,12 @@
 //! ```
 //!
 //! 其中：
-//! - `x`: 输入 (seq_len, 512)
-//! - `W₁`: 第一层权重 (512, 1024)
-//! - `b₁`: 第一层偏置 (1, 1024)
+//! - `x`: 输入 (seq_len, embedding_dim)
+//! - `W₁`: 第一层权重 (embedding_dim, hidden_dim)
+//! - `b₁`: 第一层偏置 (1, hidden_dim)
 //! - `ReLU`: 激活函数，ReLU(x) = max(0, x)
-//! - `W₂`: 第二层权重 (1024, 512)
-//! - `b₂`: 第二层偏置 (1, 512)
+//! - `W₂`: 第二层权重 (hidden_dim, embedding_dim)
+//! - `b₂`: 第二层偏置 (1, embedding_dim)
 //!
 //! ## 为什么需要 FFN？
 //!
@@ -42,20 +42,20 @@ use crate::{adam::Adam, llm::Layer, utils::sample_normal};
 
 /// **前馈神经网络结构体**
 pub struct FeedForward {
-    /// **第一层权重** W₁: (embedding_dim, hidden_dim) = (512, 1024)
+    /// **第一层权重** W₁: (embedding_dim, hidden_dim)
     pub w1: Array2<f32>,
 
     /// **第一层偏置** b₁: (1, hidden_dim) = (1, 1024)
     pub b1: Array2<f32>,
 
-    /// **第二层权重** W₂: (hidden_dim, embedding_dim) = (1024, 512)
+    /// **第二层权重** W₂: (hidden_dim, embedding_dim)
     pub w2: Array2<f32>,
 
     /// **第二层偏置** b₂: (1, embedding_dim) = (1, 512)
     pub b2: Array2<f32>,
 
     // ========== 缓存变量（用于反向传播） ==========
-    /// **缓存的输入** x: (seq_len, 512)
+    /// **缓存的输入** x: (seq_len, embedding_dim)
     pub input: Option<Array2<f32>>,
 
     /// **ReLU 激活前的隐藏层** (seq_len, 1024)
@@ -78,14 +78,22 @@ pub struct FeedForward {
 
     /// b₂ 的优化器
     pub optimizer_b2: Adam,
+
+    // =====================================================================
+    // 梯度累积支持（Gradient Accumulation）
+    // =====================================================================
+    pub grad_w1_accum: Array2<f32>,
+    pub grad_b1_accum: Array2<f32>,
+    pub grad_w2_accum: Array2<f32>,
+    pub grad_b2_accum: Array2<f32>,
 }
 
 impl FeedForward {
     /// **创建新的前馈神经网络**
     ///
     /// # 参数
-    /// - `embedding_dim`: 输入/输出维度（512）
-    /// - `hidden_dim`: 中间层维度（1024）
+    /// - `embedding_dim`: 输入/输出维度（与 EMBEDDING_DIM 一致）
+    /// - `hidden_dim`: 中间层维度（与 HIDDEN_DIM 一致）
     ///
     /// # 权重初始化：He 初始化
     ///
@@ -131,7 +139,91 @@ impl FeedForward {
             optimizer_b1: Adam::new((1, hidden_dim)),
             optimizer_w2: Adam::new((hidden_dim, embedding_dim)),
             optimizer_b2: Adam::new((1, embedding_dim)),
+            grad_w1_accum: Array2::zeros((embedding_dim, hidden_dim)),
+            grad_b1_accum: Array2::zeros((1, hidden_dim)),
+            grad_w2_accum: Array2::zeros((hidden_dim, embedding_dim)),
+            grad_b2_accum: Array2::zeros((1, embedding_dim)),
         }
+    }
+
+    pub fn zero_grad_accum(&mut self) {
+        self.grad_w1_accum.fill(0.0);
+        self.grad_b1_accum.fill(0.0);
+        self.grad_w2_accum.fill(0.0);
+        self.grad_b2_accum.fill(0.0);
+    }
+
+    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        let (Some(input), Some(hidden_pre_activation), Some(hidden_post_activation)) = (
+            self.input.as_ref(),
+            self.hidden_pre_activation.as_ref(),
+            self.hidden_post_activation.as_ref(),
+        ) else {
+            log::warn!("FeedForward.backward_accumulate 在未执行 forward 的情况下被调用，跳过累积");
+            return grads.clone();
+        };
+
+        let (
+            grad_input,
+            grad_w1,
+            grad_b1,
+            grad_w2,
+            grad_b2,
+        ) = Self::compute_grads(
+            input,
+            hidden_pre_activation,
+            hidden_post_activation,
+            grads,
+            &self.w1,
+            &self.w2,
+        );
+
+        self.grad_w1_accum += &grad_w1;
+        self.grad_b1_accum += &grad_b1;
+        self.grad_w2_accum += &grad_w2;
+        self.grad_b2_accum += &grad_b2;
+
+        grad_input
+    }
+
+    pub fn step_accumulated(&mut self, lr: f32, scale: f32) {
+        self.optimizer_w2
+            .step(&mut self.w2, &(&self.grad_w2_accum * scale), lr);
+        self.optimizer_b2
+            .step(&mut self.b2, &(&self.grad_b2_accum * scale), lr);
+        self.optimizer_w1
+            .step(&mut self.w1, &(&self.grad_w1_accum * scale), lr);
+        self.optimizer_b1
+            .step(&mut self.b1, &(&self.grad_b1_accum * scale), lr);
+
+        self.zero_grad_accum();
+    }
+
+    fn compute_grads(
+        input: &Array2<f32>,
+        hidden_pre_activation: &Array2<f32>,
+        hidden_post_activation: &Array2<f32>,
+        grads: &Array2<f32>,
+        w1: &Array2<f32>,
+        w2: &Array2<f32>,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>) {
+        // grad_W₂ = h_activated^T · grad_output
+        let grad_w2 = hidden_post_activation.t().dot(grads);
+        let grad_b2 = grads.sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_hidden_post_activation = grads.dot(&w2.t());
+
+        // ReLU'(x) = 1 if x>0 else 0
+        let mut relu_grad = hidden_pre_activation.clone();
+        relu_grad.map_inplace(|x| {
+            *x = if *x > 0.0 { 1.0 } else { 0.0 };
+        });
+        let grad_hidden_pre_activation = grad_hidden_post_activation * relu_grad;
+
+        let grad_w1 = input.t().dot(&grad_hidden_pre_activation);
+        let grad_b1 = grad_hidden_pre_activation.sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_input = grad_hidden_pre_activation.dot(&w1.t());
+
+        (grad_input, grad_w1, grad_b1, grad_w2, grad_b2)
     }
 }
 
@@ -186,37 +278,20 @@ impl Layer for FeedForward {
             return grads.clone();
         };
 
-        // ========== 反向传播第二层（输出层） ==========
-        // grad_W₂ = h_activated^T · grad_output
-        let grad_w2 = hidden_post_activation.t().dot(grads);
-
-        // grad_b₂ = sum(grad_output, axis=0)
-        let grad_b2 = grads.sum_axis(Axis(0)).insert_axis(Axis(0));
-
-        // grad_h_activated = grad_output · W₂^T
-        let grad_hidden_post_activation = grads.dot(&self.w2.t());
-
-        // ========== 反向传播 ReLU 激活函数 ==========
-        // ReLU 的导数：x > 0 ? 1 : 0
-        let mut relu_grad = hidden_pre_activation.clone();
-        relu_grad.map_inplace(|x| {
-            *x = if *x > 0.0 { 1.0 } else { 0.0 };
-        });
-
-        // grad_h = grad_h_activated * ReLU'(h) (逐元素相乘)
-        let grad_hidden_pre_activation = grad_hidden_post_activation * relu_grad;
-
-        // ========== 反向传播第一层 ==========
-        // grad_W₁ = input^T · grad_h
-        let grad_w1 = input.t().dot(&grad_hidden_pre_activation);
-
-        // grad_b₁ = sum(grad_h, axis=0)
-        let grad_b1 = grad_hidden_pre_activation
-            .sum_axis(Axis(0))
-            .insert_axis(Axis(0));
-
-        // grad_input = grad_h · W₁^T（传递给上一层）
-        let grad_input_feedforward = grad_hidden_pre_activation.dot(&self.w1.t());
+        let (
+            grad_input_feedforward,
+            grad_w1,
+            grad_b1,
+            grad_w2,
+            grad_b2,
+        ) = Self::compute_grads(
+            input,
+            hidden_pre_activation,
+            hidden_post_activation,
+            grads,
+            &self.w1,
+            &self.w2,
+        );
 
         // ========== 使用 Adam 优化器更新所有参数 ==========
         self.optimizer_w2.step(&mut self.w2, &grad_w2, lr);

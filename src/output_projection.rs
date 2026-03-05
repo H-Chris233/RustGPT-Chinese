@@ -7,7 +7,7 @@
 //! 将 Transformer 的输出（512维向量）转换为词汇表大小的 logits（概率分数）：
 //!
 //! ```text
-//! 输入: (seq_len, 512) - Transformer 的隐藏状态
+//! 输入: (seq_len, EMBEDDING_DIM) - Transformer 的隐藏状态
 //! 输出: (seq_len, vocab_size) - 每个词的未归一化概率
 //! ```
 //!
@@ -23,7 +23,7 @@
 //! ## 参数规模
 //!
 //! 这是模型中参数最多的层之一：
-//! - **权重**: 512 × vocab_size ≈ 512 × 10,000 = 5,120,000 参数
+//! - **权重**: EMBEDDING_DIM × vocab_size
 //! - **偏置**: vocab_size ≈ 10,000 参数
 //! - **总计**: 约 512 万参数
 //!
@@ -33,7 +33,7 @@
 //! - **优势**: 减少参数量，提高训练效率
 //! - **本项目**: 未实现权重共享（教育目的，保持独立性）
 
-use ndarray::{Array2, Axis};
+use ndarray::{Array1, Array2, Axis};
 
 use crate::{adam::Adam, llm::Layer, utils::sample_normal};
 
@@ -52,6 +52,28 @@ pub struct OutputProjection {
 
     /// **缓存输入**: 用于反向传播计算梯度
     pub cached_input: Option<Array2<f32>>,
+
+    // =====================================================================
+    // 梯度累积支持（Gradient Accumulation）
+    // =====================================================================
+    //
+    // 背景：
+    // - 本项目的训练代码支持 `accumulation_steps`（梯度累积），用于在显存/内存有限时
+    //   “用多个 micro-batch 模拟一个大 batch”。
+    // - 早期实现曾经尝试“只累积 logits 梯度，最后统一 backward 一次”，但由于各层的
+    //   backward 依赖 forward 缓存（cached_input 等），会导致缓存被覆盖，从而使梯度
+    //   与激活不匹配（数学错误）。
+    //
+    // 解决方案：
+    // - 每个 micro-batch 都立刻执行一次完整 backward（保证缓存正确）；
+    // - 但不立刻更新参数，而是把参数梯度累加到下面的 buffer 中；
+    // - 当累积步数到达阈值时，再把累加梯度做平均（scale=1/steps）并执行一次 Adam 更新。
+    //
+    // 说明：
+    // - 这里的 buffer **不参与序列化**（checkpoint 不保存它们），因为它们只在一次
+    //   训练 step 内有意义；恢复训练时从 0 开始累积是正确且预期的。
+    pub grad_w_out_accum: Array2<f32>,
+    pub grad_b_out_accum: Array2<f32>,
 }
 
 impl OutputProjection {
@@ -86,7 +108,76 @@ impl OutputProjection {
             b_out: Array2::zeros((1, vocab_size)),
             optimizer: Adam::new((embedding_dim, vocab_size)),
             cached_input: None,
+            grad_w_out_accum: Array2::zeros((embedding_dim, vocab_size)),
+            grad_b_out_accum: Array2::zeros((1, vocab_size)),
         }
+    }
+
+    /// 清空梯度累积 buffer。
+    ///
+    /// 教学要点：
+    /// - 梯度累积的本质是“把多个 micro-batch 的梯度求和/平均后再更新一次参数”。因此每个
+    ///   累积周期开始前必须把累积 buffer 清零。
+    pub fn zero_grad_accum(&mut self) {
+        self.grad_w_out_accum.fill(0.0);
+        self.grad_b_out_accum.fill(0.0);
+    }
+
+    /// 仅做“梯度计算 + 累加”，不更新参数（用于梯度累积）。
+    ///
+    /// 返回值：传递给前一层的梯度（dL/dInput）。
+    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        let Some(input) = self.cached_input.as_ref() else {
+            log::warn!("OutputProjection.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
+            return grads.clone();
+        };
+
+        let (grad_input, grad_w_out, grad_b_out) = Self::compute_grads(input, &self.w_out, grads);
+
+        self.grad_w_out_accum += &grad_w_out;
+        self.grad_b_out_accum += &grad_b_out;
+
+        grad_input
+    }
+
+    /// 对累积的梯度执行一次参数更新，并清空累积 buffer。
+    ///
+    /// # 参数
+    /// - `lr`: 学习率
+    /// - `scale`: 梯度缩放系数（通常为 `1.0 / accumulation_steps`，表示取平均梯度）
+    pub fn step_accumulated(&mut self, lr: f32, scale: f32) {
+        let grad_w_scaled = &self.grad_w_out_accum * scale;
+        let grad_b_scaled = &self.grad_b_out_accum * scale;
+
+        self.optimizer.step(&mut self.w_out, &grad_w_scaled, lr);
+
+        // bias 采用“纯 SGD 更新”（不走 Adam），以保持与历史 checkpoint 格式兼容。
+        // 同时我们在这里使用 **sum**（而不是 mean）来聚合 bias 梯度，避免多除一次 seq_len。
+        self.b_out -= &(lr * grad_b_scaled);
+
+        self.zero_grad_accum();
+    }
+
+    fn compute_grads(
+        input: &Array2<f32>,
+        w_out: &Array2<f32>,
+        grads: &Array2<f32>,
+    ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
+        // 计算权重梯度: grad_W = input^T · grads
+        let grad_w_out = input.t().dot(grads);
+
+        // 计算偏置梯度：对 token 位置维度求和（sum），而不是 mean。
+        //
+        // 原因（非常关键）：
+        // - 本项目的 `compute_gradients_step()` 已经对 token 数做了平均（除以 target.len()）；
+        // - 如果此处再对 token 维度取 mean，相当于又额外除一次 seq_len，导致 bias 学习过慢。
+        let grad_b_vec: Array1<f32> = grads.sum_axis(Axis(0));
+        let grad_b_out = grad_b_vec.insert_axis(Axis(0));
+
+        // 计算输入梯度: grad_input = grads · W^T
+        let grad_input = grads.dot(&w_out.t());
+
+        (grad_input, grad_w_out, grad_b_out)
     }
 }
 
@@ -152,16 +243,7 @@ impl Layer for OutputProjection {
             return grads.clone();
         };
 
-        // 计算权重梯度: grad_W = input^T · grads
-        let grad_w_out = input.t().dot(grads);
-
-        // 计算偏置梯度: grad_b = mean(grads)
-        let grad_b_out = grads
-            .mean_axis(Axis(0))
-            .unwrap_or_else(|| ndarray::Array1::zeros(grads.shape()[1]));
-
-        // 计算输入梯度: grad_input = grads · W^T
-        let grad_input = grads.dot(&self.w_out.t());
+        let (grad_input, grad_w_out, grad_b_out) = Self::compute_grads(input, &self.w_out, grads);
 
         // 更新参数
         self.optimizer.step(&mut self.w_out, &grad_w_out, lr);

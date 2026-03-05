@@ -82,7 +82,7 @@ use crate::{
 /// ## 组件说明
 ///
 /// - **attention**: 8头自注意力机制，负责捕捉序列中不同位置之间的依赖关系
-/// - **feed_forward**: 两层全连接网络 (512→1024→512)，负责特征变换
+/// - **feed_forward**: 两层全连接网络 (embedding_dim→hidden_dim→embedding_dim)，负责特征变换
 /// - **norm1, norm2**: 层归一化，稳定训练过程
 /// - **dropout1, dropout2**: 10% 的 dropout 率，防止过拟合
 pub struct TransformerBlock {
@@ -126,6 +126,56 @@ impl TransformerBlock {
             norm1: LayerNorm::new(embedding_dim),
             norm2: LayerNorm::new(embedding_dim),
         }
+    }
+
+    // =====================================================================
+    // 梯度累积支持（Gradient Accumulation）
+    // =====================================================================
+    //
+    // 教学说明：
+    // - TransformerBlock 本身没有“独立参数”，参数都在子层里（SelfAttention/FFN/LayerNorm）。
+    // - 因此梯度累积的实现也需要“递归下沉”到子层：micro-batch 级别计算梯度并累积，
+    //   累积步结束后统一更新一次参数。
+    pub fn zero_grad_accum(&mut self) {
+        self.attention.zero_grad_accum();
+        self.feed_forward.zero_grad_accum();
+        self.norm1.zero_grad_accum();
+        self.norm2.zero_grad_accum();
+    }
+
+    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        // 逻辑与 `backward()` 完全一致，但子层调用的是 backward_accumulate（不更新参数）。
+        //
+        // 关键点：
+        // - Dropout 没有参数，backward 只依赖 mask，因此可以直接复用；
+        // - LayerNorm/Attention/FFN 都会把参数梯度累加到各自的 buffer 中。
+
+        // ========== 反向传播第二个残差连接 ==========
+        let grad_dropout2 = grads;
+        let grad_x_from_residual2 = grads;
+
+        let grad_dropout2_out = self.dropout2.backward(grad_dropout2, 0.0);
+        let grad_ffn = self.feed_forward.backward_accumulate(&grad_dropout2_out);
+        let grad_norm2 = self.norm2.backward_accumulate(&grad_ffn);
+
+        let grad_x = &grad_norm2 + grad_x_from_residual2;
+
+        // ========== 反向传播第一个残差连接 ==========
+        let grad_dropout1 = &grad_x;
+        let grad_input_from_residual1 = &grad_x;
+
+        let grad_dropout1_out = self.dropout1.backward(grad_dropout1, 0.0);
+        let grad_attention = self.attention.backward_accumulate(&grad_dropout1_out);
+        let grad_norm1 = self.norm1.backward_accumulate(&grad_attention);
+
+        &grad_norm1 + grad_input_from_residual1
+    }
+
+    pub fn step_accumulated(&mut self, lr: f32, scale: f32) {
+        self.attention.step_accumulated(lr, scale);
+        self.feed_forward.step_accumulated(lr, scale);
+        self.norm1.step_accumulated(lr, scale);
+        self.norm2.step_accumulated(lr, scale);
     }
 
     /// 推理路径：在 KV 缓存开启时使用增量前向传播

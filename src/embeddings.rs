@@ -13,7 +13,7 @@
 //!
 //! **示例**：
 //! ```text
-//! "北京" → [0.23, -0.45, 0.67, ..., 0.12]  (512维)
+//! "北京" → [0.23, -0.45, 0.67, ..., 0.12]  (EMBEDDING_DIM 维)
 //! "上海" → [0.25, -0.42, 0.65, ..., 0.10]  (相似的向量)
 //! "苹果" → [-0.31, 0.52, -0.18, ..., 0.87] (不同的向量)
 //! ```
@@ -34,7 +34,7 @@
 //! 其中：
 //! - `pos` = 词在序列中的位置 (0, 1, 2, ...)
 //! - `i` = 嵌入维度的索引 (0, 1, 2, ..., 255)
-//! - `d` = 嵌入维度总数 (512)
+//! - `d` = 嵌入维度总数 (EMBEDDING_DIM)
 //!
 //! ### 3. 组合方式
 //!
@@ -78,10 +78,26 @@ pub struct Embeddings {
     /// 保存前向传播时的 token ID，反向传播时需要知道更新哪些行的嵌入。
     pub cached_input: Option<Array2<f32>>,
 
+    /// **批量前向的缓存输入**（用于 backward_batch）
+    ///
+    /// 说明：
+    /// - 之前版本的 `forward_batch/backward_batch` 是“演示性”的：forward 能输出，
+    ///   但 backward 没有更新嵌入矩阵，属于教学项目中会误导读者的错误实现。
+    /// - 这里我们显式缓存 batch 的 token IDs，并在 `backward_batch` 中按 mask 累积梯度。
+    pub cached_input_batch: Option<Array2<usize>>,
+
     /// **Adam 优化器**
     ///
     /// 用于更新词嵌入矩阵的参数。每个词的嵌入向量独立更新。
     pub token_optimizer: Adam,
+
+    // =====================================================================
+    // 梯度累积支持（Gradient Accumulation）
+    // =====================================================================
+    //
+    // 与 OutputProjection 同理：为了实现“正确的梯度累积”，我们需要在每个 micro-batch
+    // 立刻执行 backward（保证缓存正确），但把参数梯度累加起来，等到累积步结束再更新一次。
+    pub token_grads_accum: Array2<f32>,
 
     /// **位置编码缓存** (性能优化)
     ///
@@ -96,7 +112,9 @@ impl Default for Embeddings {
             token_embeddings: Self::init_embeddings(vocab.words.len(), EMBEDDING_DIM),
             position_encoder: PositionEncoding::new(),
             cached_input: None,
+            cached_input_batch: None,
             token_optimizer: Adam::new((vocab.words.len(), EMBEDDING_DIM)),
+            token_grads_accum: Array2::<f32>::zeros((vocab.words.len(), EMBEDDING_DIM)),
             position_cache: Array2::<f32>::zeros((crate::MAX_SEQ_LEN, EMBEDDING_DIM)),
         }
     }
@@ -111,13 +129,56 @@ impl Embeddings {
     /// # 初始化策略
     /// 使用正态分布 N(0, 0.02) 初始化嵌入权重。较小的标准差（0.02）有助于训练稳定。
     pub fn new(vocab: Vocab) -> Self {
+        let vocab_size = vocab.words.len();
         Self {
-            token_embeddings: Self::init_embeddings(vocab.words.len(), EMBEDDING_DIM),
+            token_embeddings: Self::init_embeddings(vocab_size, EMBEDDING_DIM),
             position_encoder: PositionEncoding::new(),
             cached_input: None,
-            token_optimizer: Adam::new((vocab.words.len(), EMBEDDING_DIM)),
+            cached_input_batch: None,
+            token_optimizer: Adam::new((vocab_size, EMBEDDING_DIM)),
+            token_grads_accum: Array2::<f32>::zeros((vocab_size, EMBEDDING_DIM)),
             position_cache: Array2::<f32>::zeros((crate::MAX_SEQ_LEN, EMBEDDING_DIM)),
         }
+    }
+
+    /// 清空梯度累积 buffer。
+    pub fn zero_grad_accum(&mut self) {
+        self.token_grads_accum.fill(0.0);
+    }
+
+    /// 用于梯度累积：只累加梯度，不更新参数。
+    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        let Some(input) = self.cached_input.as_ref() else {
+            log::warn!("Embeddings.backward_accumulate 在未执行 forward 的情况下被调用，跳过累积");
+            return grads.clone();
+        };
+
+        let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
+        let grads = grads.view(); // (seq_len, embedding_dim)
+
+        for (i, &token_id) in token_ids.iter().enumerate() {
+            let safe_id = if token_id >= self.token_embeddings.nrows() {
+                self.token_embeddings.nrows().saturating_sub(1)
+            } else {
+                token_id
+            };
+
+            let grad_row = grads.row(i);
+            {
+                let mut acc_row = self.token_grads_accum.row_mut(safe_id);
+                acc_row += &grad_row;
+            }
+        }
+
+        grads.to_owned()
+    }
+
+    /// 对累积的梯度执行一次参数更新，并清空累积 buffer。
+    pub fn step_accumulated(&mut self, lr: f32, scale: f32) {
+        let grad_scaled = &self.token_grads_accum * scale;
+        self.token_optimizer
+            .step(&mut self.token_embeddings, &grad_scaled, lr);
+        self.zero_grad_accum();
     }
 
     /// **初始化嵌入矩阵**
@@ -293,6 +354,7 @@ impl Layer for Embeddings {
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         // 保存输入，用于反向传播时确定哪些嵌入向量需要更新
         self.cached_input = Some(input.clone());
+        self.cached_input_batch = None; // 单样本路径下，清理 batch 缓存，避免误用
 
         // 将浮点数转换为整数 token ID
         let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
@@ -396,20 +458,32 @@ impl Layer for Embeddings {
         input: &Array3<f32>,
         _attention_mask: Option<&Array2<f32>>,
     ) -> Array3<f32> {
-        // 保存输入用于反向传播
         let batch_size = input.shape()[0];
         let seq_len = input.shape()[1];
+        let token_dim = input.shape()[2];
 
-        // 将 (batch, seq, 1) 转换为 (batch, seq)
-        let token_ids_flat: Vec<Vec<usize>> = (0..batch_size)
-            .map(|b| (0..seq_len).map(|s| input[[b, s, 0]] as usize).collect())
-            .collect();
+        // 兼容两种输入格式：
+        // 1) (batch, seq, 1)：最后一维是 token_id 的标量（推荐）
+        // 2) (batch, seq, d)：历史遗留/误用情况下也可能出现，我们仅使用第 0 维作为 token_id
+        if token_dim != 1 {
+            log::warn!(
+                "Embeddings.forward_batch 收到非标量 token 维度：shape={:?}，将仅使用最后一维索引 0 的值作为 token_id（兼容模式）",
+                input.shape()
+            );
+        }
+
+        let token_ids_mat: Array2<usize> = Array2::from_shape_fn((batch_size, seq_len), |(b, s)| {
+            input[[b, s, 0.min(token_dim.saturating_sub(1))]] as usize
+        });
+        self.cached_input_batch = Some(token_ids_mat.clone());
+        self.cached_input = None;
 
         // 为每个批次样本生成嵌入
         let mut output = Array3::zeros((batch_size, seq_len, EMBEDDING_DIM));
 
-        for (b, token_ids) in token_ids_flat.iter().enumerate() {
-            let embeddings = self.embed_tokens(token_ids);
+        for b in 0..batch_size {
+            let token_ids: Vec<usize> = token_ids_mat.row(b).to_vec();
+            let embeddings = self.embed_tokens(&token_ids);
             output.slice_mut(ndarray::s![b, .., ..]).assign(&embeddings);
         }
 
@@ -420,13 +494,47 @@ impl Layer for Embeddings {
     fn backward_batch(
         &mut self,
         grads: &Array3<f32>,
-        _lr: f32,
-        _attention_mask: Option<&Array2<f32>>,
+        lr: f32,
+        attention_mask: Option<&Array2<f32>>,
     ) -> Array3<f32> {
-        // 简化实现：批量模式下，使用默认实现（对每个样本分别调用单样本backward）
-        // 实际应用中，应该在forward_batch中缓存token IDs，这里才能累积梯度
+        let Some(token_ids_mat) = self.cached_input_batch.as_ref() else {
+            log::warn!("Embeddings.backward_batch 在未执行 forward_batch 的情况下被调用，跳过参数更新");
+            return grads.to_owned();
+        };
 
-        // 直接返回梯度（位置编码不需要梯度）
+        let batch_size = grads.shape()[0];
+        let seq_len = grads.shape()[1];
+
+        // 累积 token 梯度（dense 版本，教学清晰优先）
+        let mut token_grads = Array2::zeros(self.token_embeddings.dim());
+
+        for b in 0..batch_size {
+            for s in 0..seq_len {
+                if let Some(mask) = attention_mask {
+                    if mask[[b, s]] < 0.5 {
+                        continue; // PAD 位置不更新嵌入
+                    }
+                }
+
+                let token_id = token_ids_mat[[b, s]];
+                let safe_id = if token_id >= self.token_embeddings.nrows() {
+                    self.token_embeddings.nrows().saturating_sub(1)
+                } else {
+                    token_id
+                };
+
+                let grad_vec = grads.slice(ndarray::s![b, s, ..]);
+                {
+                    let mut acc_row = token_grads.row_mut(safe_id);
+                    acc_row += &grad_vec;
+                }
+            }
+        }
+
+        self.token_optimizer
+            .step(&mut self.token_embeddings, &token_grads, lr);
+
+        // 位置编码不需要梯度，直接把输入梯度传回上一层。
         grads.to_owned()
     }
 }

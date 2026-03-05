@@ -246,6 +246,18 @@ pub struct SelfAttention {
     pub optimizer_w_k: Adam,
     pub optimizer_w_v: Adam,
     pub optimizer_w_o: Adam,
+
+    // =====================================================================
+    // 梯度累积支持（Gradient Accumulation）
+    // =====================================================================
+    //
+    // 注意力层的参数比较多（Q/K/V/O 四个矩阵）。为了支持“正确的梯度累积”，我们需要：
+    // - micro-batch 级别立即 backward（保证 cached_* 对应当前样本，避免缓存覆盖错误）；
+    // - 但把 grad_W_* 累加到 buffer；累积结束再统一做一次 Adam step。
+    pub grad_w_q_accum: Array2<f32>,
+    pub grad_w_k_accum: Array2<f32>,
+    pub grad_w_v_accum: Array2<f32>,
+    pub grad_w_o_accum: Array2<f32>,
 }
 
 impl Default for SelfAttention {
@@ -338,7 +350,169 @@ impl SelfAttention {
             optimizer_w_k: Adam::new((embedding_dim, embedding_dim)),
             optimizer_w_v: Adam::new((embedding_dim, embedding_dim)),
             optimizer_w_o: Adam::new((embedding_dim, embedding_dim)),
+            grad_w_q_accum: Array2::zeros((embedding_dim, embedding_dim)),
+            grad_w_k_accum: Array2::zeros((embedding_dim, embedding_dim)),
+            grad_w_v_accum: Array2::zeros((embedding_dim, embedding_dim)),
+            grad_w_o_accum: Array2::zeros((embedding_dim, embedding_dim)),
         }
+    }
+
+    pub fn zero_grad_accum(&mut self) {
+        self.grad_w_q_accum.fill(0.0);
+        self.grad_w_k_accum.fill(0.0);
+        self.grad_w_v_accum.fill(0.0);
+        self.grad_w_o_accum.fill(0.0);
+    }
+
+    /// 计算反向传播所需的梯度（不更新参数）。
+    ///
+    /// 返回：(grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)
+    fn compute_grads(
+        &self,
+        grads: &Array2<f32>,
+    ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>)> {
+        let (Some(input), Some(_q), Some(_k), Some(_v), Some(attention_output)) = (
+            self.cached_input.as_ref(),
+            self.cached_q.as_ref(),
+            self.cached_k.as_ref(),
+            self.cached_v.as_ref(),
+            self.cached_attention_output.as_ref(),
+        ) else {
+            return None;
+        };
+
+        // ========== 步骤1: 输出投影层梯度 ==========
+        let grad_w_o = attention_output.t().dot(grads);
+        let grad_attention_output = grads.dot(&self.w_o.t());
+
+        // ========== 步骤2: 注意力反传 ==========
+        let weights_per_head = self.cached_attention_weights.as_ref()?;
+
+        let seq_len = input.nrows();
+        let num_heads = self.num_heads;
+        let head_dim = self.head_dim;
+        let sqrt_dk = (head_dim as f32).sqrt();
+
+        // 这些中间 view 必须绑定到局部变量，否则会出现“临时值被释放但仍被借用”的生命周期问题。
+        let grad_attention_view = grad_attention_output.view();
+        let grad_attention_heads = grad_attention_view
+            .to_shape((seq_len, num_heads, head_dim))
+            .ok()?
+            .permuted_axes([1, 0, 2]);
+
+        let q_view = self.cached_q.as_ref()?.view();
+        let q_heads = q_view
+            .to_shape((seq_len, num_heads, head_dim))
+            .ok()?
+            .permuted_axes([1, 0, 2]);
+
+        let k_view = self.cached_k.as_ref()?.view();
+        let k_heads = k_view
+            .to_shape((seq_len, num_heads, head_dim))
+            .ok()?
+            .permuted_axes([1, 0, 2]);
+
+        let v_view = self.cached_v.as_ref()?.view();
+        let v_heads = v_view
+            .to_shape((seq_len, num_heads, head_dim))
+            .ok()?
+            .permuted_axes([1, 0, 2]);
+
+        let mut grad_q_total = Array2::zeros((seq_len, self.embedding_dim));
+        let mut grad_k_total = Array2::zeros((seq_len, self.embedding_dim));
+        let mut grad_v_total = Array2::zeros((seq_len, self.embedding_dim));
+
+        for head_idx in 0..num_heads {
+            let q_head = q_heads.slice(s![head_idx, .., ..]);
+            let k_head = k_heads.slice(s![head_idx, .., ..]);
+            let v_head = v_heads.slice(s![head_idx, .., ..]);
+            let grad_out_head = grad_attention_heads.slice(s![head_idx, .., ..]);
+            let weights = &weights_per_head[head_idx];
+
+            // 梯度 w.r.t. V
+            let mut grad_v_head = Array2::zeros((v_head.nrows(), v_head.ncols()));
+            general_mat_mul(1.0, &weights.t(), &grad_out_head, 0.0, &mut grad_v_head);
+
+            // 梯度 w.r.t. softmax(weights)
+            let mut grad_weights = Array2::zeros((grad_out_head.nrows(), v_head.nrows()));
+            general_mat_mul(1.0, &grad_out_head, &v_head.t(), 0.0, &mut grad_weights);
+            let grad_scores = stable_softmax_gradient(weights, &grad_weights);
+
+            // 梯度 w.r.t. Q 和 K
+            let mut grad_q_head = Array2::zeros((q_head.nrows(), q_head.ncols()));
+            general_mat_mul(1.0 / sqrt_dk, &grad_scores, &k_head, 0.0, &mut grad_q_head);
+
+            let mut grad_k_head = Array2::zeros((k_head.nrows(), k_head.ncols()));
+            general_mat_mul(
+                1.0 / sqrt_dk,
+                &grad_scores.t(),
+                &q_head,
+                0.0,
+                &mut grad_k_head,
+            );
+
+            let start = head_idx * head_dim;
+            let end = start + head_dim;
+
+            grad_q_total
+                .slice_mut(s![.., start..end])
+                .assign(&grad_q_head);
+            grad_k_total
+                .slice_mut(s![.., start..end])
+                .assign(&grad_k_head);
+            grad_v_total
+                .slice_mut(s![.., start..end])
+                .assign(&grad_v_head);
+        }
+
+        // ========== 步骤3: W_q/W_k/W_v 梯度 ==========
+        let grad_w_q = input.t().dot(&grad_q_total);
+        let grad_w_k = input.t().dot(&grad_k_total);
+        let grad_w_v = input.t().dot(&grad_v_total);
+
+        // ========== 步骤4: 输入梯度 ==========
+        let grad_input_from_q = grad_q_total.dot(&self.w_q.t());
+        let grad_input_from_k = grad_k_total.dot(&self.w_k.t());
+        let grad_input_from_v = grad_v_total.dot(&self.w_v.t());
+        let grad_input = grad_input_from_q + grad_input_from_k + grad_input_from_v;
+
+        Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v))
+    }
+
+    /// 用于梯度累积：只累加参数梯度，不更新参数。
+    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) = self.compute_grads(grads)
+        else {
+            log::warn!("SelfAttention.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
+            return grads.clone();
+        };
+
+        self.grad_w_o_accum += &grad_w_o;
+        self.grad_w_q_accum += &grad_w_q;
+        self.grad_w_k_accum += &grad_w_k;
+        self.grad_w_v_accum += &grad_w_v;
+
+        grad_input
+    }
+
+    /// 对累积的梯度执行一次参数更新，并清空累积 buffer。
+    pub fn step_accumulated(&mut self, lr: f32, scale: f32) {
+        if self.freeze_updates {
+            // 即便冻结，也要清空累积，避免后续解除冻结时带入旧梯度。
+            self.zero_grad_accum();
+            return;
+        }
+
+        self.optimizer_w_o
+            .step(&mut self.w_o, &(&self.grad_w_o_accum * scale), lr);
+        self.optimizer_w_q
+            .step(&mut self.w_q, &(&self.grad_w_q_accum * scale), lr);
+        self.optimizer_w_k
+            .step(&mut self.w_k, &(&self.grad_w_k_accum * scale), lr);
+        self.optimizer_w_v
+            .step(&mut self.w_v, &(&self.grad_w_v_accum * scale), lr);
+
+        self.zero_grad_accum();
     }
 
     /// **获取或创建因果掩码**
@@ -596,13 +770,39 @@ impl SelfAttention {
     /// # 返回
     /// 注意力输出，形状与输入相同
     fn multi_head_attention(&mut self, input: &Array2<f32>) -> Array2<f32> {
+        self.multi_head_attention_with_padding_mask(input, None)
+    }
+
+    /// 多头注意力前向传播（支持 padding mask）。
+    ///
+    /// # 为什么需要 padding mask？
+    /// 当我们做 batch 训练时，为了对齐长度会对短序列补 PAD token。
+    /// 如果不在注意力里显式屏蔽 PAD，模型会把 PAD 当成真实内容参与注意力计算，产生系统性噪声。
+    ///
+    /// 这里我们采用“Key padding mask”的做法：
+    /// - 对所有 query 位置 i，若 key 位置 j 是 PAD，则把 score(i,j) 设为 -∞；
+    /// - 这样 softmax 后该位置权重为 0，从而不会读取 PAD 的 value。
+    fn multi_head_attention_with_padding_mask(
+        &mut self,
+        input: &Array2<f32>,
+        key_padding_mask: Option<&Array1<f32>>,
+    ) -> Array2<f32> {
         let (seq_len, _embedding_dim) = input.dim();
 
         // 1. 计算Q, K, V（使用优化的矩阵乘法）
         let (q, k, v) = self.compute_qkv(input);
 
-        // 2. 先克隆掩码，避免借用冲突
-        let mask = self.get_or_create_causal_mask(seq_len).clone();
+        // 2. 构造掩码：causal mask + (可选) padding mask
+        let mut mask = self.get_or_create_causal_mask(seq_len).clone();
+        if let Some(pad_mask) = key_padding_mask {
+            // pad_mask: 1.0=真实token，0.0=PAD
+            for (j, &m) in pad_mask.iter().enumerate() {
+                if m < 0.5 {
+                    // 将该列全部置为 -∞：任何 query 都不能 attend 到这个 key（PAD）
+                    mask.slice_mut(s![.., j]).fill(f32::NEG_INFINITY);
+                }
+            }
+        }
         let num_heads = self.num_heads;
 
         // 3. 分割为多个头
@@ -653,6 +853,16 @@ impl SelfAttention {
 
         // 6. 输出投影
         combined.dot(&self.w_o)
+    }
+
+    /// 显式暴露“带 padding mask 的前向”，供 batch/教学代码调用。
+    pub fn forward_with_padding_mask(
+        &mut self,
+        input: &Array2<f32>,
+        key_padding_mask: Option<&Array1<f32>>,
+    ) -> Array2<f32> {
+        self.cached_input = Some(input.clone());
+        self.multi_head_attention_with_padding_mask(input, key_padding_mask)
     }
 
     /// 启用KV缓存模式
@@ -747,114 +957,11 @@ impl Layer for SelfAttention {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        // 获取缓存的前向传播中间变量
-        let (Some(input), Some(_q), Some(_k), Some(_v), Some(attention_output)) = (
-            self.cached_input.as_ref(),
-            self.cached_q.as_ref(),
-            self.cached_k.as_ref(),
-            self.cached_v.as_ref(),
-            self.cached_attention_output.as_ref(),
-        ) else {
+        let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) = self.compute_grads(grads)
+        else {
             log::warn!("SelfAttention.backward 在未执行 forward 的情况下被调用，直接传递梯度");
             return grads.clone();
         };
-
-        // ========== 步骤1: 计算输出投影层的梯度 ==========
-        // output = attention_output @ W_o
-        // 因此: grad_W_o = attention_output^T @ grads
-        let grad_w_o = attention_output.t().dot(grads);
-
-        // grad_attention_output = grads @ W_o^T
-        let grad_attention_output = grads.dot(&self.w_o.t());
-
-        // ========== 步骤2: 通过注意力机制反向传播 ==========
-        let Some(weights_per_head) = self.cached_attention_weights.as_ref() else {
-            log::warn!("SelfAttention.backward 缺少注意力权重缓存，直接传递梯度");
-            return grad_attention_output;
-        };
-
-        let seq_len = input.nrows();
-        let num_heads = self.num_heads;
-        let head_dim = self.head_dim;
-        let sqrt_dk = (head_dim as f32).sqrt();
-
-        // 将梯度和缓存的 Q/K/V 重塑为多头格式
-        let grad_attention_view = grad_attention_output.view();
-        let grad_attention_heads = grad_attention_view
-            .to_shape((seq_len, num_heads, head_dim))
-            .expect("grad reshape failed")
-            .permuted_axes([1, 0, 2]);
-
-        let q_view = self.cached_q.as_ref().expect("缺少Q缓存").view();
-        let q_heads = q_view
-            .to_shape((seq_len, num_heads, head_dim))
-            .expect("q reshape failed")
-            .permuted_axes([1, 0, 2]);
-
-        let k_view = self.cached_k.as_ref().expect("缺少K缓存").view();
-        let k_heads = k_view
-            .to_shape((seq_len, num_heads, head_dim))
-            .expect("k reshape failed")
-            .permuted_axes([1, 0, 2]);
-
-        let v_view = self.cached_v.as_ref().expect("缺少V缓存").view();
-        let v_heads = v_view
-            .to_shape((seq_len, num_heads, head_dim))
-            .expect("v reshape failed")
-            .permuted_axes([1, 0, 2]);
-
-        let mut grad_q_total = Array2::zeros((seq_len, self.embedding_dim));
-        let mut grad_k_total = Array2::zeros((seq_len, self.embedding_dim));
-        let mut grad_v_total = Array2::zeros((seq_len, self.embedding_dim));
-
-        for head_idx in 0..num_heads {
-            let q_head = q_heads.slice(s![head_idx, .., ..]);
-            let k_head = k_heads.slice(s![head_idx, .., ..]);
-            let v_head = v_heads.slice(s![head_idx, .., ..]);
-            let grad_out_head = grad_attention_heads.slice(s![head_idx, .., ..]);
-            let weights = &weights_per_head[head_idx];
-
-            // 梯度 w.r.t. V
-            let mut grad_v_head = Array2::zeros((v_head.nrows(), v_head.ncols()));
-            general_mat_mul(1.0, &weights.t(), &grad_out_head, 0.0, &mut grad_v_head);
-
-            // 梯度 w.r.t. 权重（softmax输出）
-            let mut grad_weights = Array2::zeros((grad_out_head.nrows(), v_head.nrows()));
-            general_mat_mul(1.0, &grad_out_head, &v_head.t(), 0.0, &mut grad_weights);
-
-            let grad_scores = stable_softmax_gradient(weights, &grad_weights);
-
-            // 梯度 w.r.t. Q 和 K
-            let mut grad_q_head = Array2::zeros((q_head.nrows(), q_head.ncols()));
-            general_mat_mul(1.0 / sqrt_dk, &grad_scores, &k_head, 0.0, &mut grad_q_head);
-
-            let mut grad_k_head = Array2::zeros((k_head.nrows(), k_head.ncols()));
-            general_mat_mul(
-                1.0 / sqrt_dk,
-                &grad_scores.t(),
-                &q_head,
-                0.0,
-                &mut grad_k_head,
-            );
-
-            let start = head_idx * head_dim;
-            let end = start + head_dim;
-
-            grad_q_total
-                .slice_mut(s![.., start..end])
-                .assign(&grad_q_head);
-            grad_k_total
-                .slice_mut(s![.., start..end])
-                .assign(&grad_k_head);
-            grad_v_total
-                .slice_mut(s![.., start..end])
-                .assign(&grad_v_head);
-        }
-
-        // ========== 步骤3: 计算W_q, W_k, W_v的梯度并更新 ==========
-        let grad_w_q = input.t().dot(&grad_q_total);
-        let grad_w_k = input.t().dot(&grad_k_total);
-        let grad_w_v = input.t().dot(&grad_v_total);
 
         if !self.freeze_updates {
             self.optimizer_w_o.step(&mut self.w_o, &grad_w_o, lr);
@@ -863,12 +970,7 @@ impl Layer for SelfAttention {
             self.optimizer_w_v.step(&mut self.w_v, &grad_w_v, lr);
         }
 
-        // ========== 步骤4: 计算传播回输入的梯度 ==========
-        let grad_input_from_q = grad_q_total.dot(&self.w_q.t());
-        let grad_input_from_k = grad_k_total.dot(&self.w_k.t());
-        let grad_input_from_v = grad_v_total.dot(&self.w_v.t());
-
-        grad_input_from_q + grad_input_from_k + grad_input_from_v
+        grad_input
     }
 
     fn parameters(&self) -> usize {

@@ -275,7 +275,9 @@ impl SerializableLayer {
             token_embeddings,
             position_encoder: PositionEncoding::new(),
             cached_input: None,
+            cached_input_batch: None,
             token_optimizer: s.token_optimizer.to_adam(),
+            token_grads_accum: Array2::<f32>::zeros(s.token_embeddings_shape),
             position_cache: Array2::<f32>::zeros((crate::MAX_SEQ_LEN, crate::EMBEDDING_DIM)),
         }
     }
@@ -368,6 +370,10 @@ impl SerializableLayer {
             optimizer_w_k: s.optimizer_w_k.to_adam(),
             optimizer_w_v: s.optimizer_w_v.to_adam(),
             optimizer_w_o: s.optimizer_w_o.to_adam(),
+            grad_w_q_accum: Array2::zeros(s.w_q_shape),
+            grad_w_k_accum: Array2::zeros(s.w_k_shape),
+            grad_w_v_accum: Array2::zeros(s.w_v_shape),
+            grad_w_o_accum: Array2::zeros(s.w_o_shape),
         }
     }
 
@@ -446,6 +452,10 @@ impl SerializableLayer {
             optimizer_b1: s.optimizer_b1.to_adam(),
             optimizer_w2: s.optimizer_w2.to_adam(),
             optimizer_b2: s.optimizer_b2.to_adam(),
+            grad_w1_accum: Array2::zeros(s.w1_shape),
+            grad_b1_accum: Array2::zeros(s.b1_shape),
+            grad_w2_accum: Array2::zeros(s.w2_shape),
+            grad_b2_accum: Array2::zeros(s.b2_shape),
         }
     }
 
@@ -494,6 +504,8 @@ impl SerializableLayer {
             cached_std: None,
             optimizer_gamma: s.optimizer_gamma.to_adam(),
             optimizer_beta: s.optimizer_beta.to_adam(),
+            grad_gamma_accum: Array2::zeros(s.gamma_shape),
+            grad_beta_accum: Array2::zeros(s.beta_shape),
         }
     }
 
@@ -549,6 +561,8 @@ impl SerializableLayer {
             b_out,
             optimizer: s.optimizer.to_adam(),
             cached_input: None,
+            grad_w_out_accum: Array2::zeros(s.w_out_shape),
+            grad_b_out_accum: Array2::zeros(s.b_out_shape),
         }
     }
 

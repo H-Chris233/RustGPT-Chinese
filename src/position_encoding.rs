@@ -45,7 +45,7 @@
 //!
 //! ## 实现细节
 //!
-//! - **预计算**：在初始化时计算所有位置的编码（256×512 矩阵）
+//! - **预计算**：在初始化时计算所有位置的编码（MAX_SEQ_LEN × EMBEDDING_DIM 矩阵）
 //! - **加法融合**：位置编码直接加到词嵌入上
 //! - **无需梯度**：位置编码是固定的，不参与训练
 //!
@@ -73,7 +73,7 @@ use crate::{EMBEDDING_DIM, MAX_SEQ_LEN};
 ///
 /// 存储预计算的正弦位置编码矩阵。
 pub struct PositionEncoding {
-    /// **编码矩阵**: (MAX_SEQ_LEN, EMBEDDING_DIM) = (256, 512)
+    /// **编码矩阵**: (MAX_SEQ_LEN, EMBEDDING_DIM)
     ///
     /// 每行对应一个位置的编码向量
     pub encoding: Array2<f32>,
@@ -98,11 +98,11 @@ impl PositionEncoding {
     ///
     /// # 性能考虑
     ///
-    /// - 初始化时计算一次：O(MAX_SEQ_LEN × EMBEDDING_DIM) ≈ O(131k)
+    /// - 初始化时计算一次：O(MAX_SEQ_LEN × EMBEDDING_DIM)
     /// - 后续使用时直接查表：O(1)
     /// - 内存占用：256 × 512 × 4 bytes ≈ 524 KB
     pub fn new() -> Self {
-        // Initialize the position encoding matrix (MAX_SEQ_LEN x EMBEDDING_DIM)
+        // 初始化位置编码矩阵 (MAX_SEQ_LEN × EMBEDDING_DIM)
         let mut encoding = Array2::zeros((MAX_SEQ_LEN, EMBEDDING_DIM));
 
         for pos in 0..MAX_SEQ_LEN {

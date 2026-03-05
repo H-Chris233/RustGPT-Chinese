@@ -8,7 +8,7 @@
 //!  5.  检查点管理集成
 
 use ndarray::{Array1, Array2};
-use crate::utils::softmax;
+use crate::utils::log_softmax;
 use crate::llm::LLM;
 
 impl LLM {
@@ -54,10 +54,11 @@ impl LLM {
                 }
 
                 let logits = input;
-                let probs = softmax(&logits);
-                total_loss += Self::cross_entropy_loss_step(&probs, target_ids);
+                let log_probs = log_softmax(&logits);
+                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 //  Backward  pass
+                let probs = log_probs.mapv(|x| x.exp());
                 let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
                 Self::clip_gradients(&mut grads_output, 5.0);
 
@@ -119,9 +120,10 @@ impl LLM {
                 }
 
                 let logits = input;
-                let probs = softmax(&logits);
-                total_loss += Self::cross_entropy_loss_step(&probs, target_ids);
+                let log_probs = log_softmax(&logits);
+                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
+                let probs = log_probs.mapv(|x| x.exp());
                 let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
                 Self::clip_gradients(&mut grads_output, 5.0);
 
@@ -196,9 +198,10 @@ impl LLM {
                 }
 
                 let logits = input;
-                let probs = softmax(&logits);
-                total_loss += Self::cross_entropy_loss_step(&probs, target_ids);
+                let log_probs = log_softmax(&logits);
+                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
+                let probs = log_probs.mapv(|x| x.exp());
                 let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
                 Self::clip_gradients(&mut grads_output, 5.0);
 
@@ -291,9 +294,10 @@ impl LLM {
                 }
 
                 let logits = input;
-                let probs = softmax(&logits);
-                total_loss += Self::cross_entropy_loss_step(&probs, target_ids);
+                let log_probs = log_softmax(&logits);
+                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
+                let probs = log_probs.mapv(|x| x.exp());
                 let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
 
                 //  记录梯度范数
@@ -418,9 +422,10 @@ impl LLM {
                 }
 
                 let logits = input;
-                let probs = softmax(&logits);
-                total_loss += Self::cross_entropy_loss_step(&probs, target_ids);
+                let log_probs = log_softmax(&logits);
+                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
+                let probs = log_probs.mapv(|x| x.exp());
                 let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
 
                 //  记录梯度范数

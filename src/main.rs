@@ -232,7 +232,8 @@ fn main() {
                     perf_monitor.start("Tokenize训练数据");
                     let tokenized_data: Vec<Vec<usize>> = data
                         .iter()
-                        .map(|text| LLM::tokenize_with_vocab(&llm.vocab, text))
+                        // Resume 训练也必须保持与当前训练一致的特殊 token 策略（BOS/EOS）
+                        .map(|text| LLM::tokenize_training_with_vocab(&llm.vocab, text))
                         .collect();
                     perf_monitor.stop("Tokenize训练数据");
 
