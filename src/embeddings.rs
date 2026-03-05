@@ -53,6 +53,15 @@ use crate::{
     utils::sample_normal, vocab::Vocab,
 };
 
+/// Embeddings 层的前向/反向上下文。
+///
+/// 该上下文保存了本次 forward 的 token_id 序列，backward 需要它将梯度累积到
+/// `token_embeddings` 的对应行。
+#[derive(Clone)]
+struct EmbeddingsContext {
+    token_ids: Vec<usize>,
+}
+
 /// **嵌入层结构体**
 ///
 /// 包含词嵌入矩阵、位置编码器和用于反向传播的缓存。
@@ -146,17 +155,26 @@ impl Embeddings {
         self.token_grads_accum.fill(0.0);
     }
 
-    /// 用于梯度累积：只累加梯度，不更新参数。
-    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let Some(input) = self.cached_input.as_ref() else {
-            log::warn!("Embeddings.backward_accumulate 在未执行 forward 的情况下被调用，跳过累积");
-            return grads.clone();
-        };
-
-        let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
+    /// 将本次样本的梯度累积到 `token_grads_accum`（核心逻辑，ctx 驱动）。
+    ///
+    /// 为什么需要把这段逻辑抽出来？
+    /// - Embeddings 的参数是一个大矩阵：`token_embeddings[vocab_size, d_model]`；
+    /// - backward 时我们只更新“本次序列里出现过的 token 对应的行”；
+    /// - 因此只要我们能拿到 token_id 序列，就能完成累积；
+    /// - 新版推荐从 `ctx` 取 token_ids，避免依赖 `self.cached_input`（批量/并发时会被覆盖）。
+    fn accumulate_token_grads(&mut self, token_ids: &[usize], grads: &Array2<f32>) {
         let grads = grads.view(); // (seq_len, embedding_dim)
 
-        for (i, &token_id) in token_ids.iter().enumerate() {
+        if token_ids.len() != grads.nrows() {
+            log::warn!(
+                "Embeddings.accumulate_token_grads: token_ids.len()={} 与 grads.nrows()={} 不一致，将按较短长度截断",
+                token_ids.len(),
+                grads.nrows()
+            );
+        }
+
+        let seq_len = token_ids.len().min(grads.nrows());
+        for (i, &token_id) in token_ids.iter().take(seq_len).enumerate() {
             let safe_id = if token_id >= self.token_embeddings.nrows() {
                 self.token_embeddings.nrows().saturating_sub(1)
             } else {
@@ -164,12 +182,43 @@ impl Embeddings {
             };
 
             let grad_row = grads.row(i);
-            {
-                let mut acc_row = self.token_grads_accum.row_mut(safe_id);
-                acc_row += &grad_row;
-            }
+            let mut acc_row = self.token_grads_accum.row_mut(safe_id);
+            acc_row += &grad_row;
         }
+    }
 
+    /// 用于梯度累积：只累加梯度，不更新参数（legacy：依赖 self.cached_input）。
+    ///
+    /// 说明：
+    /// - 该方法保留是为了兼容仓库里尚未完全迁移到 ctx 的旧代码；
+    /// - 新的调用方请优先使用 `backward_accumulate_with_ctx()`。
+    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        let Some(input) = self.cached_input.as_ref() else {
+            log::warn!("Embeddings.backward_accumulate 在未执行 forward 的情况下被调用，跳过累积");
+            return grads.clone();
+        };
+
+        let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
+        self.accumulate_token_grads(&token_ids, grads);
+        grads.to_owned()
+    }
+
+    /// 用于梯度累积：只累加梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    ///
+    /// 教学说明：
+    /// - 这就是“第二轮重构”的关键：让 accumulate 接口也显式接收 ctx；
+    /// - 这样训练循环就可以逐步移除层内 `cached_*` 字段，而不会破坏梯度累积语义。
+    pub fn backward_accumulate_with_ctx(
+        &mut self,
+        ctx: &crate::llm::LayerContext,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<EmbeddingsContext>() else {
+            log::warn!("Embeddings.backward_accumulate_with_ctx 收到未知 ctx，跳过累积");
+            return grads.clone();
+        };
+
+        self.accumulate_token_grads(&ctx.token_ids, grads);
         grads.to_owned()
     }
 
@@ -351,8 +400,20 @@ impl Layer for Embeddings {
     ///
     /// # 输出格式
     /// 返回 (seq_len, embedding_dim) 的嵌入矩阵，每一行是一个512维的向量。
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // 保存输入，用于反向传播时确定哪些嵌入向量需要更新
+    ///
+    /// # 关于“显式上下文（ctx）”
+    /// 在旧实现中，Embedding 层依赖 `self.cached_input` 在 backward 时取回 token_id。
+    /// 这种“缓存写在 self 里”的设计在 batch 场景会踩坑：同一个层实例连续 forward 多个样本，
+    /// 缓存会被覆盖，导致 backward 用错样本的 token_id。
+    ///
+    /// 新版 `Layer` trait 要求 `forward()` 返回 `(output, ctx)`：
+    /// - `output`: 当前样本的前向输出
+    /// - `ctx`: 当前样本 backward 所需的中间量（这里就是 token_id 序列）
+    ///
+    /// 这样 batch 时每个样本都有自己的 ctx，不会互相覆盖。
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, crate::llm::LayerContext) {
+        // 说明：这里仍然写入 self.cached_input，主要为了兼容仓库里“梯度累积/序列化”等旧接口；
+        // 主训练链路将优先使用 ctx（避免缓存覆盖问题）。
         self.cached_input = Some(input.clone());
         self.cached_input_batch = None; // 单样本路径下，清理 batch 缓存，避免误用
 
@@ -360,7 +421,9 @@ impl Layer for Embeddings {
         let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
 
         // 查询嵌入 + 添加位置编码
-        self.embed_tokens(&token_ids)
+        let out = self.embed_tokens(&token_ids);
+
+        (out, Box::new(EmbeddingsContext { token_ids }))
     }
 
     /// **反向传播：更新词嵌入矩阵**
@@ -390,13 +453,24 @@ impl Layer for Embeddings {
     ///   embedding[5] -= lr * Adam(token_grads[5])
     ///   embedding[12] -= lr * Adam(token_grads[12])
     /// ```
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        // 获取缓存的输入 token ID
-        let Some(input) = self.cached_input.as_ref() else {
-            log::warn!("Embeddings.backward 在未执行 forward 的情况下被调用，跳过参数更新");
+    ///
+    /// # ctx 的使用
+    /// Embedding 的 backward 只需要 token_id 来把梯度累积到对应的词向量行。
+    /// 因此我们从 `ctx` 里取回 token_ids，而不是依赖 `self.cached_input`。
+    fn backward(
+        &mut self,
+        ctx: &crate::llm::LayerContext,
+        grads: &Array2<f32>,
+        lr: f32,
+    ) -> Array2<f32> {
+        // 注意：ctx 是 `Box<dyn Any>`，需要 downcast 到本层定义的 EmbeddingsContext。
+        // 如果 downcast 失败，说明调用方传错 ctx（通常是 bug），这里选择保守处理：不更新参数，直接传递梯度。
+        let Some(ctx) = ctx.downcast_ref::<EmbeddingsContext>() else {
+            log::warn!("Embeddings.backward 收到未知 ctx，跳过参数更新");
             return grads.clone();
         };
-        let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
+
+        let token_ids = &ctx.token_ids;
         let grads = grads.view(); // (sequence_length, embedding_dim)
 
         // 初始化梯度累积矩阵（全零，与嵌入矩阵形状相同）
@@ -457,7 +531,7 @@ impl Layer for Embeddings {
         &mut self,
         input: &Array3<f32>,
         _attention_mask: Option<&Array2<f32>>,
-    ) -> Array3<f32> {
+    ) -> (Array3<f32>, Vec<crate::llm::LayerContext>) {
         let batch_size = input.shape()[0];
         let seq_len = input.shape()[1];
         let token_dim = input.shape()[2];
@@ -480,27 +554,34 @@ impl Layer for Embeddings {
 
         // 为每个批次样本生成嵌入
         let mut output = Array3::zeros((batch_size, seq_len, EMBEDDING_DIM));
+        let mut ctxs: Vec<crate::llm::LayerContext> = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
             let token_ids: Vec<usize> = token_ids_mat.row(b).to_vec();
             let embeddings = self.embed_tokens(&token_ids);
             output.slice_mut(ndarray::s![b, .., ..]).assign(&embeddings);
+            ctxs.push(Box::new(EmbeddingsContext { token_ids }));
         }
 
-        output
+        (output, ctxs)
     }
 
     /// **批量反向传播：更新词嵌入矩阵**
     fn backward_batch(
         &mut self,
+        ctxs: &[crate::llm::LayerContext],
         grads: &Array3<f32>,
         lr: f32,
         attention_mask: Option<&Array2<f32>>,
     ) -> Array3<f32> {
-        let Some(token_ids_mat) = self.cached_input_batch.as_ref() else {
-            log::warn!("Embeddings.backward_batch 在未执行 forward_batch 的情况下被调用，跳过参数更新");
+        if ctxs.len() != grads.shape()[0] {
+            log::warn!(
+                "Embeddings.backward_batch ctxs.len() 与 batch_size 不一致：ctxs={}, batch={}",
+                ctxs.len(),
+                grads.shape()[0]
+            );
             return grads.to_owned();
-        };
+        }
 
         let batch_size = grads.shape()[0];
         let seq_len = grads.shape()[1];
@@ -509,6 +590,10 @@ impl Layer for Embeddings {
         let mut token_grads = Array2::zeros(self.token_embeddings.dim());
 
         for b in 0..batch_size {
+            let Some(ctx) = ctxs[b].downcast_ref::<EmbeddingsContext>() else {
+                log::warn!("Embeddings.backward_batch 收到未知 ctx，跳过该样本更新");
+                continue;
+            };
             for s in 0..seq_len {
                 if let Some(mask) = attention_mask {
                     if mask[[b, s]] < 0.5 {
@@ -516,7 +601,7 @@ impl Layer for Embeddings {
                     }
                 }
 
-                let token_id = token_ids_mat[[b, s]];
+                let token_id = ctx.token_ids.get(s).copied().unwrap_or(0);
                 let safe_id = if token_id >= self.token_embeddings.nrows() {
                     self.token_embeddings.nrows().saturating_sub(1)
                 } else {

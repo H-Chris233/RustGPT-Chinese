@@ -26,7 +26,7 @@ fn test_output_projection_forward() {
     let input = Array2::ones((3, EMBEDDING_DIM));
 
     // Test forward pass
-    let output = output_proj.forward(&input);
+    let (output, _ctx) = output_proj.forward(&input);
 
     // Check output shape - should be [seq_len, vocab_size]
     assert_eq!(output.shape(), [3, vocab_size]);
@@ -43,7 +43,7 @@ fn test_output_projection_with_different_sequence_lengths() {
         let input = Array2::ones((seq_len, EMBEDDING_DIM));
 
         // Test forward pass
-        let output = output_proj.forward(&input);
+        let (output, _ctx) = output_proj.forward(&input);
 
         // Check output shape
         assert_eq!(output.shape(), [seq_len, vocab_size]);
@@ -59,13 +59,13 @@ fn test_output_projection_backward() {
     let input = Array2::ones((3, EMBEDDING_DIM));
 
     // Forward pass first (required to cache input)
-    let _output = output_proj.forward(&input);
+    let (_output, ctx) = output_proj.forward(&input);
 
     // Create gradient tensor
     let grads = Array2::ones((3, vocab_size));
 
     // Test backward pass
-    let grad_input = output_proj.backward(&grads, 0.01);
+    let grad_input = output_proj.backward(&ctx, &grads, 0.01);
 
     // Check gradient input shape
     assert_eq!(grad_input.shape(), [3, EMBEDDING_DIM]);
@@ -75,8 +75,8 @@ fn test_output_projection_backward() {
     let b_out_before = output_proj.b_out.clone();
 
     // Run another forward and backward pass
-    let _output = output_proj.forward(&input);
-    let _grad_input = output_proj.backward(&grads, 0.01);
+    let (_output, ctx2) = output_proj.forward(&input);
+    let _grad_input = output_proj.backward(&ctx2, &grads, 0.01);
 
     // Check that parameters changed
     assert_ne!(output_proj.w_out, w_out_before);
@@ -94,14 +94,14 @@ fn test_output_projection_training() {
     // Run multiple training steps
     for _ in 0..5 {
         // Forward pass
-        let _output = output_proj.forward(&input);
+        let (_output, ctx) = output_proj.forward(&input);
 
         // Create gradient tensor (simulating cross-entropy loss gradients)
         let mut grads = Array2::zeros((3, vocab_size));
         grads[[0, 0]] = 1.0; // Set gradient for first token
 
         // Backward pass
-        let _grad_input = output_proj.backward(&grads, 0.01);
+        let _grad_input = output_proj.backward(&ctx, &grads, 0.01);
     }
 
     // Verify that parameters were updated

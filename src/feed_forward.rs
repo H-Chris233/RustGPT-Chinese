@@ -38,7 +38,18 @@
 
 use ndarray::{Array2, Axis};
 
-use crate::{adam::Adam, llm::Layer, utils::sample_normal};
+use crate::{
+    adam::Adam,
+    llm::{Layer, LayerContext},
+    utils::sample_normal,
+};
+
+#[derive(Clone)]
+struct FeedForwardContext {
+    input: Array2<f32>,
+    hidden_pre_activation: Array2<f32>,
+    hidden_post_activation: Array2<f32>,
+}
 
 /// **前馈神经网络结构体**
 pub struct FeedForward {
@@ -154,22 +165,58 @@ impl FeedForward {
     }
 
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        // 注意：这里不能直接持有 `self.input.as_ref()` 的借用再调用 `&mut self` 方法，
+        // 否则会触发 Rust 的借用冲突（E0502）。因此我们把需要的值 clone 出来再计算。
         let (Some(input), Some(hidden_pre_activation), Some(hidden_post_activation)) = (
-            self.input.as_ref(),
-            self.hidden_pre_activation.as_ref(),
-            self.hidden_post_activation.as_ref(),
+            self.input.as_ref().cloned(),
+            self.hidden_pre_activation.as_ref().cloned(),
+            self.hidden_post_activation.as_ref().cloned(),
         ) else {
             log::warn!("FeedForward.backward_accumulate 在未执行 forward 的情况下被调用，跳过累积");
             return grads.clone();
         };
 
-        let (
-            grad_input,
-            grad_w1,
-            grad_b1,
-            grad_w2,
-            grad_b2,
-        ) = Self::compute_grads(
+        self.backward_accumulate_from_values(
+            &input,
+            &hidden_pre_activation,
+            &hidden_post_activation,
+            grads,
+        )
+    }
+
+    /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    ///
+    /// 教学说明：
+    /// - FFN 的 backward 依赖 3 个中间量：input、hidden_pre_activation、hidden_post_activation；
+    /// - 在新版 `Layer` trait 中，这些量已经被打包进 `FeedForwardContext`；
+    /// - 因此梯度累积也应当从 ctx 中取回它们，而不是从 `self.input` 等缓存字段读取。
+    pub fn backward_accumulate_with_ctx(
+        &mut self,
+        ctx: &LayerContext,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<FeedForwardContext>() else {
+            log::warn!("FeedForward.backward_accumulate_with_ctx 收到未知 ctx，跳过累积");
+            return grads.clone();
+        };
+
+        self.backward_accumulate_from_values(
+            &ctx.input,
+            &ctx.hidden_pre_activation,
+            &ctx.hidden_post_activation,
+            grads,
+        )
+    }
+
+    /// 核心实现：给定前向中间量，计算梯度并写入累积 buffer。
+    fn backward_accumulate_from_values(
+        &mut self,
+        input: &Array2<f32>,
+        hidden_pre_activation: &Array2<f32>,
+        hidden_post_activation: &Array2<f32>,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
+        let (grad_input, grad_w1, grad_b1, grad_w2, grad_b2) = Self::compute_grads(
             input,
             hidden_pre_activation,
             hidden_post_activation,
@@ -267,14 +314,9 @@ impl Layer for FeedForward {
     /// ReLU'(x) = 1 if x > 0 else 0
     ///
     /// 这意味着只有激活的神经元（值>0）会传播梯度，其他神经元梯度为0。
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        // 从缓存中获取前向传播的中间结果
-        let (Some(input), Some(hidden_pre_activation), Some(hidden_post_activation)) = (
-            self.input.as_ref(),
-            self.hidden_pre_activation.as_ref(),
-            self.hidden_post_activation.as_ref(),
-        ) else {
-            log::warn!("FeedForward.backward 在未执行 forward 的情况下被调用，跳过参数更新");
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<FeedForwardContext>() else {
+            log::warn!("FeedForward.backward 收到未知 ctx，直接传递梯度");
             return grads.clone();
         };
 
@@ -285,9 +327,9 @@ impl Layer for FeedForward {
             grad_w2,
             grad_b2,
         ) = Self::compute_grads(
-            input,
-            hidden_pre_activation,
-            hidden_post_activation,
+            &ctx.input,
+            &ctx.hidden_pre_activation,
+            &ctx.hidden_post_activation,
             grads,
             &self.w1,
             &self.w2,
@@ -318,7 +360,7 @@ impl Layer for FeedForward {
     ///    - 输入：(seq_len, 1024)
     ///    - W₂：(1024, 512)
     ///    - 输出：(seq_len, 512)
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         // 第一层：线性变换
         let hidden_pre_activation = input.dot(&self.w1) + &self.b1;
 
@@ -331,12 +373,19 @@ impl Layer for FeedForward {
         // 第二层：线性变换到输出
         let output = hidden_post_activation.dot(&self.w2) + &self.b2;
 
-        // 缓存所有中间结果，供反向传播使用
+        // 兼容旧实现：仍把中间量写入 self 缓存，以支持 backward_accumulate 等历史接口。
         self.input = Some(input.clone());
-        self.hidden_pre_activation = Some(hidden_pre_activation);
-        self.hidden_post_activation = Some(hidden_post_activation);
+        self.hidden_pre_activation = Some(hidden_pre_activation.clone());
+        self.hidden_post_activation = Some(hidden_post_activation.clone());
 
-        output
+        (
+            output,
+            Box::new(FeedForwardContext {
+                input: input.clone(),
+                hidden_pre_activation,
+                hidden_post_activation,
+            }),
+        )
     }
 
     /// **计算参数总数**

@@ -26,7 +26,7 @@ fn make_op_with_params(
 }
 
 fn compute_loss(op: &mut OutputProjection, input: &Array2<f32>, grad_out: &Array2<f32>) -> f32 {
-    let out = op.forward(input);
+    let (out, _ctx) = op.forward(input);
     (&out * grad_out).sum()
 }
 
@@ -47,7 +47,7 @@ fn output_projection_parameter_gradients_match_numerical() {
     let b_out = make_b_out(vocab_size);
 
     let mut op = make_op_with_params(embedding_dim, vocab_size, &w_out, &b_out);
-    let _ = op.forward(&input);
+    let (_out, _ctx) = op.forward(&input);
     op.zero_grad_accum();
     let _ = op.backward_accumulate(&grad_out);
 

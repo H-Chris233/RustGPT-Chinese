@@ -65,7 +65,18 @@
 
 use ndarray::{Array2, Axis};
 
-use crate::{EPSILON, adam::Adam, llm::Layer};
+use crate::{
+    EPSILON,
+    adam::Adam,
+    llm::{Layer, LayerContext},
+};
+
+#[derive(Clone)]
+struct LayerNormContext {
+    input: Array2<f32>,
+    mean: Array2<f32>,
+    inv_std: Array2<f32>,
+}
 
 /// **层归一化结构体**
 pub struct LayerNorm {
@@ -145,15 +156,46 @@ impl LayerNorm {
 
     /// 仅计算并累积参数梯度，不更新参数（用于梯度累积）。
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
+        // 注意：这里不能在持有 `self.cached_*` 的不可变借用时再调用 `&mut self` 方法，
+        // 否则会触发 Rust 的借用冲突（E0502）。因此我们把需要的值 clone 出来再计算。
         let (Some(input), Some(mean), Some(inv_std)) = (
-            self.cached_input.as_ref(),
-            self.cached_mean.as_ref(),
-            self.cached_inv_std.as_ref(),
+            self.cached_input.as_ref().cloned(),
+            self.cached_mean.as_ref().cloned(),
+            self.cached_inv_std.as_ref().cloned(),
         ) else {
             log::warn!("LayerNorm.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
             return grads.clone();
         };
 
+        self.backward_accumulate_from_values(&input, &mean, &inv_std, grads)
+    }
+
+    /// 仅计算并累积参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    ///
+    /// 教学说明：
+    /// - LayerNorm 的 backward 需要 input、mean、inv_std；
+    /// - 新版 `Layer::forward()` 已经把它们打包进 `LayerNormContext`；
+    /// - 因此累积接口也应当显式接收 ctx，才能逐步删除 `cached_*` 字段。
+    pub fn backward_accumulate_with_ctx(
+        &mut self,
+        ctx: &LayerContext,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<LayerNormContext>() else {
+            log::warn!("LayerNorm.backward_accumulate_with_ctx 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
+        self.backward_accumulate_from_values(&ctx.input, &ctx.mean, &ctx.inv_std, grads)
+    }
+
+    /// 核心实现：给定前向中间量，计算梯度并写入累积 buffer。
+    fn backward_accumulate_from_values(
+        &mut self,
+        input: &Array2<f32>,
+        mean: &Array2<f32>,
+        inv_std: &Array2<f32>,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
         let (grad_input, grad_gamma, grad_beta) =
             Self::compute_grads(input, mean, inv_std, grads, &self.gamma, self.epsilon);
 
@@ -263,11 +305,6 @@ impl LayerNorm {
         }; // (seq_len, 1)
         let inv_std = (var + self.epsilon).mapv(|x| 1.0 / x.sqrt()); // (seq_len, 1)
 
-        // 缓存值用于反向传播
-        self.cached_input = Some(input.clone());
-        self.cached_mean = Some(mean.clone());
-        self.cached_inv_std = Some(inv_std.clone());
-
         // 步骤 2: 标准化（均值0，方差1）
         let normalized = centered * &inv_std;
 
@@ -289,22 +326,63 @@ impl Layer for LayerNorm {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        self.normalize(input)
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
+        // forward 需要的统计量（mean/inv_std）也用于 backward，因此放入 ctx。
+        let Some(mean) = input.mean_axis(Axis(1)).map(|m| m.insert_axis(Axis(1))) else {
+            log::warn!("LayerNorm.forward 收到空输入，直接返回");
+            return (
+                input.clone(),
+                Box::new(LayerNormContext {
+                    input: input.clone(),
+                    mean: Array2::zeros((0, 0)),
+                    inv_std: Array2::zeros((0, 0)),
+                }),
+            );
+        };
+        let centered = input - &mean;
+        let Some(var) = centered
+            .mapv(|x| x * x)
+            .mean_axis(Axis(1))
+            .map(|v| v.insert_axis(Axis(1)))
+        else {
+            log::warn!("LayerNorm.forward 收到空输入（无法计算方差），直接返回");
+            return (
+                input.clone(),
+                Box::new(LayerNormContext {
+                    input: input.clone(),
+                    mean: Array2::zeros((0, 0)),
+                    inv_std: Array2::zeros((0, 0)),
+                }),
+            );
+        };
+        let inv_std = (var + self.epsilon).mapv(|x| 1.0 / x.sqrt());
+
+        let normalized = centered * &inv_std;
+        let out = &self.gamma * &normalized + &self.beta;
+
+        // 兼容旧实现：把中间量写回 self.cached_*，供 backward_accumulate 等历史接口使用。
+        self.cached_input = Some(input.clone());
+        self.cached_mean = Some(mean.clone());
+        self.cached_inv_std = Some(inv_std.clone());
+
+        (
+            out,
+            Box::new(LayerNormContext {
+                input: input.clone(),
+                mean,
+                inv_std,
+            }),
+        )
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let (Some(input), Some(mean), Some(inv_std)) = (
-            self.cached_input.as_ref(),
-            self.cached_mean.as_ref(),
-            self.cached_inv_std.as_ref(),
-        ) else {
-            log::warn!("LayerNorm.backward 在未执行 forward 的情况下被调用，直接传递梯度");
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<LayerNormContext>() else {
+            log::warn!("LayerNorm.backward 收到未知 ctx，直接传递梯度");
             return grads.clone();
         };
 
         let (grad_input, grad_gamma, grad_beta) =
-            Self::compute_grads(input, mean, inv_std, grads, &self.gamma, self.epsilon);
+            Self::compute_grads(&ctx.input, &ctx.mean, &ctx.inv_std, grads, &self.gamma, self.epsilon);
 
         self.optimizer_gamma.step(&mut self.gamma, &grad_gamma, lr);
         self.optimizer_beta.step(&mut self.beta, &grad_beta, lr);

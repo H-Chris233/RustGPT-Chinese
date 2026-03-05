@@ -212,6 +212,7 @@ fn test_checkpoint_training_continuity() {
 
     // 获取训练后的loss
     llm.set_training_mode(true);
+    let pad_token_id = llm.vocab.pad_token_id();
     let mut final_loss = 0.0;
     let mut count = 0;
     for training_row in &tokenized_data {
@@ -226,11 +227,12 @@ fn test_checkpoint_training_continuity() {
 
         let mut output = input.clone();
         for layer in &mut llm.network {
-            output = layer.forward(&output);
+            let (out, _ctx) = layer.forward(&output);
+            output = out;
         }
 
         let probs = llm::utils::softmax(&output);
-        final_loss += LLM::cross_entropy_loss_step(&probs, target_ids);
+        final_loss += LLM::cross_entropy_loss_step(&probs, target_ids, pad_token_id);
         count += 1;
     }
     final_loss /= count as f32;
@@ -473,7 +475,9 @@ fn test_checkpoint_loss_continuity_after_resume() {
     println!("阶段3完成，训练到 epoch {}", phase3_epochs);
 
     // 计算继续训练后的loss
-    let loss_after_phase3 = compute_loss(&mut loaded_llm, &tokenized_data);
+    // 重要：这里使用 eval 模式计算 loss，与“阶段1结束 / 加载后”保持同一口径，
+    // 避免训练模式下 Dropout 引入噪声导致测试变 flaky。
+    let loss_after_phase3 = compute_loss_eval(&mut loaded_llm, &tokenized_data);
     println!("阶段3结束时的loss: {:.6}", loss_after_phase3);
 
     // 验证训练连续性：继续训练后loss应该减小（说明优化器状态正确恢复）
@@ -510,6 +514,7 @@ fn test_checkpoint_loss_continuity_after_resume() {
 /// 辅助函数：计算给定模型在数据上的平均loss（训练模式）
 fn compute_loss(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
     llm.set_training_mode(true);
+    let pad_token_id = llm.vocab.pad_token_id();
     let mut total_loss = 0.0;
     let mut count = 0;
 
@@ -526,11 +531,12 @@ fn compute_loss(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
 
         let mut output = input.clone();
         for layer in &mut llm.network {
-            output = layer.forward(&output);
+            let (out, _ctx) = layer.forward(&output);
+            output = out;
         }
 
         let probs = llm::utils::softmax(&output);
-        total_loss += LLM::cross_entropy_loss_step(&probs, target_ids);
+        total_loss += LLM::cross_entropy_loss_step(&probs, target_ids, pad_token_id);
         count += 1;
     }
 
@@ -541,6 +547,7 @@ fn compute_loss(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
 /// 辅助函数：计算给定模型在数据上的平均loss（评估模式，关闭dropout）
 fn compute_loss_eval(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
     llm.set_training_mode(false);
+    let pad_token_id = llm.vocab.pad_token_id();
     let mut total_loss = 0.0;
     let mut count = 0;
 
@@ -557,11 +564,12 @@ fn compute_loss_eval(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
 
         let mut output = input.clone();
         for layer in &mut llm.network {
-            output = layer.forward(&output);
+            let (out, _ctx) = layer.forward(&output);
+            output = out;
         }
 
         let probs = llm::utils::softmax(&output);
-        total_loss += LLM::cross_entropy_loss_step(&probs, target_ids);
+        total_loss += LLM::cross_entropy_loss_step(&probs, target_ids, pad_token_id);
         count += 1;
     }
 

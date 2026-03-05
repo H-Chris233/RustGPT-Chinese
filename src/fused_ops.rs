@@ -40,7 +40,41 @@
 
 use ndarray::{Array1, Array2, Axis};
 
-use crate::{llm::Layer, utils::sample_normal, EPSILON};
+use crate::{llm::{Layer, LayerContext}, utils::sample_normal, EPSILON};
+
+// ============================================================================
+// 显式 ctx（上下文）说明
+// ============================================================================
+//
+// 教学背景：
+// - 旧版 `Layer` trait 依赖各层把中间量缓存到 `self.cached_*`，backward 再从 self 中取回；
+// - 这在 batch 场景存在“缓存覆盖”问题：同一层实例连续 forward 多个样本后，只剩最后一次 forward 的缓存；
+// - 新版 `Layer` trait 使用显式 ctx：forward 返回 ctx，backward 必须显式接收 ctx。
+//
+// 这里的 fused 算子（LayerNorm+Linear、GELU+Linear）原本也使用 `self.cached_*`。
+// 为了让它们在 batch 场景下也“语义正确”，我们采用一个简单且直观的策略：
+// - forward 仍旧在 self 内部填充 cached_*（保留现有实现与调试便利性）；
+// - 然后把 cached_* 的拷贝打包进 ctx 返回；
+// - backward 时从 ctx 恢复 self.cached_*，再调用原有 backward 实现。
+//
+// 这种做法的特点：
+// - ✅ 代码改动小（复用现有数学实现）
+// - ✅ batch 语义正确（每个样本对应自己的 ctx）
+// - ❌ 需要 clone 中间量（教学项目可接受；性能优化可在未来再做）
+
+#[derive(Clone)]
+struct FusedLayerNormLinearContext {
+    normalized: Array2<f32>,
+    input: Array2<f32>,
+    mean: Array1<f32>,
+    std: Array1<f32>,
+}
+
+#[derive(Clone)]
+struct FusedGELULinearContext {
+    activated: Array2<f32>,
+    input: Array2<f32>,
+}
 
 /// **融合的 LayerNorm + Linear 操作**
 ///
@@ -208,12 +242,42 @@ impl Layer for FusedLayerNormLinear {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        self.forward(input)
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
+        // 调用“原有前向实现”（inherent method），它会填充 self.cached_*。
+        let out = FusedLayerNormLinear::forward(self, input);
+
+        // 将 cached_* 打包成 ctx 返回。
+        //
+        // 注意：这里使用 clone，是为了让 ctx 独立于 self 的后续 forward 调用（避免覆盖）。
+        let ctx = FusedLayerNormLinearContext {
+            normalized: self
+                .cached_normalized
+                .clone()
+                .unwrap_or_else(|| Array2::zeros((0, 0))),
+            input: self
+                .cached_input
+                .clone()
+                .unwrap_or_else(|| Array2::zeros((0, 0))),
+            mean: self.cached_mean.clone().unwrap_or_else(|| Array1::zeros(0)),
+            std: self.cached_std.clone().unwrap_or_else(|| Array1::zeros(0)),
+        };
+
+        (out, Box::new(ctx))
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        self.backward(grads, lr)
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<FusedLayerNormLinearContext>() else {
+            log::warn!("FusedLayerNormLinear.backward 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
+
+        // 从 ctx 恢复 cached_*，使原有 backward 实现可以复用。
+        self.cached_normalized = Some(ctx.normalized.clone());
+        self.cached_input = Some(ctx.input.clone());
+        self.cached_mean = Some(ctx.mean.clone());
+        self.cached_std = Some(ctx.std.clone());
+
+        FusedLayerNormLinear::backward(self, grads, lr)
     }
 
     fn parameters(&self) -> usize {
@@ -343,12 +407,31 @@ impl Layer for FusedGELULinear {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        self.forward(input)
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
+        let out = FusedGELULinear::forward(self, input);
+        let ctx = FusedGELULinearContext {
+            activated: self
+                .cached_activated
+                .clone()
+                .unwrap_or_else(|| Array2::zeros((0, 0))),
+            input: self
+                .cached_input
+                .clone()
+                .unwrap_or_else(|| Array2::zeros((0, 0))),
+        };
+        (out, Box::new(ctx))
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        self.backward(grads, lr)
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<FusedGELULinearContext>() else {
+            log::warn!("FusedGELULinear.backward 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
+
+        self.cached_activated = Some(ctx.activated.clone());
+        self.cached_input = Some(ctx.input.clone());
+
+        FusedGELULinear::backward(self, grads, lr)
     }
 
     fn parameters(&self) -> usize {

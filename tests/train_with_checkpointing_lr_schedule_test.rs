@@ -3,6 +3,7 @@
 //! 关键约束（当前仓库约定）：余弦退火 + warmup，且 `num_restarts=0`。
 
 use llm::{Layer, LLM, Vocab};
+use llm::LayerContext;
 use ndarray::Array2;
 
 struct LrProbeLayer {
@@ -32,20 +33,20 @@ impl Layer for LrProbeLayer {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         let seq_len = input.shape()[1];
         if seq_len == self.logits.nrows() {
-            return self.logits.clone();
+            return (self.logits.clone(), Box::new(()));
         }
 
         let mut out = Array2::zeros((seq_len, self.logits.ncols()));
         for i in 0..seq_len {
             out.row_mut(i).assign(&self.logits.row(0));
         }
-        out
+        (out, Box::new(()))
     }
 
-    fn backward(&mut self, _grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+    fn backward(&mut self, _ctx: &LayerContext, _grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         // 同一 epoch 内（多个样本）lr 通常相同；这里做去重，避免测试与 sample_count 强耦合。
         if self
             .seen_lrs

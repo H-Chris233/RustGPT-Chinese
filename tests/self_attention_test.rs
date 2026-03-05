@@ -10,7 +10,7 @@ fn test_self_attention_forward() {
     let input = Array2::ones((3, EMBEDDING_DIM));
 
     // Test forward pass
-    let output = self_attention.forward(&input);
+    let (output, _ctx) = self_attention.forward(&input);
 
     // Check output shape - should be same as input
     assert_eq!(output.shape(), input.shape());
@@ -27,7 +27,7 @@ fn test_self_attention_with_different_sequence_lengths() {
         let input = Array2::ones((seq_len, EMBEDDING_DIM));
 
         // Test forward pass
-        let output = self_attention.forward(&input);
+        let (output, _ctx) = self_attention.forward(&input);
 
         // Check output shape
         assert_eq!(output.shape(), [seq_len, EMBEDDING_DIM]);

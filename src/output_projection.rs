@@ -35,7 +35,22 @@
 
 use ndarray::{Array1, Array2, Axis};
 
-use crate::{adam::Adam, llm::Layer, utils::sample_normal};
+use crate::{
+    adam::Adam,
+    llm::{Layer, LayerContext},
+    utils::sample_normal,
+};
+
+/// OutputProjection 层的 forward/backward 上下文。
+///
+/// 教学说明：
+/// - 旧实现把 `input` 缓存在 `self.cached_input`，backward 时再取出来计算 `grad_W`。
+/// - 这在 batch 场景会出现“缓存覆盖”问题：同一个层实例对多个样本 forward 后，只剩最后一个样本的 cached_input。
+/// - 新版通过 ctx 显式传递 input，确保每个样本的 backward 都用到自己的 input。
+#[derive(Clone)]
+struct OutputProjectionContext {
+    input: Array2<f32>,
+}
 
 /// **输出投影层结构体**
 pub struct OutputProjection {
@@ -127,11 +142,36 @@ impl OutputProjection {
     ///
     /// 返回值：传递给前一层的梯度（dL/dInput）。
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let Some(input) = self.cached_input.as_ref() else {
+        // 注意：这里不能直接拿着 `self.cached_input.as_ref()` 的借用再调用 `&mut self` 方法，
+        // 否则会触发 Rust 的借用冲突（E0502）。因此我们把 input clone 出来再计算。
+        let Some(input) = self.cached_input.as_ref().cloned() else {
             log::warn!("OutputProjection.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
             return grads.clone();
         };
 
+        self.backward_accumulate_from_input(&input, grads)
+    }
+
+    /// 仅做“梯度计算 + 累加”，不更新参数（ctx 驱动，不依赖 cached_*）。
+    ///
+    /// 说明：
+    /// - 旧版梯度累积接口 `backward_accumulate()` 依赖 `self.cached_input`；
+    /// - 当我们把 forward/backward 迁移到“显式 ctx”后，累积接口也必须跟上，否则
+    ///   `cached_*` 字段永远无法删除（并且 batch 场景仍然潜藏覆盖风险）。
+    pub fn backward_accumulate_with_ctx(
+        &mut self,
+        ctx: &LayerContext,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<OutputProjectionContext>() else {
+            log::warn!("OutputProjection.backward_accumulate_with_ctx 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
+        self.backward_accumulate_from_input(&ctx.input, grads)
+    }
+
+    /// 核心实现：给定 input，计算梯度并写入累积 buffer。
+    fn backward_accumulate_from_input(&mut self, input: &Array2<f32>, grads: &Array2<f32>) -> Array2<f32> {
         let (grad_input, grad_w_out, grad_b_out) = Self::compute_grads(input, &self.w_out, grads);
 
         self.grad_w_out_accum += &grad_w_out;
@@ -221,9 +261,13 @@ impl Layer for OutputProjection {
     /// 经过 softmax 后变为概率：
     ///   [0.45, 0.01, 0.15, ...]  // 总和为1
     /// ```
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
+        // 兼容旧逻辑：保留 cached_input（梯度累积路径仍在使用它）。
+        // 主链路 backward 将优先使用 ctx。
         self.cached_input = Some(input.clone());
-        input.dot(&self.w_out) + &self.b_out
+
+        let out = input.dot(&self.w_out) + &self.b_out;
+        (out, Box::new(OutputProjectionContext { input: input.clone() }))
     }
 
     /// **反向传播：计算梯度并更新参数**
@@ -237,13 +281,14 @@ impl Layer for OutputProjection {
     ///   grad_b = mean(grads, axis=0)
     ///   grad_input = grads · W^T
     /// ```
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let Some(input) = self.cached_input.as_ref() else {
-            log::warn!("OutputProjection.backward 在未执行 forward 的情况下被调用，直接传递梯度");
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<OutputProjectionContext>() else {
+            log::warn!("OutputProjection.backward 收到未知 ctx，直接传递梯度");
             return grads.clone();
         };
 
-        let (grad_input, grad_w_out, grad_b_out) = Self::compute_grads(input, &self.w_out, grads);
+        let (grad_input, grad_w_out, grad_b_out) =
+            Self::compute_grads(&ctx.input, &self.w_out, grads);
 
         // 更新参数
         self.optimizer.step(&mut self.w_out, &grad_w_out, lr);

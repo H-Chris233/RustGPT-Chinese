@@ -15,14 +15,14 @@ fn benchmark_mask_caching() {
 
     // 预热
     for _ in 0..3 {
-        let _ = self_attention.forward(&input);
+        let (_out, _ctx) = self_attention.forward(&input);
     }
 
     // 基准测试：测量多次前向传播的平均时间
     let iterations = 100;
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = self_attention.forward(&input);
+        let (_out, _ctx) = self_attention.forward(&input);
     }
     let duration = start.elapsed();
     let avg_time = duration / iterations;
@@ -52,14 +52,14 @@ fn benchmark_different_sequence_lengths() {
 
         // 预热
         for _ in 0..3 {
-            let _ = self_attention.forward(&input);
+            let (_out, _ctx) = self_attention.forward(&input);
         }
 
         // 基准测试
         let iterations = 50;
         let start = Instant::now();
         for _ in 0..iterations {
-            let _ = self_attention.forward(&input);
+            let (_out, _ctx) = self_attention.forward(&input);
         }
         let duration = start.elapsed();
         let avg_time = duration / iterations;
@@ -96,7 +96,7 @@ fn benchmark_numerical_stability() {
         let mut all_finite = true;
 
         for _ in 0..iterations {
-            let output = self_attention.forward(&input);
+            let (output, _ctx) = self_attention.forward(&input);
             all_finite &= output.iter().all(|&v| v.is_finite());
         }
 
@@ -126,9 +126,9 @@ fn benchmark_gradient_computation() {
 
     // 预热
     for _ in 0..3 {
-        let output = self_attention.forward(&input);
+        let (output, ctx) = self_attention.forward(&input);
         let grad = Array2::ones(output.dim());
-        let _ = self_attention.backward(&grad, 0.001);
+        let _ = self_attention.backward(&ctx, &grad, 0.001);
     }
 
     // 基准测试
@@ -137,16 +137,16 @@ fn benchmark_gradient_computation() {
     // 前向传播
     let start = Instant::now();
     for _ in 0..iterations {
-        let _ = self_attention.forward(&input);
+        let (_out, _ctx) = self_attention.forward(&input);
     }
     let forward_time = start.elapsed() / iterations;
 
     // 前向+反向传播
     let start = Instant::now();
     for _ in 0..iterations {
-        let output = self_attention.forward(&input);
+        let (output, ctx) = self_attention.forward(&input);
         let grad = Array2::ones(output.dim());
-        let _ = self_attention.backward(&grad, 0.001);
+        let _ = self_attention.backward(&ctx, &grad, 0.001);
     }
     let total_time = start.elapsed() / iterations;
     let backward_time = total_time - forward_time;
@@ -175,7 +175,7 @@ fn benchmark_cache_hit_rate() {
     for i in 0..iterations {
         let seq_len = common_lengths[i % common_lengths.len()];
         let input = Array2::ones((seq_len, EMBEDDING_DIM));
-        let _ = self_attention.forward(&input);
+        let (_out, _ctx) = self_attention.forward(&input);
     }
     let duration = start.elapsed();
 

@@ -51,7 +51,12 @@
 use ndarray::Array2;
 use rand::{Rng, rng};
 
-use crate::llm::Layer;
+use crate::llm::{Layer, LayerContext};
+
+#[derive(Clone)]
+struct DropoutContext {
+    mask: Option<Array2<f32>>,
+}
 
 /// **Dropout 正则化层**
 pub struct Dropout {
@@ -138,6 +143,28 @@ impl Dropout {
 
         mask
     }
+
+    /// 使用 **self 内部缓存的 mask** 做反向传播（兼容旧的“无 ctx”调用路径）。
+    ///
+    /// 教学说明：
+    /// - 新版推荐使用 `Layer::backward(ctx, grads, lr)`，其中 ctx 自带 mask；
+    /// - 但仓库里仍存在一些旧接口（例如梯度累积的某些实现）会直接依赖 self.mask；
+    /// - 为了让重构可以分阶段推进，这里保留一个显式方法用于兼容。
+    pub fn backward_cached(&self, grads: &Array2<f32>) -> Array2<f32> {
+        if self.training && self.dropout_rate > 0.0 {
+            if let Some(mask) = self.mask.as_ref() {
+                let scale_factor = 1.0 / (1.0 - self.dropout_rate);
+                let mut result = grads.clone();
+                result *= mask;
+                result *= scale_factor;
+                result
+            } else {
+                grads.clone()
+            }
+        } else {
+            grads.clone()
+        }
+    }
 }
 
 impl Layer for Dropout {
@@ -153,24 +180,37 @@ impl Layer for Dropout {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         if self.training && self.dropout_rate > 0.0 {
             let mask = self.create_mask(input.dim());
+            // 兼容旧实现：仍把 mask 缓存在 self 中，供旧的“非 ctx 路径”（例如某些累积接口）使用。
             self.mask = Some(mask.clone());
-
             let scale_factor = 1.0 / (1.0 - self.dropout_rate);
             let mut result = input.clone();
             result *= &mask;
             result *= scale_factor;
-            result
+            (
+                result,
+                Box::new(DropoutContext {
+                    mask: Some(mask),
+                }),
+            )
         } else {
-            input.clone()
+            (
+                input.clone(),
+                Box::new(DropoutContext { mask: None }),
+            )
         }
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
+        let mask = ctx
+            .downcast_ref::<DropoutContext>()
+            .map(|c| c.mask.as_ref())
+            .unwrap_or(None);
+
         if self.training && self.dropout_rate > 0.0 {
-            if let Some(mask) = self.mask.as_ref() {
+            if let Some(mask) = mask {
                 let scale_factor = 1.0 / (1.0 - self.dropout_rate);
                 let mut result = grads.clone();
                 result *= mask;

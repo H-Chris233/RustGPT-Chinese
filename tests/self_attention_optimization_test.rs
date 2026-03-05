@@ -16,7 +16,7 @@ fn test_causal_mask_caching() {
     // 首次前向传播，应该创建并缓存掩码
     let seq_len1 = 5;
     let input1 = Array2::ones((seq_len1, EMBEDDING_DIM));
-    let output1 = self_attention.forward(&input1);
+    let (output1, _ctx) = self_attention.forward(&input1);
 
     // 验证掩码已被缓存
     assert!(self_attention.causal_mask_cache.contains_key(&seq_len1));
@@ -41,7 +41,7 @@ fn test_causal_mask_caching() {
 
     // 第二次使用相同序列长度，应该复用缓存
     let input2 = Array2::ones((seq_len1, EMBEDDING_DIM)) * 2.0;
-    let output2 = self_attention.forward(&input2);
+    let (output2, _ctx) = self_attention.forward(&input2);
 
     // 输出形状应该正确
     assert_eq!(output1.shape(), [seq_len1, EMBEDDING_DIM]);
@@ -50,7 +50,7 @@ fn test_causal_mask_caching() {
     // 不同序列长度应该创建新的缓存条目
     let seq_len2 = 10;
     let input3 = Array2::ones((seq_len2, EMBEDDING_DIM));
-    let _output3 = self_attention.forward(&input3);
+    let (_output3, _ctx) = self_attention.forward(&input3);
 
     // 验证两个不同长度的掩码都被缓存
     assert!(self_attention.causal_mask_cache.contains_key(&seq_len1));
@@ -65,7 +65,7 @@ fn test_multiple_sequence_lengths() {
     // 测试多个不同的序列长度
     for seq_len in [1, 3, 5, 8, 16, 32, 64] {
         let input = Array2::ones((seq_len, EMBEDDING_DIM));
-        let output = self_attention.forward(&input);
+        let (output, _ctx) = self_attention.forward(&input);
 
         // 验证输出形状
         assert_eq!(
@@ -99,7 +99,7 @@ fn test_numerical_stability_with_large_values() {
         }
     }
 
-    let output = self_attention.forward(&input);
+    let (output, _ctx) = self_attention.forward(&input);
 
     // 验证输出不包含NaN或Inf
     for &val in output.iter() {
@@ -125,7 +125,7 @@ fn test_numerical_stability_with_small_values() {
         }
     }
 
-    let output = self_attention.forward(&input);
+    let (output, _ctx) = self_attention.forward(&input);
 
     // 验证输出不包含NaN或Inf
     for &val in output.iter() {
@@ -143,11 +143,11 @@ fn test_gradient_flow() {
     // 前向传播
     let seq_len = 5;
     let input = Array2::ones((seq_len, EMBEDDING_DIM));
-    let _output = self_attention.forward(&input);
+    let (_output, ctx) = self_attention.forward(&input);
 
     // 反向传播
     let grad_output = Array2::ones((seq_len, EMBEDDING_DIM));
-    let grad_input = self_attention.backward(&grad_output, 0.001);
+    let grad_input = self_attention.backward(&ctx, &grad_output, 0.001);
 
     // 验证梯度不包含NaN或Inf
     for &val in grad_input.iter() {
@@ -177,7 +177,7 @@ fn test_gradient_stability_with_extreme_values() {
         }
     }
 
-    let _output = self_attention.forward(&input);
+    let (_output, ctx) = self_attention.forward(&input);
 
     // 使用极端梯度值
     let mut grad_output = Array2::zeros((seq_len, EMBEDDING_DIM));
@@ -187,7 +187,7 @@ fn test_gradient_stability_with_extreme_values() {
         }
     }
 
-    let grad_input = self_attention.backward(&grad_output, 0.001);
+    let grad_input = self_attention.backward(&ctx, &grad_output, 0.001);
 
     // 验证梯度稳定性
     for &val in grad_input.iter() {
@@ -205,7 +205,7 @@ fn test_forward_backward_consistency() {
     let input = Array2::ones((seq_len, EMBEDDING_DIM));
 
     for iter in 0..10 {
-        let output = self_attention.forward(&input);
+        let (output, ctx) = self_attention.forward(&input);
 
         // 验证输出有效
         assert!(
@@ -215,7 +215,7 @@ fn test_forward_backward_consistency() {
         );
 
         let grad_output = Array2::ones((seq_len, EMBEDDING_DIM));
-        let grad_input = self_attention.backward(&grad_output, 0.001);
+        let grad_input = self_attention.backward(&ctx, &grad_output, 0.001);
 
         // 验证梯度有效
         assert!(
@@ -235,12 +235,12 @@ fn test_mask_cache_performance() {
 
     // 第一次调用会创建缓存
     let start = std::time::Instant::now();
-    let _output1 = self_attention.forward(&input);
+    let (_output1, _ctx) = self_attention.forward(&input);
     let first_duration = start.elapsed();
 
     // 后续调用应该复用缓存（理论上更快，但由于其他计算占主导，差异可能不明显）
     let start = std::time::Instant::now();
-    let _output2 = self_attention.forward(&input);
+    let (_output2, _ctx) = self_attention.forward(&input);
     let second_duration = start.elapsed();
 
     println!("第一次调用: {:?}", first_duration);
@@ -259,12 +259,12 @@ fn test_output_causality() {
 
     // 创建一个输入，其中后面的位置有不同的值
     let input1 = Array2::ones((seq_len, EMBEDDING_DIM));
-    let output1 = self_attention.forward(&input1);
+    let (output1, _ctx) = self_attention.forward(&input1);
 
     // 修改最后一个位置的值（未来 token）
     let mut input2 = input1.clone();
     input2.row_mut(seq_len - 1).fill(999.0);
-    let output2 = self_attention.forward(&input2);
+    let (output2, _ctx) = self_attention.forward(&input2);
 
     // 两个输出的形状应该相同
     assert_eq!(output1.shape(), output2.shape());
@@ -295,7 +295,7 @@ fn test_different_batch_sizes() {
     // 测试不同的"批次大小"（实际上是序列长度）
     for seq_len in [1, 2, 4, 8, 16] {
         let input = Array2::ones((seq_len, EMBEDDING_DIM));
-        let output = self_attention.forward(&input);
+        let (output, _ctx) = self_attention.forward(&input);
 
         assert_eq!(output.shape(), [seq_len, EMBEDDING_DIM]);
         assert!(output.iter().all(|&v| v.is_finite()));

@@ -160,96 +160,93 @@ impl<'a> Drop for InferenceSession<'a> {
     }
 }
 
-/// Layer trait - 支持单样本和批量处理
+use std::any::Any;
+
+/// Layer 上下文：用于把 forward 产生的中间量（原本缓存在 self 内部的 cached_*）
+/// 以“值”的形式返回给调用方，并在 backward 时显式传回，从而避免 batch 缓存覆盖。
+pub type LayerContext = Box<dyn Any>;
+
+/// Layer trait - 支持单样本和批量处理（显式上下文）
 ///
-/// 所有神经网络层需要实现这个trait，支持：
-/// - 单样本处理：forward/backward 使用 Array2 (seq_len, hidden_dim)
-/// - 批量处理：forward_batch/backward_batch 使用 Array3 (batch, seq, hidden_dim)
+/// 设计目标：
+/// - `forward()` 返回 `(output, ctx)`，其中 `ctx` 保存 backward 所需的中间量
+/// - `backward()` 必须显式接收 `ctx`，避免依赖 self 内部缓存
+///
+/// 批量接口同理：返回/接收每个样本的 ctx，保证 batch 反传语义正确。
 pub trait Layer {
     fn layer_type(&self) -> &str;
-
-    /// 单样本前向传播（保留向后兼容）
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32>;
-
-    /// 单样本反向传播（保留向后兼容）
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32>;
 
     /// 用于类型转换的辅助方法
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 
-    /// 批量前向传播
-    ///
-    /// # 参数
-    /// - `input`: (batch_size, seq_len, hidden_dim) 或 (batch_size, seq_len) 对于embeddings
-    /// - `attention_mask`: 可选的注意力掩码 (batch_size, seq_len)，1.0表示真实token，0.0表示PAD
-    ///
-    /// # 返回值
-    /// (batch_size, seq_len, hidden_dim) 的输出张量
+    /// 单样本前向传播
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext);
+
+    /// 单样本反向传播
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32>;
+
+    /// 批量前向传播（默认实现：逐样本循环）
     fn forward_batch(
         &mut self,
         input: &Array3<f32>,
-        _attention_mask: Option<&Array2<f32>>,
-    ) -> Array3<f32> {
-        // 默认实现：对批次中的每个样本分别调用单样本 forward
+        attention_mask: Option<&Array2<f32>>,
+    ) -> (Array3<f32>, Vec<LayerContext>) {
         let batch_size = input.shape()[0];
         let seq_len = input.shape()[1];
         let hidden_dim = input.shape()[2];
 
         let mut output = Array3::zeros((batch_size, seq_len, hidden_dim));
+        let mut ctxs: Vec<LayerContext> = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
             let sample = input.slice(ndarray::s![b, .., ..]).to_owned();
-            let sample_output = self.forward(&sample);
+            let (sample_out, ctx) = self.forward(&sample);
             output
                 .slice_mut(ndarray::s![b, .., ..])
-                .assign(&sample_output);
+                .assign(&sample_out);
+            ctxs.push(ctx);
         }
 
-        output
+        let _ = attention_mask;
+        (output, ctxs)
     }
 
-    /// 批量反向传播
-    ///
-    /// # 参数
-    /// - `grads`: (batch_size, seq_len, hidden_dim) 的梯度
-    /// - `lr`: 学习率
-    /// - `attention_mask`: 可选的注意力掩码，用于排除PAD位置的梯度
-    ///
-    /// # 返回值
-    /// (batch_size, seq_len, hidden_dim) 的输入梯度
+    /// 批量反向传播（默认实现：逐样本循环）
     fn backward_batch(
         &mut self,
+        ctxs: &[LayerContext],
         grads: &Array3<f32>,
         lr: f32,
         attention_mask: Option<&Array2<f32>>,
     ) -> Array3<f32> {
-        // 默认实现：对批次中的每个样本分别调用单样本 backward
         let batch_size = grads.shape()[0];
         let seq_len = grads.shape()[1];
         let hidden_dim = grads.shape()[2];
 
-        let mut grad_input = Array3::zeros((batch_size, seq_len, hidden_dim));
+        assert_eq!(
+            ctxs.len(),
+            batch_size,
+            "backward_batch: ctxs.len() must equal batch_size"
+        );
 
+        let mut grad_input = Array3::zeros((batch_size, seq_len, hidden_dim));
         for b in 0..batch_size {
             let mut sample_grad = grads.slice(ndarray::s![b, .., ..]).to_owned();
 
-            // 如果有注意力掩码，将PAD位置的梯度清零
             if let Some(mask) = attention_mask {
                 for s in 0..seq_len {
                     if mask[[b, s]] < 0.5 {
-                        // PAD位置，梯度清零
                         sample_grad.row_mut(s).fill(0.0);
                     }
                 }
             }
 
-            let sample_grad_input = self.backward(&sample_grad, lr);
+            let sample_grad_input = self.backward(&ctxs[b], &sample_grad, lr);
             grad_input
                 .slice_mut(ndarray::s![b, .., ..])
                 .assign(&sample_grad_input);
         }
-
         grad_input
     }
 
@@ -471,7 +468,8 @@ impl LLM {
             if let Some(block) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
                 hidden = block.forward_inference(&hidden);
             } else {
-                hidden = layer.forward(&hidden);
+                let (out, _ctx) = layer.forward(&hidden);
+                hidden = out;
             }
         }
 
@@ -653,7 +651,9 @@ impl LLM {
             let mut input = token_input;
 
             for layer in &mut self.network {
-                input = layer.forward(&input);
+                // 生成阶段只做前向推理，不需要 ctx。
+                let (out, _ctx) = layer.forward(&input);
+                input = out;
             }
 
             let logits = input;
@@ -717,8 +717,21 @@ impl LLM {
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                // ==========================
+                // 前向传播（显式上下文）
+                // ==========================
+                //
+                // 教学说明：
+                // - 新版 Layer::forward 返回 (output, ctx)；
+                // - ctx 保存 backward 所需的中间量（例如 FFN 的激活、Attention 的权重、Dropout 的 mask 等）；
+                // - 我们把每一层的 ctx 按顺序存入 `layer_ctxs`，并在反向传播时按相反顺序取回。
+                //
+                // 这样即便未来实现“真正 batch”，也不会再出现“forward 缓存被覆盖导致静默错误梯度”的问题。
+                let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -744,8 +757,13 @@ impl LLM {
 
                 Self::clip_gradients(&mut grads_output, 1.0);
 
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, current_lr);
+                for (layer, ctx) in self
+                    .network
+                    .iter_mut()
+                    .rev()
+                    .zip(layer_ctxs.iter().rev())
+                {
+                    grads_output = layer.backward(ctx, &grads_output, current_lr);
                 }
                 sample_count += 1;
             }
@@ -801,8 +819,12 @@ impl LLM {
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                // 前向传播：收集每层 ctx，供反向传播使用（避免缓存覆盖）
+                let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -830,8 +852,13 @@ impl LLM {
                 // 更强的梯度裁剪提升稳定性
                 Self::clip_gradients(&mut grads_output, 1.0);
 
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, current_lr);
+                for (layer, ctx) in self
+                    .network
+                    .iter_mut()
+                    .rev()
+                    .zip(layer_ctxs.iter().rev())
+                {
+                    grads_output = layer.backward(ctx, &grads_output, current_lr);
                 }
 
                 sample_count += 1;
@@ -876,8 +903,21 @@ impl LLM {
         total_epochs: usize,
         num_restarts: usize,
     ) -> f32 {
+        if total_epochs == 0 {
+            return initial_lr;
+        }
+
         // 计算每个周期的长度
-        let cycle_length = total_epochs / (num_restarts + 1);
+        //
+        // 注意：当 total_epochs < (num_restarts+1) 时，整数除法会得到 0，进而导致：
+        // - epoch % cycle_length 取模 0 panic
+        // - progress 计算除以 0
+        // 这里用 max(1) 做鲁棒性保护：宁可退化为“无退火”（cycle_length=1），也不要训练直接崩溃。
+        // 额外安全性：
+        // - `num_restarts + 1` 在极端输入下可能发生 usize 溢出并回绕为 0（release 模式），导致除以 0 panic；
+        // - 这里使用 saturating_add 保证分母至少为 1。
+        let denom = num_restarts.saturating_add(1).max(1);
+        let cycle_length = (total_epochs / denom).max(1);
 
         // 当前在周期内的位置
         let cycle_epoch = epoch % cycle_length;
@@ -971,23 +1011,50 @@ impl LLM {
         }
     }
 
-    fn backward_accumulate(&mut self, grads_output: &Array2<f32>) -> Array2<f32> {
+    /// 梯度累积（网络级别调度，ctx 驱动）。
+    ///
+    /// 说明：
+    /// - 旧版实现会在 forward 时把中间量写入各层 `cached_*` 字段，然后 `backward_accumulate()`
+    ///   再从 self 中读取这些缓存；
+    /// - 这会阻碍我们删除 cached 字段，也会在 batch/并发场景造成“缓存覆盖”风险；
+    /// - 新版改为：forward 收集每层 ctx，反传（累积）时按层把 ctx 逐一归还。
+    fn backward_accumulate_with_ctx(
+        &mut self,
+        layer_ctxs: &[LayerContext],
+        grads_output: &Array2<f32>,
+    ) -> Array2<f32> {
+        if layer_ctxs.len() != self.network.len() {
+            log::warn!(
+                "LLM.backward_accumulate_with_ctx: layer_ctxs.len()={} 与 network.len()={} 不一致，可能导致梯度错配",
+                layer_ctxs.len(),
+                self.network.len()
+            );
+        }
+
         let mut grads = grads_output.clone();
-        for layer in self.network.iter_mut().rev() {
+        for (layer, ctx) in self
+            .network
+            .iter_mut()
+            .rev()
+            .zip(layer_ctxs.iter().rev())
+        {
             grads = if let Some(op) = layer.as_any_mut().downcast_mut::<OutputProjection>() {
-                op.backward_accumulate(&grads)
+                op.backward_accumulate_with_ctx(ctx, &grads)
             } else if let Some(tb) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
-                tb.backward_accumulate(&grads)
+                tb.backward_accumulate_with_ctx(ctx, &grads)
             } else if let Some(emb) = layer.as_any_mut().downcast_mut::<Embeddings>() {
-                emb.backward_accumulate(&grads)
+                emb.backward_accumulate_with_ctx(ctx, &grads)
             } else {
-                // 理论上不会发生（网络结构固定），但保底：直接 backward（会更新参数）。
-                // 这里打印 error，避免“悄悄错”。
-                log::error!(
-                    "Layer {} 未实现梯度累积接口，已回退为立即更新（accumulation_steps 将不再严格等价）",
+                // 理论上不会发生（网络结构在 src/main.rs 中固定）。
+                //
+                // 旧版这里会 fallback 到 `backward(lr=0.0)`，但 Adam 即使 lr=0 也会推进内部状态
+                //（timestep/m/v），导致训练“看似没更新参数但状态漂移”，并破坏梯度累积的等价性。
+                //
+                // 因此这里选择 fail-fast：发现不支持累积的层就直接终止，避免静默错误。
+                panic!(
+                    "Layer {} 未实现梯度累积接口（backward_accumulate/step_accumulated），无法启用 accumulation_steps。",
                     layer.layer_type()
                 );
-                layer.backward(&grads, 0.0)
             };
         }
         grads
@@ -1080,10 +1147,17 @@ impl LLM {
             let current_lr =
                 Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
-            let mut total_loss = 0.0;
+            // 训练指标口径（重要）：
+            // - 旧实现：先对每个序列做 token-mean（loss / n_targets），再对序列做 mean（/ sample_count）
+            //   → 会把短序列“隐式加权”得更重。
+            // - 新实现：对所有有效 token 的 NLL 求和后再除以总 token 数
+            //   → 与常见 LM/困惑度定义一致（token-weighted）。
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
             let mut total_grad_norm = 0.0;
             let mut sample_count = 0usize;
-            let mut accum_counter = 0usize;
+            let mut accum_counter = 0usize; // micro-batch 计数（用于触发 step）
+            let mut accum_tokens = 0usize; // micro-batch 内有效 token 数（用于 token-weighted scale）
             // 每个 epoch 重新开始累积
             self.zero_grad_accum();
 
@@ -1095,14 +1169,30 @@ impl LLM {
                 // 前向传播
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
+                let n_targets = target_ids
+                    .iter()
+                    .filter(|&&t| t != pad_token_id)
+                    .count();
+                if n_targets == 0 {
+                    continue;
+                }
 
                 let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
                 input
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                // 前向传播：必须显式收集每层 ctx，供梯度累积路径使用。
+                //
+                // 教学说明：
+                // - 虽然我们“每个 micro-batch 都立刻 backward”，理论上 cached_* 不会被后续样本覆盖；
+                // - 但如果累积接口仍依赖 cached_*，就意味着 cached_* 字段永远删不掉；
+                // - 因此这里直接使用 ctx 驱动的累积反传，作为第二轮重构的起点。
+                let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -1123,8 +1213,10 @@ impl LLM {
                     }
                 };
 
-                total_loss +=
+                let loss_mean =
                     Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+                total_nll += loss_mean * (n_targets as f32);
+                total_tokens += n_targets;
 
                 total_grad_norm += Self::compute_grad_norm(&grads_output);
 
@@ -1138,11 +1230,20 @@ impl LLM {
                 // - 必须对每个 micro-batch 立即执行 backward（否则层内 cached_* 会被后续样本覆盖）；
                 // - 但不立刻更新参数，而是把参数梯度累加到各层的累积 buffer；
                 // - 当累积步数到达阈值时，再统一对“平均梯度”执行一次参数更新（scale=1/steps）。
-                self.backward_accumulate(&grads_output);
+                //
+                // 这里额外做一个关键修复（token-weighted）：
+                // - `compute_gradients_step()` 输出的是 “token-mean loss” 对 logits 的梯度（已除以 n_targets）；
+                // - 若直接对 micro-batch 求平均，会变成 sequence-weighted（每条序列权重相同）；
+                // - 我们把 logits 梯度乘回 n_targets，使其对应 “sum NLL” 的梯度，
+                //   然后在 step 时用 `scale = 1/accum_tokens` 做统一平均，得到 token-weighted 梯度。
+                grads_output.mapv_inplace(|x| x * (n_targets as f32));
+                self.backward_accumulate_with_ctx(&layer_ctxs, &grads_output);
                 accum_counter += 1;
+                accum_tokens += n_targets;
                 if accum_counter >= effective_accum_steps {
-                    self.step_accumulated(current_lr, 1.0 / accum_counter as f32);
+                    self.step_accumulated(current_lr, 1.0 / accum_tokens as f32);
                     accum_counter = 0;
+                    accum_tokens = 0;
                 }
 
                 sample_count += 1;
@@ -1150,12 +1251,12 @@ impl LLM {
 
             // 处理最后一个“不满 accumulation_steps”的尾批次
             if accum_counter > 0 {
-                self.step_accumulated(current_lr, 1.0 / accum_counter as f32);
+                self.step_accumulated(current_lr, 1.0 / accum_tokens as f32);
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
-            let avg_loss = if sample_count > 0 {
-                total_loss / sample_count as f32
+            let avg_loss = if total_tokens > 0 {
+                total_nll / total_tokens as f32
             } else {
                 0.0
             };
@@ -1321,8 +1422,20 @@ impl LLM {
                             .collect::<Array1<f32>>(),
                     );
 
+                    // ==========================
+                    // forward（显式上下文）
+                    // ==========================
+                    //
+                    // 教学说明：
+                    // - 本项目 Layer 的 backward 需要 forward 的中间量；
+                    // - 旧版把中间量缓存在 self 中，batch 内多次 forward 会覆盖缓存；
+                    // - 新版把中间量放到 ctx 中，因此我们必须在 forward 时收集每层 ctx。
+                    let mut layer_ctxs: Vec<LayerContext> =
+                        Vec::with_capacity(self.network.len());
                     for layer in &mut self.network {
-                        input = layer.forward(&input);
+                        let (out, ctx) = layer.forward(&input);
+                        layer_ctxs.push(ctx);
+                        input = out;
                     }
 
                     let logits = input;
@@ -1350,9 +1463,16 @@ impl LLM {
                     total_grad_norm += Self::compute_grad_norm(&grads);
                     Self::clip_gradients(&mut grads, 1.0);
 
-                    // backward + update
-                    for layer in self.network.iter_mut().rev() {
-                        grads = layer.backward(&grads, current_lr);
+                    // ==========================
+                    // backward（按层取回 ctx）
+                    // ==========================
+                    for (layer, ctx) in self
+                        .network
+                        .iter_mut()
+                        .rev()
+                        .zip(layer_ctxs.iter().rev())
+                    {
+                        grads = layer.backward(ctx, &grads, current_lr);
                     }
 
                     sample_count += 1;
@@ -1808,7 +1928,9 @@ impl LLM {
 
             let mut input = token_input;
             for layer in &mut self.network {
-                input = layer.forward(&input);
+                // 生成阶段只做推理，不需要 ctx。
+                let (out, _ctx) = layer.forward(&input);
+                input = out;
             }
 
             if input.shape()[0] == 0 {
@@ -1973,7 +2095,9 @@ impl LLM {
 
                 let mut input_tensor = input;
                 for layer in &mut self.network {
-                    input_tensor = layer.forward(&input_tensor);
+                    // beam_search 属于推理路径，不需要 ctx。
+                    let (out, _ctx) = layer.forward(&input_tensor);
+                    input_tensor = out;
                 }
 
                 let probs = softmax(&input_tensor);
@@ -2280,19 +2404,40 @@ impl LLM {
     }
 
     /// 计算交叉熵损失（从softmax概率）
-    pub fn cross_entropy_loss_step(probs: &Array2<f32>, target: &[usize]) -> f32 {
+    pub fn cross_entropy_loss_step(
+        probs: &Array2<f32>,
+        target: &[usize],
+        pad_token_id: usize,
+    ) -> f32 {
         use crate::LOG_EPSILON;
-        let mut loss = 0.0;
-        let n_targets = target.len() as f32;
+        let mut loss = 0.0f32;
+        let mut n_targets = 0usize;
 
         for (row_idx, &target_idx) in target.iter().enumerate() {
-            if target_idx < probs.shape()[1] {
-                let prob = probs[[row_idx, target_idx]].max(LOG_EPSILON);
-                loss -= prob.ln();
+            if target_idx == pad_token_id {
+                continue;
             }
+
+            if row_idx >= probs.shape()[0] || target_idx >= probs.shape()[1] {
+                log::warn!(
+                    "cross_entropy_loss_step 越界：row_idx={}, target_idx={}, probs_shape={:?}",
+                    row_idx,
+                    target_idx,
+                    probs.dim()
+                );
+                continue;
+            }
+
+            let prob = probs[[row_idx, target_idx]].max(LOG_EPSILON);
+            loss -= prob.ln();
+            n_targets += 1;
         }
 
-        loss / n_targets
+        if n_targets == 0 {
+            0.0
+        } else {
+            loss / (n_targets as f32)
+        }
     }
 
     pub fn compute_gradients_step(

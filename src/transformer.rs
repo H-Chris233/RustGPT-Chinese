@@ -68,12 +68,29 @@
 //! 输出 (seq_len, 512)
 //! ```
 
-use ndarray::{s, Array1, Array2, Array3};
+use ndarray::{s, Array2, Array3, Axis};
 
 use crate::{
     dropout::Dropout, feed_forward::FeedForward, layer_norm::LayerNorm, llm::Layer,
     self_attention::SelfAttention,
 };
+
+use crate::llm::LayerContext;
+
+/// TransformerBlock 的 forward/backward 上下文。
+///
+/// 教学说明：
+/// - TransformerBlock 由多个子层串联组成，并包含两次残差连接；
+/// - 每个子层的 backward 都需要它自己的 ctx（例如 Dropout 的 mask、Attention 的 Q/K/V、FFN 的激活等）；
+/// - 因此 TransformerBlock 的 ctx 本质上是“子层 ctx 的集合”，用于在 backward 时逐一归还。
+struct TransformerBlockContext {
+    norm1: LayerContext,
+    attention: LayerContext,
+    dropout1: LayerContext,
+    norm2: LayerContext,
+    feed_forward: LayerContext,
+    dropout2: LayerContext,
+}
 
 /// **Transformer 块结构体**
 ///
@@ -154,7 +171,7 @@ impl TransformerBlock {
         let grad_dropout2 = grads;
         let grad_x_from_residual2 = grads;
 
-        let grad_dropout2_out = self.dropout2.backward(grad_dropout2, 0.0);
+        let grad_dropout2_out = self.dropout2.backward_cached(grad_dropout2);
         let grad_ffn = self.feed_forward.backward_accumulate(&grad_dropout2_out);
         let grad_norm2 = self.norm2.backward_accumulate(&grad_ffn);
 
@@ -164,9 +181,59 @@ impl TransformerBlock {
         let grad_dropout1 = &grad_x;
         let grad_input_from_residual1 = &grad_x;
 
-        let grad_dropout1_out = self.dropout1.backward(grad_dropout1, 0.0);
+        let grad_dropout1_out = self.dropout1.backward_cached(grad_dropout1);
         let grad_attention = self.attention.backward_accumulate(&grad_dropout1_out);
         let grad_norm1 = self.norm1.backward_accumulate(&grad_attention);
+
+        &grad_norm1 + grad_input_from_residual1
+    }
+
+    /// 梯度累积（ctx 驱动版本）：只累加子层参数梯度，不更新参数。
+    ///
+    /// 与 `Layer::backward()` 的关系：
+    /// - `Layer::backward()`：计算梯度 + 立刻更新参数（Adam step）。
+    /// - `*_accumulate`：计算梯度 + 把参数梯度加到 buffer；真正的参数更新在 `step_accumulated()`。
+    ///
+    /// 为什么这个版本必须接收 ctx？
+    /// - TransformerBlock 内部包含 6 次子层调用（含两次 Dropout）；
+    /// - 每个子层的 backward 都依赖“本次 forward 的中间量”；
+    /// - 如果仍从 `self.cached_*` 读取，这些缓存会阻碍后续删除 cached 字段，并在 batch 场景埋雷。
+    pub fn backward_accumulate_with_ctx(
+        &mut self,
+        ctx: &LayerContext,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<TransformerBlockContext>() else {
+            log::warn!("TransformerBlock.backward_accumulate_with_ctx 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
+
+        // ========== 反向传播第二个残差连接 ==========
+        let grad_dropout2 = grads;
+        let grad_x_from_residual2 = grads;
+
+        // Dropout 没有参数：直接用 ctx 版 backward（mask 来自 ctx）
+        let grad_dropout2_out = self.dropout2.backward(&ctx.dropout2, grad_dropout2, 0.0);
+        let grad_ffn = self
+            .feed_forward
+            .backward_accumulate_with_ctx(&ctx.feed_forward, &grad_dropout2_out);
+        let grad_norm2 = self
+            .norm2
+            .backward_accumulate_with_ctx(&ctx.norm2, &grad_ffn);
+
+        let grad_x = &grad_norm2 + grad_x_from_residual2;
+
+        // ========== 反向传播第一个残差连接 ==========
+        let grad_dropout1 = &grad_x;
+        let grad_input_from_residual1 = &grad_x;
+
+        let grad_dropout1_out = self.dropout1.backward(&ctx.dropout1, grad_dropout1, 0.0);
+        let grad_attention = self
+            .attention
+            .backward_accumulate_with_ctx(&ctx.attention, &grad_dropout1_out);
+        let grad_norm1 = self
+            .norm1
+            .backward_accumulate_with_ctx(&ctx.norm1, &grad_attention);
 
         &grad_norm1 + grad_input_from_residual1
     }
@@ -184,15 +251,17 @@ impl TransformerBlock {
         let attention_out = if self.attention.use_kv_cache {
             self.attention.forward_with_kv_cache(&norm1_out)
         } else {
-            self.attention.forward(&norm1_out)
+            // 推理路径只需要输出，不需要 ctx。
+            let (out, _ctx) = self.attention.forward(&norm1_out);
+            out
         };
-        let dropout1_out = self.dropout1.forward(&attention_out);
+        let (dropout1_out, _ctx) = self.dropout1.forward(&attention_out);
 
         let x = input + &dropout1_out;
 
         let norm2_out = self.norm2.normalize(&x);
-        let feed_forward_out = self.feed_forward.forward(&norm2_out);
-        let dropout2_out = self.dropout2.forward(&feed_forward_out);
+        let (feed_forward_out, _ctx) = self.feed_forward.forward(&norm2_out);
+        let (dropout2_out, _ctx) = self.dropout2.forward(&feed_forward_out);
 
         &x + &dropout2_out
     }
@@ -241,59 +310,86 @@ impl Layer for TransformerBlock {
     ///
     /// # 返回值
     /// 输出张量，形状与输入相同 (seq_len, embedding_dim)
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         // ========== 第一个子层：多头自注意力 ==========
         // Pre-LN 架构：先归一化，再应用注意力
-        let norm1_out = self.norm1.normalize(input);
-        let attention_out = self.attention.forward(&norm1_out);
-        let dropout1_out = self.dropout1.forward(&attention_out);
+        let (norm1_out, ctx_norm1) = self.norm1.forward(input);
+        let (attention_out, ctx_attention) = self.attention.forward(&norm1_out);
+        let (dropout1_out, ctx_dropout1) = self.dropout1.forward(&attention_out);
 
         // 残差连接：保留原始信息，避免信息丢失
         let x = input + &dropout1_out;
 
         // ========== 第二个子层：前馈神经网络 ==========
         // 同样采用 Pre-LN：先归一化，再应用FFN
-        let norm2_out = self.norm2.normalize(&x);
-        let feed_forward_out = self.feed_forward.forward(&norm2_out);
-        let dropout2_out = self.dropout2.forward(&feed_forward_out);
+        let (norm2_out, ctx_norm2) = self.norm2.forward(&x);
+        let (feed_forward_out, ctx_ffn) = self.feed_forward.forward(&norm2_out);
+        let (dropout2_out, ctx_dropout2) = self.dropout2.forward(&feed_forward_out);
 
         // 最终残差连接：整合注意力和前馈的输出
-        &x + &dropout2_out
+        let out = &x + &dropout2_out;
+
+        (
+            out,
+            Box::new(TransformerBlockContext {
+                norm1: ctx_norm1,
+                attention: ctx_attention,
+                dropout1: ctx_dropout1,
+                norm2: ctx_norm2,
+                feed_forward: ctx_ffn,
+                dropout2: ctx_dropout2,
+            }),
+        )
     }
 
     fn forward_batch(
         &mut self,
         input: &Array3<f32>,
         attention_mask: Option<&Array2<f32>>,
-    ) -> Array3<f32> {
+    ) -> (Array3<f32>, Vec<LayerContext>) {
         let batch_size = input.shape()[0];
         let seq_len = input.shape()[1];
         let hidden_dim = input.shape()[2];
 
         let mut output = Array3::zeros((batch_size, seq_len, hidden_dim));
+        let mut ctxs: Vec<LayerContext> = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
             let sample = input.slice(s![b, .., ..]).to_owned();
-            let key_padding_mask: Option<Array1<f32>> =
-                attention_mask.map(|m| m.row(b).to_owned());
+            let (norm1_out, ctx_norm1) = self.norm1.forward(&sample);
 
-            let norm1_out = self.norm1.normalize(&sample);
-            let attention_out =
-                self.attention
-                    .forward_with_padding_mask(&norm1_out, key_padding_mask.as_ref());
-            let dropout1_out = self.dropout1.forward(&attention_out);
+            // 注意力需要 padding mask：我们把单样本包装成 batch_size=1 的张量，
+            // 复用 SelfAttention::forward_batch（它会生成正确 ctx）。
+            let attn_in = norm1_out.insert_axis(Axis(0));
+            let attn_mask = attention_mask.map(|m| m.slice(s![b..b + 1, ..]).to_owned());
+            let (attn_out_b, mut attn_ctxs) =
+                self.attention.forward_batch(&attn_in, attn_mask.as_ref());
+            let attention_out = attn_out_b.index_axis(Axis(0), 0).to_owned();
+            let ctx_attention = attn_ctxs
+                .pop()
+                .unwrap_or_else(|| Box::new(()));
 
+            let (dropout1_out, ctx_dropout1) = self.dropout1.forward(&attention_out);
             let x = &sample + &dropout1_out;
 
-            let norm2_out = self.norm2.normalize(&x);
-            let feed_forward_out = self.feed_forward.forward(&norm2_out);
-            let dropout2_out = self.dropout2.forward(&feed_forward_out);
+            let (norm2_out, ctx_norm2) = self.norm2.forward(&x);
+            let (ffn_out, ctx_ffn) = self.feed_forward.forward(&norm2_out);
+            let (dropout2_out, ctx_dropout2) = self.dropout2.forward(&ffn_out);
 
             let sample_out = &x + &dropout2_out;
             output.slice_mut(s![b, .., ..]).assign(&sample_out);
+
+            ctxs.push(Box::new(TransformerBlockContext {
+                norm1: ctx_norm1,
+                attention: ctx_attention,
+                dropout1: ctx_dropout1,
+                norm2: ctx_norm2,
+                feed_forward: ctx_ffn,
+                dropout2: ctx_dropout2,
+            }));
         }
 
-        output
+        (output, ctxs)
     }
 
     /// **反向传播：计算梯度并更新参数**
@@ -331,7 +427,11 @@ impl Layer for TransformerBlock {
     ///
     /// # 返回值
     /// 传递给前一层的梯度 (seq_len, embedding_dim)
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<TransformerBlockContext>() else {
+            log::warn!("TransformerBlock.backward 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
         // ========== 反向传播第二个残差连接 ==========
         // 梯度分为两路：残差路径 + 变换路径
 
@@ -340,9 +440,11 @@ impl Layer for TransformerBlock {
         let grad_x_from_residual2 = grads;
 
         // 变换路径：依次通过 Dropout2 → FFN → Norm2
-        let grad_dropout2_out = self.dropout2.backward(grad_dropout2, lr);
-        let grad_ffn = self.feed_forward.backward(&grad_dropout2_out, lr);
-        let grad_norm2 = self.norm2.backward(&grad_ffn, lr);
+        let grad_dropout2_out = self.dropout2.backward(&ctx.dropout2, grad_dropout2, lr);
+        let grad_ffn = self
+            .feed_forward
+            .backward(&ctx.feed_forward, &grad_dropout2_out, lr);
+        let grad_norm2 = self.norm2.backward(&ctx.norm2, &grad_ffn, lr);
 
         // 累积两路梯度
         let grad_x = &grad_norm2 + grad_x_from_residual2;
@@ -354,9 +456,11 @@ impl Layer for TransformerBlock {
         let grad_input_from_residual1 = &grad_x;
 
         // 变换路径：依次通过 Dropout1 → Attention → Norm1
-        let grad_dropout1_out = self.dropout1.backward(grad_dropout1, lr);
-        let grad_attention = self.attention.backward(&grad_dropout1_out, lr);
-        let grad_norm1 = self.norm1.backward(&grad_attention, lr);
+        let grad_dropout1_out = self.dropout1.backward(&ctx.dropout1, grad_dropout1, lr);
+        let grad_attention = self
+            .attention
+            .backward(&ctx.attention, &grad_dropout1_out, lr);
+        let grad_norm1 = self.norm1.backward(&ctx.norm1, &grad_attention, lr);
 
         // 累积两路梯度，得到最终输入梯度
         &grad_norm1 + grad_input_from_residual1

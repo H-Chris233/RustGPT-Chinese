@@ -26,7 +26,7 @@ fn make_attn_with_weights(
 }
 
 fn compute_loss(attn: &mut SelfAttention, input: &Array2<f32>, grad_out: &Array2<f32>) -> f32 {
-    let out = attn.forward(input);
+    let (out, _ctx) = attn.forward(input);
     (&out * grad_out).sum()
 }
 
@@ -54,7 +54,7 @@ fn self_attention_parameter_gradients_match_numerical() {
 
     // 解析梯度：通过 backward_accumulate 计算并写入 grad_w_*_accum
     let mut attn = make_attn_with_weights(dim, &w_q, &w_k, &w_v, &w_o);
-    let _ = attn.forward(&input);
+    let (_out, _ctx) = attn.forward(&input);
     attn.zero_grad_accum();
     let _ = attn.backward_accumulate(&grad_out);
     let grad_w_q = attn.grad_w_q_accum.clone();

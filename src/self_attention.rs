@@ -91,7 +91,28 @@ use std::f32;
 use ndarray::{s, Array1, Array2, Array3, ArrayView2, Axis};
 use ndarray::linalg::general_mat_mul;
 
-use crate::{adam::Adam, llm::Layer, utils::sample_normal, EMBEDDING_DIM};
+use crate::{
+    EMBEDDING_DIM,
+    adam::Adam,
+    llm::{Layer, LayerContext},
+    utils::sample_normal,
+};
+
+/// SelfAttention 层的 forward/backward 上下文。
+///
+/// 教学说明：
+/// - 注意力层的反向传播需要大量中间量（Q/K/V、softmax 权重、输出投影前的 attention_output 等）。
+/// - 旧实现把这些值存进 self.cached_*，在 batch（同一层实例连续 forward 多个样本）时会被覆盖。
+/// - 新版将中间量放到 ctx 中：每个样本一份 ctx，batch 时不会错配。
+#[derive(Clone)]
+struct SelfAttentionContext {
+    input: Array2<f32>,
+    q: Array2<f32>,
+    k: Array2<f32>,
+    v: Array2<f32>,
+    attention_output: Array2<f32>,
+    attention_weights: Option<Vec<Array2<f32>>>,
+}
 
 /// **稳定的 Softmax 实现（使用 log-sum-exp 技巧）**
 ///
@@ -397,26 +418,20 @@ impl SelfAttention {
     /// 计算反向传播所需的梯度（不更新参数）。
     ///
     /// 返回：(grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)
-    fn compute_grads(
+    fn compute_grads_from_ctx(
         &self,
+        ctx: &SelfAttentionContext,
         grads: &Array2<f32>,
     ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>)> {
-        let (Some(input), Some(_q), Some(_k), Some(_v), Some(attention_output)) = (
-            self.cached_input.as_ref(),
-            self.cached_q.as_ref(),
-            self.cached_k.as_ref(),
-            self.cached_v.as_ref(),
-            self.cached_attention_output.as_ref(),
-        ) else {
-            return None;
-        };
+        let input = &ctx.input;
+        let attention_output = &ctx.attention_output;
 
         // ========== 步骤1: 输出投影层梯度 ==========
         let grad_w_o = attention_output.t().dot(grads);
         let grad_attention_output = grads.dot(&self.w_o.t());
 
         // ========== 步骤2: 注意力反传 ==========
-        let weights_per_head = self.cached_attention_weights.as_ref()?;
+        let weights_per_head = ctx.attention_weights.as_ref()?;
 
         let seq_len = input.nrows();
         let num_heads = self.num_heads;
@@ -430,19 +445,19 @@ impl SelfAttention {
             .ok()?
             .permuted_axes([1, 0, 2]);
 
-        let q_view = self.cached_q.as_ref()?.view();
+        let q_view = ctx.q.view();
         let q_heads = q_view
             .to_shape((seq_len, num_heads, head_dim))
             .ok()?
             .permuted_axes([1, 0, 2]);
 
-        let k_view = self.cached_k.as_ref()?.view();
+        let k_view = ctx.k.view();
         let k_heads = k_view
             .to_shape((seq_len, num_heads, head_dim))
             .ok()?
             .permuted_axes([1, 0, 2]);
 
-        let v_view = self.cached_v.as_ref()?.view();
+        let v_view = ctx.v.view();
         let v_heads = v_view
             .to_shape((seq_len, num_heads, head_dim))
             .ok()?
@@ -509,11 +524,68 @@ impl SelfAttention {
         Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v))
     }
 
+    fn compute_grads(
+        &self,
+        grads: &Array2<f32>,
+    ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>)> {
+        // 兼容旧接口（用于 backward_accumulate/step_accumulated）：从 self.cached_* 构造 ctx。
+        let (Some(input), Some(q), Some(k), Some(v), Some(attention_output)) = (
+            self.cached_input.as_ref(),
+            self.cached_q.as_ref(),
+            self.cached_k.as_ref(),
+            self.cached_v.as_ref(),
+            self.cached_attention_output.as_ref(),
+        ) else {
+            return None;
+        };
+
+        let ctx = SelfAttentionContext {
+            input: input.clone(),
+            q: q.clone(),
+            k: k.clone(),
+            v: v.clone(),
+            attention_output: attention_output.clone(),
+            attention_weights: self.cached_attention_weights.clone(),
+        };
+        self.compute_grads_from_ctx(&ctx, grads)
+    }
+
     /// 用于梯度累积：只累加参数梯度，不更新参数。
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
         let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) = self.compute_grads(grads)
         else {
             log::warn!("SelfAttention.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
+            return grads.clone();
+        };
+
+        self.grad_w_o_accum += &grad_w_o;
+        self.grad_w_q_accum += &grad_w_q;
+        self.grad_w_k_accum += &grad_w_k;
+        self.grad_w_v_accum += &grad_w_v;
+
+        grad_input
+    }
+
+    /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    ///
+    /// 教学说明：
+    /// - SelfAttention 的 backward 依赖大量中间量（Q/K/V、权重、attention_output 等）；
+    /// - 新版 `Layer::forward()` 已经把这些量打包进 `SelfAttentionContext`；
+    /// - 因此累积接口也应当接收 ctx，才能避免 cached_* 覆盖并逐步删掉缓存字段。
+    pub fn backward_accumulate_with_ctx(
+        &mut self,
+        ctx: &LayerContext,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<SelfAttentionContext>() else {
+            log::warn!("SelfAttention.backward_accumulate_with_ctx 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
+
+        let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) =
+            self.compute_grads_from_ctx(ctx, grads)
+        else {
+            log::warn!("SelfAttention.backward_accumulate_with_ctx 在未执行 forward 的情况下被调用，直接传递梯度");
             return grads.clone();
         };
 
@@ -981,34 +1053,78 @@ impl Layer for SelfAttention {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
+        // ==========================
+        // 前向传播（显式 ctx）
+        // ==========================
+        //
+        // 教学说明：
+        // - multi_head_attention 内部会计算 Q/K/V、注意力权重、attention_output 等，并填充 self.cached_*；
+        // - 旧版 backward 直接读取 self.cached_*，在 batch 场景会被覆盖；
+        // - 新版将这些中间量打包成 ctx 返回，由调用方在 backward 时传回。
         self.cached_input = Some(input.clone());
-        self.multi_head_attention(input)
+        let out = self.multi_head_attention(input);
+
+        let ctx = SelfAttentionContext {
+            input: input.clone(),
+            q: self.cached_q.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
+            k: self.cached_k.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
+            v: self.cached_v.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
+            attention_output: self
+                .cached_attention_output
+                .clone()
+                .unwrap_or_else(|| Array2::zeros((0, 0))),
+            attention_weights: self.cached_attention_weights.clone(),
+        };
+
+        (out, Box::new(ctx))
     }
 
     fn forward_batch(
         &mut self,
         input: &Array3<f32>,
         attention_mask: Option<&Array2<f32>>,
-    ) -> Array3<f32> {
+    ) -> (Array3<f32>, Vec<LayerContext>) {
         let batch_size = input.shape()[0];
         let seq_len = input.shape()[1];
         let hidden_dim = input.shape()[2];
 
         let mut output = Array3::zeros((batch_size, seq_len, hidden_dim));
+        let mut ctxs: Vec<LayerContext> = Vec::with_capacity(batch_size);
 
         for b in 0..batch_size {
             let sample = input.slice(s![b, .., ..]).to_owned();
             let key_padding_mask = attention_mask.map(|m| m.row(b).to_owned());
-            let sample_out = self.forward_with_padding_mask(&sample, key_padding_mask.as_ref());
+            // forward_with_padding_mask 会更新 self.cached_*，因此每个样本都要立即捕获 ctx。
+            let sample_out =
+                self.forward_with_padding_mask(&sample, key_padding_mask.as_ref());
             output.slice_mut(s![b, .., ..]).assign(&sample_out);
+
+            let ctx = SelfAttentionContext {
+                input: sample,
+                q: self.cached_q.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
+                k: self.cached_k.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
+                v: self.cached_v.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
+                attention_output: self
+                    .cached_attention_output
+                    .clone()
+                    .unwrap_or_else(|| Array2::zeros((0, 0))),
+                attention_weights: self.cached_attention_weights.clone(),
+            };
+            ctxs.push(Box::new(ctx));
         }
 
-        output
+        (output, ctxs)
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) = self.compute_grads(grads)
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
+        let Some(ctx) = ctx.downcast_ref::<SelfAttentionContext>() else {
+            log::warn!("SelfAttention.backward 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
+
+        let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) =
+            self.compute_grads_from_ctx(ctx, grads)
         else {
             log::warn!("SelfAttention.backward 在未执行 forward 的情况下被调用，直接传递梯度");
             return grads.clone();

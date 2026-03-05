@@ -65,7 +65,7 @@ pub use batch_loader::{Batch, BatchLoader, PAD_TOKEN_ID};
 pub use checkpoint_manager::{CheckpointManager, CheckpointMetadata, CheckpointStrategy};
 pub use dataset_loader::Dataset;
 pub use embeddings::Embeddings;
-pub use llm::{LLM, Layer};
+pub use llm::{Layer, LayerContext, LLM};
 pub use model_serialization::{
     load_model_auto, load_model_binary, load_model_json, save_model_binary, save_model_json,
 };

@@ -79,8 +79,15 @@ pub fn log_softmax(logits: &Array2<f32>) -> Array2<f32> {
 /// 正态分布采样值
 pub fn sample_normal<R: Rng>(rng: &mut R, mean: f32, std_dev: f32) -> f32 {
     // Box-Muller 变换
-    let u1: f32 = rng.random();
-    let u2: f32 = rng.random();
+    // 注意：u1 不能为 0，否则 ln(0) 会得到 -∞，从而产生 ∞/NaN 的权重，导致训练/测试出现随机性崩溃。
+    //
+    // 这是一个“隐藏但很致命”的数值稳定性问题：
+    // - 本项目的 SelfAttention/FFN 等层会生成上百万个随机权重；
+    // - 即便 `u1==0` 的概率极低，也会在大量采样下偶发出现，造成测试用例“有时过、有时挂”的非确定性。
+    //
+    // 因此我们把 u1 下界钳制到一个很小的正数，保证 ln(u1) 有定义且有限。
+    let u1: f32 = rng.random::<f32>().max(1e-7);
+    let u2: f32 = rng.random::<f32>();
     let z0 = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos();
     mean + std_dev * z0
 }

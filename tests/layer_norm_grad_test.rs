@@ -37,7 +37,7 @@ fn layer_norm_gradients_match_numerical() {
     ln.gamma = gamma.clone();
     ln.beta = beta.clone();
 
-    let _ = ln.forward(&input);
+    let (_y, _ctx) = ln.forward(&input);
     ln.zero_grad_accum();
     let grad_input = ln.backward_accumulate(&grad_out);
     let grad_gamma = ln.grad_gamma_accum.clone();
@@ -50,7 +50,7 @@ fn layer_norm_gradients_match_numerical() {
         let mut ln = LayerNorm::new(dim);
         ln.gamma = gamma.clone();
         ln.beta = beta.clone();
-        let y = ln.forward(input);
+        let (y, _ctx) = ln.forward(input);
         (&y * &grad_out).sum()
     };
 
@@ -126,4 +126,3 @@ fn layer_norm_gradients_match_numerical() {
         );
     }
 }
-

@@ -5,6 +5,7 @@
 //! - 如果未来有人把裁剪阈值改回 5.0 或移除裁剪，这个测试会立刻失败。
 
 use llm::{Layer, LLM, Vocab};
+use llm::LayerContext;
 use ndarray::Array2;
 
 struct ProbeLayer {
@@ -34,11 +35,11 @@ impl Layer for ProbeLayer {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         // 训练入口输入为 (1, seq_len)，输出 logits 为 (seq_len, vocab_size)。
         let seq_len = input.shape()[1];
         if seq_len == self.logits.nrows() {
-            return self.logits.clone();
+            return (self.logits.clone(), Box::new(()));
         }
 
         // 兼容性：必要时复制第 0 行。
@@ -46,10 +47,10 @@ impl Layer for ProbeLayer {
         for i in 0..seq_len {
             out.row_mut(i).assign(&self.logits.row(0));
         }
-        out
+        (out, Box::new(()))
     }
 
-    fn backward(&mut self, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
+    fn backward(&mut self, _ctx: &LayerContext, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
         self.seen_grad_norms.push(LLM::compute_grad_norm(grads));
         // 返回任意形状一致的输入梯度（该测试中不会被使用）
         Array2::zeros((1, grads.nrows()))

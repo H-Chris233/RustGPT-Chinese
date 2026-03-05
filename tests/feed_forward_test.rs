@@ -10,7 +10,7 @@ fn test_feed_forward_forward() {
     let input = Array2::ones((3, EMBEDDING_DIM));
 
     // Test forward pass
-    let output = feed_forward.forward(&input);
+    let (output, _ctx) = feed_forward.forward(&input);
 
     // Check output shape - should be same as input
     assert_eq!(output.shape(), input.shape());
@@ -27,7 +27,7 @@ fn test_feed_forward_with_different_sequence_lengths() {
         let input = Array2::ones((seq_len, EMBEDDING_DIM));
 
         // Test forward pass
-        let output = feed_forward.forward(&input);
+        let (output, _ctx) = feed_forward.forward(&input);
 
         // Check output shape
         assert_eq!(output.shape(), [seq_len, EMBEDDING_DIM]);
@@ -43,12 +43,12 @@ fn test_feed_forward_and_backward() {
     let input = Array2::ones((3, EMBEDDING_DIM));
 
     // Test forward pass
-    let output = feed_forward.forward(&input);
+    let (output, ctx) = feed_forward.forward(&input);
 
     let grads = Array2::ones((3, EMBEDDING_DIM));
 
     // Test backward pass
-    let grad_input = feed_forward.backward(&grads, 0.01);
+    let grad_input = feed_forward.backward(&ctx, &grads, 0.01);
 
     // Make sure backward pass modifies the input
     assert_ne!(output, grad_input);

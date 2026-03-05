@@ -87,7 +87,7 @@ fn test_embedding_backwards() {
             return;
         }
     };
-    let _output = embeddings.forward(&input);
+    let (_output, ctx) = embeddings.forward(&input);
 
     // Create some dummy gradients and run backward pass
     let grads = match Array2::from_shape_vec((3, EMBEDDING_DIM), vec![0.1; 3 * EMBEDDING_DIM]) {
@@ -97,7 +97,7 @@ fn test_embedding_backwards() {
             return;
         }
     };
-    let _grad_input = embeddings.backward(&grads, 0.01);
+    let _grad_input = embeddings.backward(&ctx, &grads, 0.01);
 
     let post_train_token_embeddings = embeddings.token_embeddings.clone();
 

@@ -31,8 +31,8 @@ impl LLM {
             let decay_steps = 10.0;
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
 
-            let mut total_loss = 0.0;
-            let mut sample_count = 0usize;
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
 
             //  直接使用缓存的tokenized数据，无需重复tokenize
             for training_row in &tokenized_data {
@@ -50,8 +50,13 @@ impl LLM {
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                // 前向传播：收集每层 ctx，供反向传播使用（避免缓存覆盖）
+                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
+                    Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -69,22 +74,35 @@ impl LLM {
                         }
                     };
 
-                total_loss +=
+                let n_targets = target_ids
+                    .iter()
+                    .filter(|&&t| t != pad_token_id)
+                    .count();
+                if n_targets == 0 {
+                    continue;
+                }
+                let loss_mean =
                     Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+                total_nll += loss_mean * (n_targets as f32);
+                total_tokens += n_targets;
                 Self::clip_gradients(&mut grads_output, 5.0);
 
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, current_lr);
+                for (layer, ctx) in self
+                    .network
+                    .iter_mut()
+                    .rev()
+                    .zip(layer_ctxs.iter().rev())
+                {
+                    grads_output = layer.backward(ctx, &grads_output, current_lr);
                 }
 
-                sample_count += 1;
             }
 
             println!(
                 "Epoch  {}:  Loss  =  {:.4},  LR  =  {:.6}",
                 epoch,
-                if sample_count > 0 {
-                    total_loss / sample_count as f32
+                if total_tokens > 0 {
+                    total_nll / total_tokens as f32
                 } else {
                     0.0
                 },
@@ -112,8 +130,8 @@ impl LLM {
             let current_lr =
                 Self::cosine_with_warmup_lr(initial_lr, epoch, epochs, num_restarts, warmup_epochs);
 
-            let mut total_loss = 0.0;
-            let mut sample_count = 0usize;
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
@@ -127,8 +145,12 @@ impl LLM {
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
+                    Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -145,15 +167,28 @@ impl LLM {
                         }
                     };
 
-                total_loss +=
+                let n_targets = target_ids
+                    .iter()
+                    .filter(|&&t| t != pad_token_id)
+                    .count();
+                if n_targets == 0 {
+                    continue;
+                }
+                let loss_mean =
                     Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+                total_nll += loss_mean * (n_targets as f32);
+                total_tokens += n_targets;
                 Self::clip_gradients(&mut grads_output, 5.0);
 
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, current_lr);
+                for (layer, ctx) in self
+                    .network
+                    .iter_mut()
+                    .rev()
+                    .zip(layer_ctxs.iter().rev())
+                {
+                    grads_output = layer.backward(ctx, &grads_output, current_lr);
                 }
 
-                sample_count += 1;
             }
 
             //  每10个epoch打印一次，减少输出
@@ -161,8 +196,8 @@ impl LLM {
                 println!(
                     "Epoch  {}:  Loss  =  {:.4},  LR  =  {:.6}",
                     epoch,
-                    if sample_count > 0 {
-                        total_loss / sample_count as f32
+                    if total_tokens > 0 {
+                        total_nll / total_tokens as f32
                     } else {
                         0.0
                     },
@@ -201,8 +236,8 @@ impl LLM {
             let current_lr =
                 Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 2, warmup_epochs);
 
-            let mut total_loss = 0.0;
-            let mut sample_count = 0usize;
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
@@ -216,8 +251,12 @@ impl LLM {
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
+                    Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -234,19 +273,32 @@ impl LLM {
                         }
                     };
 
-                total_loss +=
+                let n_targets = target_ids
+                    .iter()
+                    .filter(|&&t| t != pad_token_id)
+                    .count();
+                if n_targets == 0 {
+                    continue;
+                }
+                let loss_mean =
                     Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+                total_nll += loss_mean * (n_targets as f32);
+                total_tokens += n_targets;
                 Self::clip_gradients(&mut grads_output, 5.0);
 
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, current_lr);
+                for (layer, ctx) in self
+                    .network
+                    .iter_mut()
+                    .rev()
+                    .zip(layer_ctxs.iter().rev())
+                {
+                    grads_output = layer.backward(ctx, &grads_output, current_lr);
                 }
 
-                sample_count += 1;
             }
 
-            let avg_loss = if sample_count > 0 {
-                total_loss / sample_count as f32
+            let avg_loss = if total_tokens > 0 {
+                total_nll / total_tokens as f32
             } else {
                 0.0
             };
@@ -306,7 +358,8 @@ impl LLM {
             let epoch_start = std::time::Instant::now();
             let current_lr = Self::cosine_annealing_lr(initial_lr, epoch, max_epochs, 2);
 
-            let mut total_loss = 0.0;
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
             let mut total_grad_norm = 0.0;
             let mut sample_count = 0;
 
@@ -323,8 +376,12 @@ impl LLM {
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
+                    Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -341,16 +398,30 @@ impl LLM {
                         }
                     };
 
-                total_loss +=
+                let n_targets = target_ids
+                    .iter()
+                    .filter(|&&t| t != pad_token_id)
+                    .count();
+                if n_targets == 0 {
+                    continue;
+                }
+                let loss_mean =
                     Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+                total_nll += loss_mean * (n_targets as f32);
+                total_tokens += n_targets;
 
                 //  记录梯度范数
                 total_grad_norm += Self::compute_grad_norm(&grads_output);
 
                 Self::clip_gradients(&mut grads_output, 5.0);
 
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, current_lr);
+                for (layer, ctx) in self
+                    .network
+                    .iter_mut()
+                    .rev()
+                    .zip(layer_ctxs.iter().rev())
+                {
+                    grads_output = layer.backward(ctx, &grads_output, current_lr);
                 }
 
                 sample_count += 1;
@@ -366,7 +437,11 @@ impl LLM {
                 return epoch;
             }
 
-            let avg_loss = total_loss / sample_count as f32;
+            let avg_loss = if total_tokens > 0 {
+                total_nll / total_tokens as f32
+            } else {
+                0.0
+            };
             let avg_grad_norm = total_grad_norm / sample_count as f32;
             let perplexity = avg_loss.exp();
             let samples_per_sec = if epoch_time > 0.0 {
@@ -462,7 +537,8 @@ impl LLM {
             let current_lr =
                 Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
-            let mut total_loss = 0.0;
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
             let mut total_grad_norm = 0.0;
             let mut sample_count = 0;
 
@@ -479,8 +555,12 @@ impl LLM {
                     .row_mut(0)
                     .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
 
+                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
+                    Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
-                    input = layer.forward(&input);
+                    let (out, ctx) = layer.forward(&input);
+                    layer_ctxs.push(ctx);
+                    input = out;
                 }
 
                 let logits = input;
@@ -497,8 +577,17 @@ impl LLM {
                         }
                     };
 
-                total_loss +=
+                let n_targets = target_ids
+                    .iter()
+                    .filter(|&&t| t != pad_token_id)
+                    .count();
+                if n_targets == 0 {
+                    continue;
+                }
+                let loss_mean =
                     Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+                total_nll += loss_mean * (n_targets as f32);
+                total_tokens += n_targets;
 
                 //  记录梯度范数
                 total_grad_norm += Self::compute_grad_norm(&grads_output);
@@ -506,8 +595,13 @@ impl LLM {
                 // 与 `train_monitored()` 保持一致：使用更严格的裁剪阈值提升稳定性。
                 Self::clip_gradients(&mut grads_output, 1.0);
 
-                for layer in self.network.iter_mut().rev() {
-                    grads_output = layer.backward(&grads_output, current_lr);
+                for (layer, ctx) in self
+                    .network
+                    .iter_mut()
+                    .rev()
+                    .zip(layer_ctxs.iter().rev())
+                {
+                    grads_output = layer.backward(ctx, &grads_output, current_lr);
                 }
 
                 sample_count += 1;
@@ -523,7 +617,11 @@ impl LLM {
                 return epoch;
             }
 
-            let avg_loss = total_loss / sample_count as f32;
+            let avg_loss = if total_tokens > 0 {
+                total_nll / total_tokens as f32
+            } else {
+                0.0
+            };
             let avg_grad_norm = total_grad_norm / sample_count as f32;
             let perplexity = avg_loss.exp();
             let samples_per_sec = if epoch_time > 0.0 {

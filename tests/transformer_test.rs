@@ -9,7 +9,7 @@ fn test_transformer_block() {
     let input = Array2::ones((1, EMBEDDING_DIM));
 
     // Test forward pass
-    let output = transformer.forward(&input);
+    let (output, _ctx) = transformer.forward(&input);
 
     // Check output shape
     assert_eq!(output.shape(), [1, EMBEDDING_DIM]);

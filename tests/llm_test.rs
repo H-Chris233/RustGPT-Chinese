@@ -2,6 +2,7 @@ use llm::{
     EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, Layer, Vocab, output_projection::OutputProjection,
     transformer::TransformerBlock,
 };
+use llm::LayerContext;
 use ndarray::Array2;
 
 struct TestOutputProjectionLayer {
@@ -26,7 +27,11 @@ impl Layer for TestOutputProjectionLayer {
         self
     }
 
-    fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
+        // 教学说明：
+        // - 该测试 layer 需要在 backward 中使用 forward 的输入；
+        // - 新版 Layer trait 使用 ctx 显式传递中间量；
+        // - 因此我们把 input 克隆后放入 ctx，同时也保留到 self.cache_input（兼容旧逻辑）。
         self.cache_input = Some(input.clone());
         let mut mock_output = Array2::zeros((input.shape()[1], self.vocab_size));
 
@@ -40,12 +45,22 @@ impl Layer for TestOutputProjectionLayer {
         }
 
         self.loop_count += 1;
-        mock_output
+        (mock_output, Box::new(input.clone()))
     }
 
     // Need to test this next
-    fn backward(&mut self, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
-        let Some(input) = self.cache_input.as_ref() else {
+    fn backward(
+        &mut self,
+        ctx: &LayerContext,
+        grads: &Array2<f32>,
+        _lr: f32,
+    ) -> Array2<f32> {
+        let input = if let Some(input) = ctx.downcast_ref::<Array2<f32>>() {
+            input
+        } else if let Some(input) = self.cache_input.as_ref() {
+            // fallback：若 ctx 类型不匹配，仍尽量用旧缓存（测试层容错）
+            input
+        } else {
             // If forward wasn't called, just pass gradients through
             return grads.clone();
         };

@@ -28,12 +28,12 @@ fn numerical_gradient(
 ) -> f32 {
     let mut input_plus = input.clone();
     input_plus[[i, j]] += EPSILON;
-    let output_plus = attention.forward(&input_plus);
+    let (output_plus, _ctx) = attention.forward(&input_plus);
     let loss_plus = compute_mse_loss(&output_plus, target);
 
     let mut input_minus = input.clone();
     input_minus[[i, j]] -= EPSILON;
-    let output_minus = attention.forward(&input_minus);
+    let (output_minus, _ctx) = attention.forward(&input_minus);
     let loss_minus = compute_mse_loss(&output_minus, target);
 
     (loss_plus - loss_minus) / (2.0 * EPSILON)
@@ -54,9 +54,9 @@ fn test_gradient_matches_numerical_estimate() {
 
     let target = Array2::ones((seq_len, embedding_dim)) * 0.5;
 
-    let output = attention.forward(&input);
+    let (output, ctx) = attention.forward(&input);
     let grad_output = (&output - &target) * (2.0 / output.len() as f32);
-    let grad_input = attention.backward(&grad_output, 0.0);
+    let grad_input = attention.backward(&ctx, &grad_output, 0.0);
 
     let sample_positions = vec![
         (0, 0),
@@ -100,9 +100,9 @@ fn test_gradient_stability_large_values() {
         }
     }
 
-    let output = attention.forward(&input);
+    let (output, ctx) = attention.forward(&input);
     let grad_output = Array2::ones(output.dim());
-    let grad_input = attention.backward(&grad_output, 0.0);
+    let grad_input = attention.backward(&ctx, &grad_output, 0.0);
 
     assert!(
         output.iter().all(|&v| v.is_finite()),
@@ -131,9 +131,9 @@ fn test_gradient_stability_small_values() {
         }
     }
 
-    let output = attention.forward(&input);
+    let (output, ctx) = attention.forward(&input);
     let grad_output = Array2::ones(output.dim()) * 1e-3;
-    let grad_input = attention.backward(&grad_output, 0.0);
+    let grad_input = attention.backward(&ctx, &grad_output, 0.0);
 
     assert!(
         output.iter().all(|&v| v.is_finite()),

@@ -33,7 +33,7 @@ fn make_ffn_with_params(
 }
 
 fn compute_loss(ffn: &mut FeedForward, input: &Array2<f32>, grad_out: &Array2<f32>) -> f32 {
-    let out = ffn.forward(input);
+    let (out, _ctx) = ffn.forward(input);
     (&out * grad_out).sum()
 }
 
@@ -63,7 +63,7 @@ fn feed_forward_parameter_gradients_match_numerical() {
     let b2 = Array2::from_shape_vec((1, embedding_dim), vec![0.1, -0.2, 0.05, 0.0]).unwrap();
 
     let mut ffn = make_ffn_with_params(embedding_dim, hidden_dim, &w1, &b1, &w2, &b2);
-    let _ = ffn.forward(&input);
+    let (_out, _ctx) = ffn.forward(&input);
     // 确保 ReLU 的输入远离 0（不可导点），避免有限差分在边界附近波动。
     let Some(h_pre) = ffn.hidden_pre_activation.as_ref() else {
         panic!("hidden_pre_activation should be cached after forward()");

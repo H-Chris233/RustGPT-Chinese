@@ -33,8 +33,8 @@ fn self_attention_forward_batch_respects_padding_mask() {
 
     let attention_mask = Array2::from_shape_vec((1, seq_len), vec![0.0, 0.0, 1.0, 1.0]).unwrap();
 
-    let out_unmasked = attn.forward_batch(&input_batch, None);
-    let out_masked = attn.forward_batch(&input_batch, Some(&attention_mask));
+    let (out_unmasked, _ctx_unmasked) = attn.forward_batch(&input_batch, None);
+    let (out_masked, _ctx_masked) = attn.forward_batch(&input_batch, Some(&attention_mask));
 
     let max_abs_unmasked = out_unmasked
         .slice(s![0, 3, ..])
@@ -56,4 +56,3 @@ fn self_attention_forward_batch_respects_padding_mask() {
         max_abs_masked
     );
 }
-
