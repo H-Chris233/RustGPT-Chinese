@@ -6,7 +6,7 @@
 /// 3. 稳定的softmax实现
 /// 4. 梯度数值稳定性
 use llm::{EMBEDDING_DIM, Layer, self_attention::SelfAttention};
-use ndarray::Array2;
+use ndarray::{Array2, s};
 
 #[test]
 fn test_causal_mask_caching() {
@@ -261,13 +261,10 @@ fn test_output_causality() {
     let input1 = Array2::ones((seq_len, EMBEDDING_DIM));
     let output1 = self_attention.forward(&input1);
 
-    // 修改最后一个位置的值
-    let mut self_attention2 = SelfAttention::new(EMBEDDING_DIM);
-    // 使用相同的权重（通过克隆或设置相同的种子）
-    // 这里简化测试：只验证形状和有限性
+    // 修改最后一个位置的值（未来 token）
     let mut input2 = input1.clone();
     input2.row_mut(seq_len - 1).fill(999.0);
-    let output2 = self_attention2.forward(&input2);
+    let output2 = self_attention.forward(&input2);
 
     // 两个输出的形状应该相同
     assert_eq!(output1.shape(), output2.shape());
@@ -275,6 +272,20 @@ fn test_output_causality() {
     // 输出应该都是有限的
     assert!(output1.iter().all(|&v| v.is_finite()));
     assert!(output2.iter().all(|&v| v.is_finite()));
+
+    // 核心断言：
+    // - 由于因果掩码，位置 < last 的输出不应受到 last token 变化影响。
+    let prefix1 = output1.slice(s![0..seq_len - 1, ..]);
+    let prefix2 = output2.slice(s![0..seq_len - 1, ..]);
+    let max_abs_diff = prefix1
+        .iter()
+        .zip(prefix2.iter())
+        .fold(0.0_f32, |m, (&a, &b)| m.max((a - b).abs()));
+    assert!(
+        max_abs_diff < 1e-6,
+        "因果性违反：修改未来 token 影响了过去输出，max_abs_diff={}",
+        max_abs_diff
+    );
 }
 
 #[test]

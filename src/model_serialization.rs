@@ -501,7 +501,7 @@ impl SerializableLayer {
             beta,
             cached_input: None,
             cached_mean: None,
-            cached_std: None,
+            cached_inv_std: None,
             optimizer_gamma: s.optimizer_gamma.to_adam(),
             optimizer_beta: s.optimizer_beta.to_adam(),
             grad_gamma_accum: Array2::zeros(s.gamma_shape),

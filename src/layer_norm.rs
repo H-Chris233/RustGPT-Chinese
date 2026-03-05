@@ -87,8 +87,12 @@ pub struct LayerNorm {
     /// **缓存均值**: 每个样本在特征维度上的均值
     pub cached_mean: Option<Array2<f32>>,
 
-    /// **缓存标准差**: 每个样本在特征维度上的标准差
-    pub cached_std: Option<Array2<f32>>,
+    /// **缓存 inv_std**: 每个样本在特征维度上的 `1 / sqrt(var + ε)`
+    ///
+    /// 说明：
+    /// - 早期版本缓存的是 `std`，并采用 `(std + ε)` 的非标准归一化；
+    /// - 为保证前向/反向数学一致性（标准 LayerNorm），这里缓存 `inv_std`。
+    pub cached_inv_std: Option<Array2<f32>>,
 
     // ========== Adam 优化器 ==========
     pub optimizer_gamma: Adam,
@@ -125,7 +129,7 @@ impl LayerNorm {
             beta: Array2::zeros((1, embedding_dim)), // β 初始化为 0
             cached_input: None,
             cached_mean: None,
-            cached_std: None,
+            cached_inv_std: None,
             optimizer_gamma: Adam::new((1, embedding_dim)),
             optimizer_beta: Adam::new((1, embedding_dim)),
             grad_gamma_accum: Array2::zeros((1, embedding_dim)),
@@ -141,17 +145,17 @@ impl LayerNorm {
 
     /// 仅计算并累积参数梯度，不更新参数（用于梯度累积）。
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let (Some(input), Some(mean), Some(std)) = (
+        let (Some(input), Some(mean), Some(inv_std)) = (
             self.cached_input.as_ref(),
             self.cached_mean.as_ref(),
-            self.cached_std.as_ref(),
+            self.cached_inv_std.as_ref(),
         ) else {
             log::warn!("LayerNorm.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
             return grads.clone();
         };
 
         let (grad_input, grad_gamma, grad_beta) =
-            Self::compute_grads(input, mean, std, grads, &self.gamma, self.epsilon);
+            Self::compute_grads(input, mean, inv_std, grads, &self.gamma, self.epsilon);
 
         self.grad_gamma_accum += &grad_gamma;
         self.grad_beta_accum += &grad_beta;
@@ -175,35 +179,34 @@ impl LayerNorm {
     fn compute_grads(
         input: &Array2<f32>,
         mean: &Array2<f32>,
-        std: &Array2<f32>,
+        inv_std: &Array2<f32>,
         grads: &Array2<f32>,
         gamma: &Array2<f32>,
-        epsilon: f32,
+        _epsilon: f32,
     ) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
-        let normalized = (input - mean) / (std + epsilon);
+        // 标准 LayerNorm 定义：
+        //   var = mean((x - mean)^2)
+        //   inv_std = 1 / sqrt(var + ε)
+        //   x_hat = (x - mean) * inv_std
+        //   y = gamma * x_hat + beta
+        //
+        // 反向传播（对每一行独立计算）：
+        //   dy = grads
+        //   dgamma = sum(dy * x_hat)
+        //   dbeta  = sum(dy)
+        //   dx = inv_std * (dy*gamma - mean(dy*gamma) - x_hat*mean((dy*gamma)*x_hat))
+        //
+        // 参考：LayerNorm 的常见推导形式（等价于 “batchnorm-style” 的简化向量化公式）。
+        let x_hat = (input - mean) * inv_std;
         let n_features = input.shape()[1] as f32;
 
-        let grad_gamma = (&normalized * grads).sum_axis(Axis(0)).insert_axis(Axis(0));
+        let grad_gamma = (&x_hat * grads).sum_axis(Axis(0)).insert_axis(Axis(0));
         let grad_beta = grads.sum_axis(Axis(0)).insert_axis(Axis(0));
 
-        let grad_normalized = gamma * grads;
-
-        let grad_input = {
-            let variance = std * std + epsilon;
-            let grad_var = (&grad_normalized * &normalized)
-                .sum_axis(Axis(1))
-                .insert_axis(Axis(1))
-                * (-0.5)
-                / variance.mapv(|x| x * x.sqrt());
-            let grad_mean = grad_normalized.sum_axis(Axis(1)).insert_axis(Axis(1)) * (-1.0)
-                / (std + epsilon)
-                + &grad_var * (input - mean).sum_axis(Axis(1)).insert_axis(Axis(1)) * (-2.0)
-                    / n_features;
-
-            &grad_normalized / (std + epsilon)
-                + &grad_var * 2.0 * (input - mean) / n_features
-                + &grad_mean / n_features
-        };
+        let dy = gamma * grads;
+        let mean_dy = dy.sum_axis(Axis(1)).insert_axis(Axis(1)) / n_features;
+        let mean_dy_xhat = (&dy * &x_hat).sum_axis(Axis(1)).insert_axis(Axis(1)) / n_features;
+        let grad_input = (dy - &mean_dy - &x_hat * &mean_dy_xhat) * inv_std;
 
         (grad_input, grad_gamma, grad_beta)
     }
@@ -215,17 +218,17 @@ impl LayerNorm {
     /// 1. **计算统计量**（对每个样本的特征维度）：
     ///    ```text
     ///    μ = mean(x, axis=1)  // 每行的均值
-    ///    σ = std(x, axis=1)   // 每行的标准差
+    ///    var = mean((x-μ)^2)  // 每行的方差（无偏差修正）
     ///    ```
     ///
     /// 2. **标准化**：
     ///    ```text
-    ///    x_norm = (x - μ) / (σ + ε)
+    ///    x_hat = (x - μ) / sqrt(var + ε)
     ///    ```
     ///
     /// 3. **缩放和偏移**：
     ///    ```text
-    ///    output = γ * x_norm + β
+    ///    output = γ * x_hat + β
     ///    ```
     ///
     /// # 参数
@@ -244,20 +247,29 @@ impl LayerNorm {
     ///  [-1.224, 0.0, 1.224]]     // 均值=0, 标准差=1
     /// ```
     pub fn normalize(&mut self, input: &Array2<f32>) -> Array2<f32> {
-        // 步骤 1: 计算每个样本的均值和标准差
+        // 步骤 1: 计算每个样本的均值和方差
         let Some(mean) = input.mean_axis(Axis(1)).map(|m| m.insert_axis(Axis(1))) else {
             log::warn!("LayerNorm.normalize 收到空输入，直接返回");
             return input.clone();
         }; // (seq_len, 1)
-        let std = input.std_axis(Axis(1), 0.0).insert_axis(Axis(1)); // (seq_len, 1)
+        let centered = input - &mean;
+        let Some(var) = centered
+            .mapv(|x| x * x)
+            .mean_axis(Axis(1))
+            .map(|v| v.insert_axis(Axis(1)))
+        else {
+            log::warn!("LayerNorm.normalize 收到空输入（无法计算方差），直接返回");
+            return input.clone();
+        }; // (seq_len, 1)
+        let inv_std = (var + self.epsilon).mapv(|x| 1.0 / x.sqrt()); // (seq_len, 1)
 
         // 缓存值用于反向传播
         self.cached_input = Some(input.clone());
         self.cached_mean = Some(mean.clone());
-        self.cached_std = Some(std.clone());
+        self.cached_inv_std = Some(inv_std.clone());
 
         // 步骤 2: 标准化（均值0，方差1）
-        let normalized = (input - &mean) / (&std + self.epsilon);
+        let normalized = centered * &inv_std;
 
         // 步骤 3: 缩放和偏移
         &self.gamma * &normalized + &self.beta
@@ -282,17 +294,17 @@ impl Layer for LayerNorm {
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
-        let (Some(input), Some(mean), Some(std)) = (
+        let (Some(input), Some(mean), Some(inv_std)) = (
             self.cached_input.as_ref(),
             self.cached_mean.as_ref(),
-            self.cached_std.as_ref(),
+            self.cached_inv_std.as_ref(),
         ) else {
             log::warn!("LayerNorm.backward 在未执行 forward 的情况下被调用，直接传递梯度");
             return grads.clone();
         };
 
         let (grad_input, grad_gamma, grad_beta) =
-            Self::compute_grads(input, mean, std, grads, &self.gamma, self.epsilon);
+            Self::compute_grads(input, mean, inv_std, grads, &self.gamma, self.epsilon);
 
         self.optimizer_gamma.step(&mut self.gamma, &grad_gamma, lr);
         self.optimizer_beta.step(&mut self.beta, &grad_beta, lr);

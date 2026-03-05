@@ -101,13 +101,36 @@ use crate::{adam::Adam, llm::Layer, utils::sample_normal, EMBEDDING_DIM};
 /// - `logits`: 输入矩阵 (seq_len, seq_len)
 ///
 /// # 返回值
-/// Softmax 输出，形状与输入相同，每行元素和为1
+/// Softmax 输出，形状与输入相同：
+/// - **正常行**：每行元素和为 1
+/// - **全被 mask 的行**（例如整行都是 `-∞`）：返回全 0（行和为 0）
 fn stable_softmax(logits: &Array2<f32>) -> Array2<f32> {
     let mut result = Array2::zeros(logits.dim());
 
     for (i, row) in logits.rows().into_iter().enumerate() {
         // 找到该行的最大值（数值稳定性）
         let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        // 极端情况：
+        // - 如果一整行都是 -∞（例如：padding mask 把所有 key 都屏蔽掉），那么 softmax 在数学上
+        //   是未定义的（0/0）。此时我们返回“全 0 权重”，并让上层输出自然变为 0，避免把
+        //   PAD/value 当成有效信息做均匀平均。
+        if max_val.is_nan() {
+            log::warn!("stable_softmax: logits contains NaN; returning zero row (row={})", i);
+            continue;
+        }
+        if max_val == f32::NEG_INFINITY {
+            // 全被 mask（或全是 -∞）
+            continue;
+        }
+        if max_val.is_infinite() {
+            log::warn!(
+                "stable_softmax: logits contains infinite value; returning zero row (row={})",
+                i
+            );
+            // 保持 result 的该行全零
+            continue;
+        }
 
         // 计算 exp(x - max)
         let exp_vals = row.mapv(|x| (x - max_val).exp());
@@ -116,11 +139,18 @@ fn stable_softmax(logits: &Array2<f32>) -> Array2<f32> {
         let sum_exp: f32 = exp_vals.sum();
 
         // 归一化（添加epsilon避免除零）
-        let normalized = if sum_exp > 1e-15 {
+        let normalized = if sum_exp.is_finite() && sum_exp > 1e-15 {
             exp_vals.mapv(|x| x / sum_exp)
         } else {
-            // 如果所有值都极小，返回均匀分布
-            Array1::from_elem(exp_vals.len(), 1.0 / exp_vals.len() as f32)
+            if !sum_exp.is_finite() {
+                log::warn!(
+                    "stable_softmax: sum_exp is not finite; returning zero row (row={}, sum_exp={})",
+                    i,
+                    sum_exp
+                );
+            }
+            // 如果所有值都极小/非有限，返回全 0 分布（与 “全部被 mask” 的语义一致）
+            Array1::zeros(exp_vals.len())
         };
 
         result.row_mut(i).assign(&normalized);

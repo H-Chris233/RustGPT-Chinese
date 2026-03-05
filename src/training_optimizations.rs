@@ -313,10 +313,23 @@ impl LLM {
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
+            if sample_count == 0 {
+                log::error!(
+                    "train_with_early_stopping: 没有有效训练样本（所有序列长度 < 2），无法继续训练。epoch={}",
+                    epoch
+                );
+                self.set_training_mode(false);
+                return epoch;
+            }
+
             let avg_loss = total_loss / sample_count as f32;
             let avg_grad_norm = total_grad_norm / sample_count as f32;
             let perplexity = avg_loss.exp();
-            let samples_per_sec = sample_count as f32 / epoch_time;
+            let samples_per_sec = if epoch_time > 0.0 {
+                sample_count as f32 / epoch_time
+            } else {
+                0.0
+            };
 
             //  📊  丰富的训练信息
             if epoch % 10 == 0 || epoch == max_epochs - 1 {
@@ -441,10 +454,23 @@ impl LLM {
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
+            if sample_count == 0 {
+                log::error!(
+                    "train_with_checkpointing: 没有有效训练样本（所有序列长度 < 2），无法继续训练。epoch={}",
+                    epoch
+                );
+                self.set_training_mode(false);
+                return epoch;
+            }
+
             let avg_loss = total_loss / sample_count as f32;
             let avg_grad_norm = total_grad_norm / sample_count as f32;
             let perplexity = avg_loss.exp();
-            let samples_per_sec = sample_count as f32 / epoch_time;
+            let samples_per_sec = if epoch_time > 0.0 {
+                sample_count as f32 / epoch_time
+            } else {
+                0.0
+            };
 
             //  📊  丰富的训练信息
             if epoch % 10 == 0 || epoch == max_epochs - 1 {
