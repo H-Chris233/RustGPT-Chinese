@@ -90,6 +90,12 @@ pub struct BatchLoader {
 
     /// 分桶的长度阈值（序列长度差异在此范围内的分到同一桶）
     pub bucket_width: usize,
+
+    /// PAD token 的 ID（用于 padding 填充）。
+    ///
+    /// 重要：不要假设 PAD 一定是 0；当词表通过 `Vocab::new_with_special_tokens` 自定义时，
+    /// PAD 可能是其他值。训练/数据管道应以 `Vocab::pad_token_id()` 为单一事实源，并把该值传入 loader。
+    pub pad_token_id: usize,
 }
 
 impl BatchLoader {
@@ -100,10 +106,21 @@ impl BatchLoader {
     /// - `use_bucketing`: 是否启用分桶策略（推荐 true）
     /// - `bucket_width`: 分桶宽度（推荐 8-16）
     pub fn new(batch_size: usize, use_bucketing: bool, bucket_width: usize) -> Self {
+        Self::new_with_pad_token_id(batch_size, use_bucketing, bucket_width, PAD_TOKEN_ID)
+    }
+
+    /// 创建新的批量加载器（显式指定 PAD token id）
+    pub fn new_with_pad_token_id(
+        batch_size: usize,
+        use_bucketing: bool,
+        bucket_width: usize,
+        pad_token_id: usize,
+    ) -> Self {
         Self {
             batch_size,
             use_bucketing,
             bucket_width,
+            pad_token_id,
         }
     }
 
@@ -196,7 +213,7 @@ impl BatchLoader {
         let batch_size = sequences.len();
 
         // 初始化 tokens 和 mask
-        let mut tokens = Array2::from_elem((batch_size, max_len), PAD_TOKEN_ID);
+        let mut tokens = Array2::from_elem((batch_size, max_len), self.pad_token_id);
         let mut attention_mask = Array2::zeros((batch_size, max_len));
 
         // 填充每个序列
@@ -266,7 +283,8 @@ pub fn create_training_batches(
             continue;
         }
 
-        let mut input_tokens = Array2::from_elem((batch.batch_size, input_seq_len), PAD_TOKEN_ID);
+        let mut input_tokens =
+            Array2::from_elem((batch.batch_size, input_seq_len), batch_loader.pad_token_id);
         let mut input_mask = Array2::zeros((batch.batch_size, input_seq_len));
 
         for i in 0..batch.batch_size {

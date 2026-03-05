@@ -31,6 +31,12 @@
 
 ## 🆕 最近更新
 
+### 训练正确性修复：PAD/mask/非法 target (2026-03-05)
+- ✅ **Batch/PAD mask 接线**：`SelfAttention` / `TransformerBlock` 的 `forward_batch(...)` 会消费 `attention_mask`（Key padding mask），为后续真正的 batch 向量化训练提供正确性门槛
+- ✅ **消除 `PAD_ID==0` 硬编码**：padding/loss/grad 以 `vocab.pad_token_id()` 为单一事实源；`BatchLoader` 支持注入 `pad_token_id`
+- ✅ **训练信号护栏**：shape mismatch / target 越界 / 全 PAD 时跳过 optimizer step，避免 Adam 动量“0 梯度漂移”，并提升可诊断性
+- ✅ **新增/更新测试**：`self_attention_forward_batch_mask_test`、`compute_gradients_step_test`
+
 ### v0.4.0 - 检查点管理与训练恢复 (2025-10-28)
 - 🚀 **检查点管理器** - 支持Best/Last/周期性保存策略，自动清理旧检查点
 - ✅ **完整状态保存** - 模型参数 + Adam优化器状态（m, v, timestep），支持断点续训
@@ -70,7 +76,7 @@
 ```
 输入文本 → Jieba 分词 → 词嵌入 + 位置编码
     ↓
-[4个 Transformer 块]
+[2个 Transformer 块]
     每个块包含：
     • 层归一化 → 多头注意力 (8 头) → Dropout → 残差连接
     • 层归一化 → 前馈网络 → Dropout → 残差连接
@@ -248,18 +254,18 @@ checkpoints/
 
 ### 模型配置
 - **词汇表大小**: 动态（基于训练数据构建，集成jieba-rs）
-- **嵌入维度**: 512（从原始 128 增强，更好地表示中文字符）
-- **隐藏维度**: 1024（从原始 256 增强，处理复杂中文模式）
-- **最大序列长度**: 256 个标记（从原始 80 增加，支持更长的中文句子）
-- **架构**: 4 Pre-LN Transformer 块 + 嵌入 + 输出投影
-- **总参数**: ~9.68M
+- **嵌入维度**: 256（见 `EMBEDDING_DIM`）
+- **隐藏维度**: 512（见 `HIDDEN_DIM`）
+- **最大序列长度**: 128（见 `MAX_SEQ_LEN`）
+- **架构**: 2 Pre-LN Transformer 块 + 嵌入 + 输出投影（见 `src/main.rs` 默认构建）
+- **总参数**: 与 `vocab_size` 线性相关（主要由 Embeddings / OutputProjection 主导）；运行时会打印 `llm.total_parameters()`
 
 ### 训练细节
 - **优化器**: Adam (β₁=0.9, β₂=0.999, ε=1e-8) 带梯度裁剪
-- **预训练 LR**: 0.0005（100 轮，带指数衰减 0.95^(轮次/10)）
-- **指令微调 LR**: 0.0001（100 轮，带指数衰减）
-- **损失函数**: 交叉熵损失，数值稳定性（限制在 1e-15）
-- **梯度裁剪**: L2 范数限制在 5.0
+- **学习率调度**: 余弦退火 + Warmup（无重启，见 `LLM::cosine_with_warmup_lr`）
+- **预训练/微调默认 LR**: 0.0001（`src/main.rs` 默认训练入口）
+- **损失函数**: `log_softmax` + NLL（从 log_probs 计算交叉熵），`pad_token_id` 不参与 loss/grad
+- **梯度裁剪**: L2 范数限制在 1.0（训练主路径默认）
 - **正则化**: Dropout 层，10% 率（反向 Dropout）
 
 ### 关键特性
@@ -287,7 +293,7 @@ checkpoints/
 | Jieba 单例 (OnceLock) | 50-70% | ✅ 已实现 |
 | 注意力重塑 (切片操作) | 20-30% | ✅ 已实现 |
 | 编译器优化 (LTO) | 10-20% | ✅ 已实现 |
-| ndarray rayon 并行化 | 10-15% | ✅ 已实现 |
+| 可选 BLAS 加速（`--features blas`） | 依赖环境 | ✅ 已实现 |
 | **总计预期提升** | **60-80%** | ✅ 已实现 |
 
 ## 🔧 开发
@@ -345,11 +351,14 @@ cargo build --release
 
 ## 📊 依赖项
 
-- `ndarray` - 用于矩阵运算的 N 维数组
+- `ndarray` - 用于矩阵运算的 N 维数组（可选 BLAS：`cargo build --features blas`）
 - `jieba-rs` - 中文文本分词和处理
-- `rand` + `rand_distr` - 随机数生成
+- `lru` - 分词缓存（减少重复 tokenization）
+- `rand` - 随机数生成（初始化权重等）
 - `regex` - 正则表达式匹配中文成语识别
-- `bincode` - 序列化和二进制编码
+- `serde` + `serde_json` - 序列化（元数据/导出）
+- `bincode` - 二进制序列化（checkpoint）
+- `log` + `simple_logger` - 日志
 
 没有 PyTorch、TensorFlow 或 Candle - 只有纯 Rust 和线性代数！
 
@@ -358,14 +367,14 @@ cargo build --release
 欢迎贡献！这个项目非常适合学习和实验。
 
 ### 高优先级功能需求
-- **🏪 模型持久化** - 将训练参数保存到磁盘（目前全部在内存中）
+- **🧮 真正的 batch 向量化训练** - 基于 `forward_batch/backward_batch` 做批量矩阵运算，并实现“累积/平均梯度后一次 optimizer step”（当前 `train_monitored_batch` 仍是 batch 内顺序 SGD）
 - **📊 评估指标** - 困惑度，基准测试，训练可视化
 - **🎯 注意力可视化** - 可视化中文文本的注意力模式
 - **📈 训练曲线** - 损失/准确率绘图
 
 ### 改进领域
 - **高级架构** (旋转位置嵌入 (RoPE)，Flash Attention)
-- **训练改进** (梯度累积，学习率预热，混合精度)
+- **训练改进** (严格 batch 更新语义，混合精度，更完善的日志/诊断)
 - **中文数据处理** (更大的中文数据集，流式数据加载)
 - **模型分析** (注意力可视化，梯度分析，可解释性)
 
@@ -373,13 +382,13 @@ cargo build --release
 - ✅ **Pre-LN Transformer** - 现代 GPT-2 标准架构
 - ✅ **明确的残差连接** - 清晰且可维护
 - ✅ **性能优化** - 比初版快 60-80%
-- ⚠️ **无注意力掩码参数** - 目前硬编码因果掩码
+- ✅ **Padding mask 支持** - `forward_with_padding_mask(...)` / `forward_batch(..., attention_mask)`（训练默认单序列无需 padding）
 - ✅ **梯度累积** - 可配置（默认禁用以提升稳定性）
-- ⚠️ **无学习率预热** - 使用余弦退火，但没有预热阶段
+- ✅ **Warmup + 余弦退火** - 默认训练入口启用 warmup（无重启）
 
 ### 入门
 1. Fork 仓库
-2. 创建功能分支：`git checkout -b feature/model-persistence`
+2. 创建功能分支：`git checkout -b feature/vectorized-batch`
 3. 进行更改并添加测试
 4. 运行测试套件：`cargo test`
 5. 格式化和检查：`cargo fmt && cargo clippy`
@@ -394,9 +403,9 @@ cargo build --release
 - 为复杂算法添加解释注释
 
 ### 贡献想法
-- 🚀 **初学者**: 模型保存/加载，更多中文训练数据，配置文件
-- 🔥 **中级**: 注意力可视化，训练检查点，评估指标
-- ⚡ **高级**: Flash Attention，梯度累积，RoPE，混合精度训练
+- 🚀 **初学者**: 更多中文训练数据，配置文件，补测试/修文档
+- 🔥 **中级**: 真正的 batch 向量化训练，评估指标，训练可视化
+- ⚡ **高级**: Flash Attention，RoPE，混合精度训练
 
 有问题？开一个 issue 或开始讨论！
 

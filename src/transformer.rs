@@ -68,7 +68,7 @@
 //! 输出 (seq_len, 512)
 //! ```
 
-use ndarray::Array2;
+use ndarray::{s, Array1, Array2, Array3};
 
 use crate::{
     dropout::Dropout, feed_forward::FeedForward, layer_norm::LayerNorm, llm::Layer,
@@ -259,6 +259,41 @@ impl Layer for TransformerBlock {
 
         // 最终残差连接：整合注意力和前馈的输出
         &x + &dropout2_out
+    }
+
+    fn forward_batch(
+        &mut self,
+        input: &Array3<f32>,
+        attention_mask: Option<&Array2<f32>>,
+    ) -> Array3<f32> {
+        let batch_size = input.shape()[0];
+        let seq_len = input.shape()[1];
+        let hidden_dim = input.shape()[2];
+
+        let mut output = Array3::zeros((batch_size, seq_len, hidden_dim));
+
+        for b in 0..batch_size {
+            let sample = input.slice(s![b, .., ..]).to_owned();
+            let key_padding_mask: Option<Array1<f32>> =
+                attention_mask.map(|m| m.row(b).to_owned());
+
+            let norm1_out = self.norm1.normalize(&sample);
+            let attention_out =
+                self.attention
+                    .forward_with_padding_mask(&norm1_out, key_padding_mask.as_ref());
+            let dropout1_out = self.dropout1.forward(&attention_out);
+
+            let x = &sample + &dropout1_out;
+
+            let norm2_out = self.norm2.normalize(&x);
+            let feed_forward_out = self.feed_forward.forward(&norm2_out);
+            let dropout2_out = self.dropout2.forward(&feed_forward_out);
+
+            let sample_out = &x + &dropout2_out;
+            output.slice_mut(s![b, .., ..]).assign(&sample_out);
+        }
+
+        output
     }
 
     /// **反向传播：计算梯度并更新参数**

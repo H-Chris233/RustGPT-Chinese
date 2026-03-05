@@ -272,6 +272,22 @@ pub struct LLM {
     pub beam_candidates_buffer: Vec<(Vec<usize>, f32)>,
 }
 
+/// 训练信号（loss/grad）计算错误。
+///
+/// 一旦触发，说明上游对齐或词表尺寸已损坏；继续执行 optimizer step 会导致 Adam 动量“漂移”，
+/// 破坏可复现性。因此调用方应 **跳过本步参数更新** 并优先定位根因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrainingSignalError {
+    /// `probs.shape()[0] != target.len()`（常见于 target 对齐错误或 logits/softmax shape 错误）。
+    ShapeMismatch { probs_rows: usize, target_len: usize },
+    /// target id 超出 vocab_size（常见于词表/输出层维度不一致）。
+    TargetOutOfRange {
+        row_idx: usize,
+        target_idx: usize,
+        vocab_size: usize,
+    },
+}
+
 /// 早停机制
 ///
 /// 监控训练loss，如果长时间不改善则自动停止训练
@@ -671,6 +687,8 @@ impl LLM {
     pub fn train(&mut self, data: Vec<&str>, epochs: usize, initial_lr: f32) {
         self.set_training_mode(true);
 
+        let pad_token_id = self.vocab.pad_token_id();
+
         let tokenized_data = data
             .iter()
             // 教学要点：训练序列应包含 BOS/EOS，否则模型难以学会“什么时候结束”。
@@ -705,11 +723,24 @@ impl LLM {
 
                 let logits = input;
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 // Backward pass: grad = softmax(logits) - one_hot
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output = match Self::compute_gradients_step(
+                    &probs,
+                    target_ids,
+                    pad_token_id,
+                ) {
+                    Ok(Some(grads)) => grads,
+                    Ok(None) => continue, // 全 PAD：跳过 optimizer step，避免 Adam 动量漂移
+                    Err(err) => {
+                        log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                        continue;
+                    }
+                };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
 
                 Self::clip_gradients(&mut grads_output, 1.0);
 
@@ -745,6 +776,8 @@ impl LLM {
     ) {
         self.set_training_mode(true);
 
+        let pad_token_id = self.vocab.pad_token_id();
+
         for epoch in 0..epochs {
             let decay_rate: f32 = 0.95;
             let decay_steps = 10.0;
@@ -775,11 +808,24 @@ impl LLM {
                 let logits = input;
                 // 使用 log_softmax + NLL 提升数值稳定性
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 // 反向传播：grad = softmax(logits) - one_hot
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output = match Self::compute_gradients_step(
+                    &probs,
+                    target_ids,
+                    pad_token_id,
+                ) {
+                    Ok(Some(grads)) => grads,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                        continue;
+                    }
+                };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
 
                 // 更强的梯度裁剪提升稳定性
                 Self::clip_gradients(&mut grads_output, 1.0);
@@ -988,6 +1034,8 @@ impl LLM {
     ) -> usize {
         self.set_training_mode(true);
 
+        let pad_token_id = self.vocab.pad_token_id();
+
         let mut perf_monitor = PerformanceMonitor::new();
         let effective_accum_steps = accumulation_steps.max(1);
 
@@ -1059,11 +1107,24 @@ impl LLM {
 
                 let logits = input;
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 // 计算输出梯度
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output = match Self::compute_gradients_step(
+                    &probs,
+                    target_ids,
+                    pad_token_id,
+                ) {
+                    Ok(Some(grads)) => grads,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                        continue;
+                    }
+                };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
 
                 total_grad_norm += Self::compute_grad_norm(&grads_output);
 
@@ -1182,6 +1243,7 @@ impl LLM {
         use crate::batch_loader::{BatchLoader, create_training_batches};
 
         self.set_training_mode(true);
+        let pad_token_id = self.vocab.pad_token_id();
 
         let perf_monitor = PerformanceMonitor::new();
 
@@ -1202,7 +1264,8 @@ impl LLM {
         );
 
         // 创建批量加载器
-        let batch_loader = BatchLoader::new(batch_size, true, 16);
+        let batch_loader =
+            BatchLoader::new_with_pad_token_id(batch_size, true, 16, pad_token_id);
 
         let mut early_stopping = EarlyStopping::new(patience, 0.01);
         let training_start_time = std::time::Instant::now();
@@ -1265,13 +1328,24 @@ impl LLM {
                     let logits = input;
                     let log_probs = log_softmax(&logits);
 
-                    // loss
-                    let loss = Self::cross_entropy_from_log_probs(&log_probs, &target_ids);
-                    total_loss += loss;
-
                     // grads (dL/dlogits)
                     let probs = log_probs.mapv(|x| x.exp());
-                    let mut grads = Self::compute_gradients_step(&probs, &target_ids);
+                    let mut grads = match Self::compute_gradients_step(
+                        &probs,
+                        &target_ids,
+                        pad_token_id,
+                    ) {
+                        Ok(Some(grads)) => grads,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                            continue;
+                        }
+                    };
+
+                    // loss（仅在本步会更新参数时计入）
+                    total_loss +=
+                        Self::cross_entropy_from_log_probs(&log_probs, &target_ids, pad_token_id);
 
                     total_grad_norm += Self::compute_grad_norm(&grads);
                     Self::clip_gradients(&mut grads, 1.0);
@@ -2168,15 +2242,18 @@ impl LLM {
         (ch as u32) >= 0x4E00 && (ch as u32) <= 0x9FFF
     }
 
-    pub(crate) fn cross_entropy_from_log_probs(log_probs: &Array2<f32>, target: &[usize]) -> f32 {
+    pub(crate) fn cross_entropy_from_log_probs(
+        log_probs: &Array2<f32>,
+        target: &[usize],
+        pad_token_id: usize,
+    ) -> f32 {
         // 使用 log_softmax 输出计算交叉熵，避免对概率取对数的数值不稳定
         let mut loss = 0.0;
         let mut n_targets = 0usize;
 
         for (row_idx, &target_idx) in target.iter().enumerate() {
-            // 约定：PAD token id 固定为 0（见 vocab.rs / batch_loader.rs）。
             // PAD 不应该参与 loss（否则会把“补齐的空白”当成训练信号）。
-            if target_idx == 0 {
+            if target_idx == pad_token_id {
                 continue;
             }
 
@@ -2218,7 +2295,11 @@ impl LLM {
         loss / n_targets
     }
 
-    pub fn compute_gradients_step(probs: &Array2<f32>, target: &[usize]) -> Array2<f32> {
+    pub fn compute_gradients_step(
+        probs: &Array2<f32>,
+        target: &[usize],
+        pad_token_id: usize,
+    ) -> Result<Option<Array2<f32>>, TrainingSignalError> {
         let mut grads = probs.clone(); // softmax - one_hot(target)
 
         if probs.shape()[0] != target.len() {
@@ -2227,34 +2308,48 @@ impl LLM {
                 probs.shape()[0],
                 target.len()
             );
-            return grads; // 返回原始梯度，避免崩溃
+            // 关键：如果继续 backward（哪怕传入 0 梯度），Adam 的动量也可能导致参数漂移。
+            // 因此这里返回 Err，强制调用方跳过本步 optimizer step。
+            return Err(TrainingSignalError::ShapeMismatch {
+                probs_rows: probs.shape()[0],
+                target_len: target.len(),
+            });
         }
 
         let mut n_targets = 0usize;
 
         for (row_idx, &target_idx) in target.iter().enumerate() {
-            if target_idx == 0 {
-                continue; // PAD 不参与梯度
+            if target_idx == pad_token_id {
+                // 与 loss 计算保持一致：PAD 不参与训练信号，因此该位置的梯度应为 0。
+                grads.row_mut(row_idx).fill(0.0);
+                continue;
             }
 
             if target_idx >= grads.shape()[1] {
-                log::warn!(
-                    "compute_gradients_step 越界：row_idx={}, target_idx={}, probs_shape={:?}",
+                log::error!(
+                    "compute_gradients_step target 越界：row_idx={}, target_idx={}, probs_shape={:?}",
                     row_idx,
                     target_idx,
                     probs.dim()
                 );
-                continue;
+                return Err(TrainingSignalError::TargetOutOfRange {
+                    row_idx,
+                    target_idx,
+                    vocab_size: grads.shape()[1],
+                });
             }
 
             grads[[row_idx, target_idx]] -= 1.0;
             n_targets += 1;
         }
 
-        if n_targets > 0 {
-            grads.mapv_inplace(|x| x / (n_targets as f32));
+        if n_targets == 0 {
+            // 全部是 PAD：没有训练信号。必须跳过 optimizer step，避免 Adam 动量导致“0 梯度漂移”。
+            return Ok(None);
         }
-        grads
+
+        grads.mapv_inplace(|x| x / (n_targets as f32));
+        Ok(Some(grads))
     }
 
     pub fn clip_gradients(grads: &mut Array2<f32>, max_norm: f32) {

@@ -88,7 +88,7 @@
 use std::collections::HashMap;
 use std::f32;
 
-use ndarray::{s, Array1, Array2, ArrayView2, Axis};
+use ndarray::{s, Array1, Array2, Array3, ArrayView2, Axis};
 use ndarray::linalg::general_mat_mul;
 
 use crate::{adam::Adam, llm::Layer, utils::sample_normal, EMBEDDING_DIM};
@@ -984,6 +984,27 @@ impl Layer for SelfAttention {
     fn forward(&mut self, input: &Array2<f32>) -> Array2<f32> {
         self.cached_input = Some(input.clone());
         self.multi_head_attention(input)
+    }
+
+    fn forward_batch(
+        &mut self,
+        input: &Array3<f32>,
+        attention_mask: Option<&Array2<f32>>,
+    ) -> Array3<f32> {
+        let batch_size = input.shape()[0];
+        let seq_len = input.shape()[1];
+        let hidden_dim = input.shape()[2];
+
+        let mut output = Array3::zeros((batch_size, seq_len, hidden_dim));
+
+        for b in 0..batch_size {
+            let sample = input.slice(s![b, .., ..]).to_owned();
+            let key_padding_mask = attention_mask.map(|m| m.row(b).to_owned());
+            let sample_out = self.forward_with_padding_mask(&sample, key_padding_mask.as_ref());
+            output.slice_mut(s![b, .., ..]).assign(&sample_out);
+        }
+
+        output
     }
 
     fn backward(&mut self, grads: &Array2<f32>, lr: f32) -> Array2<f32> {

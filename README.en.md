@@ -31,6 +31,12 @@ This is just a toy project that demonstrates how Chinese LLMs work under the hoo
 
 ## 🆕 Recent Updates
 
+### Training Correctness: PAD/mask/illegal targets (2026-03-05)
+- ✅ **Batch/PAD mask wiring**: `SelfAttention` / `TransformerBlock` consume `attention_mask` in `forward_batch(...)` (key padding mask)
+- ✅ **Remove `PAD_ID==0` assumptions**: padding/loss/grads use `vocab.pad_token_id()` as the single source of truth; `BatchLoader` supports injecting `pad_token_id`
+- ✅ **Training signal guardrails**: shape mismatch / out-of-range targets / all-PAD now skip optimizer steps to avoid Adam momentum drift and to improve debuggability
+- ✅ **New/updated tests**: `self_attention_forward_batch_mask_test`, updated `compute_gradients_step_test`
+
 ### v0.4.0 - Checkpoint Management & Training Resume (2025-10-28)
 - 🚀 **Checkpoint Manager** - Supports Best/Last/Periodic saving strategies with automatic cleanup
 - ✅ **Complete State Saving** - Model parameters + Adam optimizer state (m, v, timestep) for true resume
@@ -214,10 +220,10 @@ Model output: 降雨是由云中的水蒸气凝结成水滴，当水滴变得太
 
 ### Training Details (v0.3.1)
 - **Optimizer**: Adam (β₁=0.9, β₂=0.999, ε=1e-8) with gradient clipping
-- **Pre-training LR**: 0.001 with cosine annealing (2 restarts) + early stopping (patience=30)
-- **Instruction Tuning LR**: 0.0005 with cosine annealing (2 restarts) + early stopping
-- **Loss Function**: Cross-entropy loss with numerical stability (clipping at 1e-15)
-- **Gradient Clipping**: L2 norm capped at 5.0
+- **LR Schedule**: Cosine decay + warmup (no restarts by default)
+- **Default LR (main training entry)**: 0.0001
+- **Loss Function**: `log_softmax` + NLL (cross entropy from log-probs); PAD (`vocab.pad_token_id()`) is excluded from loss/grads
+- **Gradient Clipping**: L2 norm capped at 1.0 on the main training path
 - **Regularization**: Dropout layers with 10% rate (inverted dropout)
 - **🚀 v0.3.1 训练优化**:
   - 数据预处理缓存 (避免重复tokenization)
@@ -255,7 +261,7 @@ Model output: 降雨是由云中的水蒸气凝结成水滴，当水滴变得太
 | Gradient accumulation | 40% stability* | ✅ v0.3.1 |
 | Attention reshape (slice ops) | 20-30% | ✅ Implemented |
 | Compiler optimizations (LTO) | 10-20% | ✅ Implemented |
-| ndarray rayon parallelization | 10-15% | ✅ Implemented |
+| Optional BLAS (`--features blas`) | env-dependent | ✅ Implemented |
 | **Total expected improvement** | **80-100%** | ✅ Implemented |
 
 *训练质量和稳定性提升，不仅仅是速度优化
@@ -305,34 +311,37 @@ Perfect for understanding how LLMs with Chinese support work under the hood!
 
 ## 📊 Dependencies
 
-- `ndarray` - N-dimensional arrays for matrix operations (with rayon parallelization)
+- `ndarray` - N-dimensional arrays for matrix operations (optional BLAS via `--features blas`)
 - `jieba-rs` - Chinese text segmentation and tokenization
-- `rand` + `rand_distr` - Random number generation for initialization
+- `lru` - LRU cache for tokenizer optimization
+- `rand` - Random number generation for initialization
 - `regex` - Pattern matching for Chinese idioms recognition
 - `bincode` - Serialization and binary encoding
 - `serde` + `serde_json` - Data serialization
+- `log` + `simple_logger` - Logging
 
 No PyTorch, TensorFlow, or Candle - just pure Rust and linear algebra!
 
 ## 📚 Documentation
 
 - **[CLAUDE.md](CLAUDE.md)** - Development guidelines for Claude Code assistant
-- **[训练性能优化完全指南](docs/训练性能优化指南.md)** - Comprehensive training performance optimization guide (CN)
-- **[训练稳定化与后续改进路线](docs/训练稳定化与后续改进路线.md)** - Training stabilization plan and next steps (CN)
+- **[批量训练与动态掩码](docs/批量训练与动态掩码.md)** - Batch training & dynamic masking notes (CN)
+- **[检查点管理与早停机制实现](docs/检查点管理与早停机制实现.md)** - Checkpointing & early stopping (CN)
+- **[性能优化文档](docs/性能优化文档.md)** - Performance optimizations (CN)
 
 ## 🤝 Contributing
 
 Contributions are welcome! This project is perfect for learning and experimentation.
 
 ### High Priority Features Needed
-- **🏪 Model Persistence** - Save/load trained parameters to disk (currently all in-memory)
+- **🧮 True vectorized batch training** - Batch GEMMs + “accumulate/average grads then one optimizer step” (current `train_monitored_batch` is still per-sample SGD inside a batch)
 - **📊 Evaluation metrics** - Perplexity, benchmarks, training visualizations
 - **🎯 Attention visualization** - Visualize attention patterns for Chinese text
 - **📈 Training curves** - Loss/accuracy plotting
 
 ### Areas for Improvement
 - **Advanced architectures** (Rotary Position Embedding (RoPE), Flash Attention)
-- **Training improvements** (Gradient accumulation, learning rate warmup, mixed precision)
+- **Training improvements** (strict batch update semantics, mixed precision, better diagnostics)
 - **Chinese data handling** (Larger Chinese datasets, streaming data loading)
 - **Model analysis** (Attention visualization, gradient analysis, interpretability)
 
@@ -340,13 +349,13 @@ Contributions are welcome! This project is perfect for learning and experimentat
 - ✅ **Pre-LN Transformer** - Modern GPT-2 standard architecture
 - ✅ **Explicit residual connections** - Clear and maintainable
 - ✅ **Performance optimized** - 60-80% faster than initial version
-- ⚠️ **No attention masking parameter** - Currently hardcoded causal masking
+- ✅ **Padding mask support** - `forward_with_padding_mask(...)` / `forward_batch(..., attention_mask)` (single-sample training does not pad by default)
 - ✅ **Gradient accumulation** - Configurable via accumulation steps (default disabled for stability)
-- ⚠️ **No learning rate warmup** - Cosine annealing used, but no warmup phase
+- ✅ **Warmup + cosine schedule** - Default training path uses warmup (no restarts)
 
 ### Getting Started
 1. Fork the repository
-2. Create a feature branch: `git checkout -b feature/model-persistence`
+2. Create a feature branch: `git checkout -b feature/vectorized-batch`
 3. Make your changes and add tests
 4. Run the test suite: `cargo test`
 5. Format and lint: `cargo fmt && cargo clippy`
@@ -361,9 +370,9 @@ Contributions are welcome! This project is perfect for learning and experimentat
 - Add comments explaining complex algorithms
 
 ### Ideas for Contributions
-- 🚀 **Beginner**: Model save/load, more Chinese training data, config files
-- 🔥 **Intermediate**: Attention visualization, training checkpoints, evaluation metrics
-- ⚡ **Advanced**: Flash Attention, gradient accumulation, RoPE, mixed precision training
+- 🚀 **Beginner**: More Chinese training data, config files, tests/docs fixes
+- 🔥 **Intermediate**: True vectorized batch training, evaluation metrics, training visualization
+- ⚡ **Advanced**: Flash Attention, RoPE, mixed precision training
 
 Questions? Open an issue or start a discussion!
 

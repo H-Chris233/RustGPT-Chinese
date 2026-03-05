@@ -24,6 +24,7 @@ impl LLM {
         initial_lr: f32,
     ) {
         self.set_training_mode(true);
+        let pad_token_id = self.vocab.pad_token_id();
 
         for epoch in 0..epochs {
             let decay_rate: f32 = 0.95;
@@ -55,11 +56,21 @@ impl LLM {
 
                 let logits = input;
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 //  Backward  pass
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output =
+                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
+                        Ok(Some(grads)) => grads,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                            continue;
+                        }
+                    };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
                 Self::clip_gradients(&mut grads_output, 5.0);
 
                 for layer in self.network.iter_mut().rev() {
@@ -93,6 +104,7 @@ impl LLM {
         num_restarts: usize, //  推荐值:  2-3
     ) {
         self.set_training_mode(true);
+        let pad_token_id = self.vocab.pad_token_id();
 
         for epoch in 0..epochs {
             //  🔥  使用余弦退火学习率 + Warmup
@@ -121,10 +133,20 @@ impl LLM {
 
                 let logits = input;
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output =
+                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
+                        Ok(Some(grads)) => grads,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                            continue;
+                        }
+                    };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
                 Self::clip_gradients(&mut grads_output, 5.0);
 
                 for layer in self.network.iter_mut().rev() {
@@ -167,6 +189,7 @@ impl LLM {
         patience: usize,
     ) -> usize {
         self.set_training_mode(true);
+        let pad_token_id = self.vocab.pad_token_id();
 
         let mut best_loss = f32::INFINITY;
         let mut counter = 0;
@@ -199,10 +222,20 @@ impl LLM {
 
                 let logits = input;
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output =
+                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
+                        Ok(Some(grads)) => grads,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                            continue;
+                        }
+                    };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
                 Self::clip_gradients(&mut grads_output, 5.0);
 
                 for layer in self.network.iter_mut().rev() {
@@ -261,6 +294,7 @@ impl LLM {
         patience: usize,
     ) -> usize {
         self.set_training_mode(true);
+        let pad_token_id = self.vocab.pad_token_id();
 
         let mut best_loss = f32::INFINITY;
         let mut counter = 0;
@@ -295,10 +329,20 @@ impl LLM {
 
                 let logits = input;
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output =
+                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
+                        Ok(Some(grads)) => grads,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                            continue;
+                        }
+                    };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
 
                 //  记录梯度范数
                 total_grad_norm += Self::compute_grad_norm(&grads_output);
@@ -398,6 +442,7 @@ impl LLM {
         resume_epoch: usize,
     ) -> usize {
         self.set_training_mode(true);
+        let pad_token_id = self.vocab.pad_token_id();
 
         let mut best_loss = if let Some(ref manager) = checkpoint_manager {
             manager.get_best_loss()
@@ -405,13 +450,17 @@ impl LLM {
             f32::INFINITY
         };
         let mut counter = 0;
-        let min_delta = 0.001f32;
+        // 与 `train_monitored()` 保持一致：避免 resume 训练与主训练的早停判据不一致。
+        let min_delta = 0.01f32;
         let mut best_epoch = resume_epoch;
         let start_time = std::time::Instant::now();
 
         for epoch in resume_epoch..max_epochs {
             let epoch_start = std::time::Instant::now();
-            let current_lr = Self::cosine_annealing_lr(initial_lr, epoch, max_epochs, 2);
+            // 与 `train_monitored()` 保持一致：余弦退火 + warmup（禁用重启）。
+            let warmup_epochs = Self::recommend_warmup_epochs(max_epochs);
+            let current_lr =
+                Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
             let mut total_loss = 0.0;
             let mut total_grad_norm = 0.0;
@@ -436,15 +485,26 @@ impl LLM {
 
                 let logits = input;
                 let log_probs = log_softmax(&logits);
-                total_loss += Self::cross_entropy_from_log_probs(&log_probs, target_ids);
 
                 let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = Self::compute_gradients_step(&probs, target_ids);
+                let mut grads_output =
+                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
+                        Ok(Some(grads)) => grads,
+                        Ok(None) => continue,
+                        Err(err) => {
+                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                            continue;
+                        }
+                    };
+
+                total_loss +=
+                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
 
                 //  记录梯度范数
                 total_grad_norm += Self::compute_grad_norm(&grads_output);
 
-                Self::clip_gradients(&mut grads_output, 5.0);
+                // 与 `train_monitored()` 保持一致：使用更严格的裁剪阈值提升稳定性。
+                Self::clip_gradients(&mut grads_output, 1.0);
 
                 for layer in self.network.iter_mut().rev() {
                     grads_output = layer.backward(&grads_output, current_lr);
