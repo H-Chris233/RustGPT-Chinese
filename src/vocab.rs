@@ -119,7 +119,7 @@ const MAX_IDIOMS_JSON_BYTES: u64 = 16 * 1024 * 1024; // 16MiB
 /// **全局成语集合**
 ///
 /// 使用 `OnceLock` 确保线程安全的延迟初始化：
-/// - 首次调用时从 `data/chinese_idioms.json` 加载
+/// - 首次调用时从 `data/idioms/chinese_idioms_enhanced.json` 加载（推荐）
 /// - 后续调用直接返回已加载的实例
 /// - 内存中只有一份拷贝，所有线程共享
 static COMMON_IDIOM_SET: OnceLock<HashSet<String>> = OnceLock::new();
@@ -193,14 +193,14 @@ pub fn reset_cache_stats() {
 /// # 返回值
 /// 返回全局共享的成语 HashSet，包含从 JSON 文件加载的所有成语
 ///
-/// # Panic
-/// 如果无法加载 `data/chinese_idioms.json`，程序会 panic
+/// # 失败策略
+/// 如果无法加载成语词典文件，程序会返回空集合（并记录错误日志）。
 fn common_idioms() -> &'static HashSet<String> {
     COMMON_IDIOM_SET.get_or_init(|| match load_common_idioms_from_file() {
         Ok(set) => set,
         Err(e) => {
             log::error!(
-                "Failed to load chinese idioms from data/chinese_idioms.json: {}",
+                "Failed to load chinese idioms dictionary: {}",
                 e
             );
             HashSet::new()
@@ -231,34 +231,103 @@ fn jieba_instance() -> &'static Jieba {
 
 /// **从文件加载中文成语列表**
 ///
-/// 从 `data/chinese_idioms.json` 读取成语数组并转换为 HashSet。
+/// 从“成语语料目录”读取成语并转换为 HashSet。
 ///
-/// # 文件格式
+/// # 新目录与新结构（唯一支持）
+/// - 目录：`data/idioms/`
+/// - 主文件：`data/idioms/chinese_idioms_enhanced.json`
+/// - 格式：对象 `{ metadata, idioms: [ { 成语: "..." }, ... ] }`
+///
+/// # 文件示例
 /// ```json
-/// [
-///   "一帆风顺",
-///   "水到渠成",
-///   "画龙点睛",
-///   ...
-/// ]
+/// {
+///   "metadata": { "total_count": 12345 },
+///   "idioms": [
+///     { "成语": "一帆风顺" },
+///     { "成语": "水到渠成" },
+///     { "成语": "画龙点睛" }
+///   ]
+/// }
 /// ```
 ///
 /// # 返回值
 /// - `Ok(HashSet<String>)`: 成功加载的成语集合
 /// - `Err`: 文件读取或 JSON 解析错误
 fn load_common_idioms_from_file() -> Result<HashSet<String>, Box<dyn std::error::Error>> {
-    let idioms_file_path = "data/chinese_idioms.json";
-    let meta = fs::metadata(idioms_file_path)?;
+    let path = "data/idioms/chinese_idioms_enhanced.json";
+    if !Path::new(path).exists() {
+        return Err(format!("未找到成语词典文件: {}", path).into());
+    }
+
+    load_idioms_from_path(path)
+}
+
+/// 从指定路径读取成语集合。
+///
+/// 仅支持结构化增强版对象：
+/// `{ metadata, idioms: [ { 成语: "...", ... }, ... ] }`
+fn load_idioms_from_path(path: &str) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
+    let meta = fs::metadata(path)?;
     if meta.len() > MAX_IDIOMS_JSON_BYTES {
         return Err(format!(
             "成语词典文件过大(>{} bytes): {}",
-            MAX_IDIOMS_JSON_BYTES, idioms_file_path
+            MAX_IDIOMS_JSON_BYTES, path
         )
         .into());
     }
-    let idioms_json = fs::read_to_string(idioms_file_path)?;
-    let idioms: Vec<String> = serde_json::from_str(&idioms_json)?;
-    Ok(HashSet::from_iter(idioms))
+
+    let content = fs::read_to_string(path)?;
+    #[derive(Deserialize)]
+    struct IdiomsCorpus {
+        /// 仅用于保留结构约束（不强依赖字段内容）
+        metadata: serde_json::Value,
+        idioms: Vec<IdiomEntry>,
+    }
+
+    #[derive(Deserialize)]
+    struct IdiomEntry {
+        #[serde(rename = "成语")]
+        idiom: String,
+    }
+
+    let corpus: IdiomsCorpus = serde_json::from_str(&content).map_err(|e| {
+        format!(
+            "成语词典 JSON 解析失败（仅支持 {{metadata, idioms:[{{成语}}]}} 结构）: {} ({})",
+            path, e
+        )
+    })?;
+
+    let IdiomsCorpus { metadata, idioms } = corpus;
+
+    // 读取条目，做最小清洗（trim + 去空）
+    let idioms: HashSet<String> = idioms
+        .into_iter()
+        .map(|e| e.idiom.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    // metadata 字段必须存在；变量仅用于确保反序列化约束生效（避免被优化为未使用）
+    let _ = metadata;
+
+    // 轻量提示：成语通常为四个汉字；如条目不符合也保留（避免误删），仅记录提示。
+    let non_standard = idioms.iter().filter(|s| s.chars().count() != 4).count();
+    if non_standard > 0 {
+        log::info!(
+            "成语词典 {} 中包含 {} 条非四字成语（已保留）。如需严格四字过滤，可在此处开启。",
+            path,
+            non_standard
+        );
+    }
+
+    if idioms.len() < 50 {
+        log::warn!(
+            "成语词典条目数较少（{} 条）：{}。若你预期应更大，请检查语料文件是否为完整版本。",
+            idioms.len(),
+            path
+        );
+    }
+
+    Ok(idioms)
 }
 
 /// **词汇表结构体**
@@ -926,7 +995,7 @@ impl Vocab {
     ///
     /// 1. **四字成语检测**：
     ///    - 正则: `[\u4e00-\u9fff]{4}` 匹配4个连续中文字符
-    ///    - 验证: 在成语字典中查找（`data/chinese_idioms.json`）
+    ///    - 验证: 在成语字典中查找（推荐：`data/idioms/chinese_idioms_enhanced.json`）
     ///    - 示例: "一帆风顺", "画龙点睛"
     ///
     /// 2. **有意义短语检测**：

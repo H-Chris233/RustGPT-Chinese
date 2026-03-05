@@ -149,7 +149,7 @@ The training process has two phases with v0.3.1 performance optimizations:
 - Extracts 4-character Chinese idioms (成语) with pattern matching
 
 **Special Processing:**
-- Idiom detection via regex patterns and dictionary lookup (`data/chinese_idioms.json`)
+- Idiom detection via regex patterns and dictionary lookup (`data/idioms/chinese_idioms_enhanced.json` only)
 - Phrase extraction for multi-character meaningful phrases
 - Post-processing removes extra spaces between Chinese characters
 
@@ -230,7 +230,7 @@ Defined in `vocab.rs`:
 Training data is loaded from JSON files in `data/`:
 - `data/pretraining/` - Directory of JSON arrays (e.g. `set1.json`, `dataset2.json`, ...)
 - `data/chat/` - Directory of JSON arrays (e.g. `set1.json`, `dataset2.json`, ...)
-- `data/chinese_idioms.json` - Array of 4-character Chinese idioms
+- `data/idioms/chinese_idioms_enhanced.json` - Structured idiom knowledge base (recommended)
 
 Format: Simple JSON arrays of strings.
 
