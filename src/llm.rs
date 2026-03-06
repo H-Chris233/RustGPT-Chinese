@@ -715,8 +715,9 @@ impl LLM {
             let decay_steps = 10.0;
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
 
-            let mut total_loss = 0.0;
-            let mut sample_count = 0usize;
+            // 训练指标口径：统一使用 token-weighted mean，避免短序列被隐式加权。
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
@@ -731,17 +732,17 @@ impl LLM {
                     continue;
                 };
 
-                total_loss += step.loss_mean;
+                total_nll += step.loss_mean * (step.n_targets as f32);
+                total_tokens += step.n_targets;
                 Self::clip_gradients(&mut step.grads_output, 1.0);
                 self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
-                sample_count += 1;
             }
 
             println!(
                 "Epoch {}: Loss = {:.4}, LR = {:.6}",
                 epoch,
-                if sample_count > 0 {
-                    total_loss / sample_count as f32
+                if total_tokens > 0 {
+                    total_nll / total_tokens as f32
                 } else {
                     0.0
                 },
@@ -1281,7 +1282,9 @@ impl LLM {
             let current_lr =
                 Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
-            let mut total_loss = 0.0;
+            // 训练指标口径：统一使用 token-weighted mean，避免短序列被隐式加权。
+            let mut total_nll = 0.0;
+            let mut total_tokens = 0usize;
             let mut total_grad_norm = 0.0;
             let mut sample_count = 0usize;
 
@@ -1324,8 +1327,9 @@ impl LLM {
                         continue;
                     };
 
-                    // loss（仅在本步会更新参数时计入）
-                    total_loss += step.loss_mean;
+                    // loss（仅在本步会更新参数时计入，按有效 token 做统一加权）
+                    total_nll += step.loss_mean * (step.n_targets as f32);
+                    total_tokens += step.n_targets;
 
                     total_grad_norm += Self::compute_grad_norm(&step.grads_output);
                     Self::clip_gradients(&mut step.grads_output, 1.0);
@@ -1336,8 +1340,8 @@ impl LLM {
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
-            let avg_loss = if sample_count > 0 {
-                total_loss / sample_count as f32
+            let avg_loss = if total_tokens > 0 {
+                total_nll / total_tokens as f32
             } else {
                 0.0
             };
