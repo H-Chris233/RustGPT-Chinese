@@ -1042,27 +1042,36 @@ impl LLM {
                 // - 但不立刻更新参数，而是把参数梯度累加到各层的累积 buffer；
                 // - 当累积步数到达阈值时，再统一对“平均梯度”执行一次参数更新（scale=1/steps）。
                 //
-                // 这里额外做一个关键修复（token-weighted）：
-                // - `compute_gradients_step()` 输出的是 “token-mean loss” 对 logits 的梯度（已除以 n_targets）；
-                // - 若直接对 micro-batch 求平均，会变成 sequence-weighted（每条序列权重相同）；
-                // - 我们把 logits 梯度乘回 n_targets，使其对应 “sum NLL” 的梯度，
-                //   然后在 step 时用 `scale = 1/accum_tokens` 做统一平均，得到 token-weighted 梯度。
-                Self::rescale_logits_grads_for_accumulation(&mut step.grads_output, step.n_targets);
-                self.backward_accumulate_with_ctx(&step.layer_ctxs, &step.grads_output);
-                accum_counter += 1;
-                accum_tokens += step.n_targets;
-                if accum_counter >= effective_accum_steps {
-                    self.step_accumulated(
-                        current_lr,
-                        Self::token_weighted_accum_scale(accum_tokens),
+                if effective_accum_steps == 1 {
+                    // accumulation_steps=1 时不需要进入“参数梯度累积”路径，
+                    // 直接走标准 backward 更简单，也允许实验性单层/探针模型复用 train_monitored。
+                    self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
+                } else {
+                    // 这里额外做一个关键修复（token-weighted）：
+                    // - `compute_gradients_step()` 输出的是 “token-mean loss” 对 logits 的梯度（已除以 n_targets）；
+                    // - 若直接对 micro-batch 求平均，会变成 sequence-weighted（每条序列权重相同）；
+                    // - 我们把 logits 梯度乘回 n_targets，使其对应 “sum NLL” 的梯度，
+                    //   然后在 step 时用 `scale = 1/accum_tokens` 做统一平均，得到 token-weighted 梯度。
+                    Self::rescale_logits_grads_for_accumulation(
+                        &mut step.grads_output,
+                        step.n_targets,
                     );
-                    accum_counter = 0;
-                    accum_tokens = 0;
+                    self.backward_accumulate_with_ctx(&step.layer_ctxs, &step.grads_output);
+                    accum_counter += 1;
+                    accum_tokens += step.n_targets;
+                    if accum_counter >= effective_accum_steps {
+                        self.step_accumulated(
+                            current_lr,
+                            Self::token_weighted_accum_scale(accum_tokens),
+                        );
+                        accum_counter = 0;
+                        accum_tokens = 0;
+                    }
                 }
             }
 
             // 处理最后一个“不满 accumulation_steps”的尾批次
-            if accum_counter > 0 {
+            if effective_accum_steps > 1 && accum_counter > 0 {
                 self.step_accumulated(current_lr, Self::token_weighted_accum_scale(accum_tokens));
             }
 
