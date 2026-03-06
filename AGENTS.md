@@ -50,6 +50,15 @@ cargo clippy                 # 静态检查（建议在提交前运行）
 - 训练语料位于 `data/pretraining/` 与 `data/chat/`：保持为 **JSON 字符串数组**；新增分片建议沿用 `datasetN.json`/`setN.json` 的递增命名，避免破坏加载顺序。
 - 不要提交运行产物：`target/`、`checkpoints/`、`exports/`、`logs/` 等目录已在 `.gitignore` 中忽略（PR 中出现这些文件通常意味着误提交）。
 
+## Training API & Teaching Notes
+
+- 训练公开入口应尽量保持最小表面积；当前推荐保留：`train(...)`、`train_monitored(...)`、`train_bucketed_sequential(...)`、`train_with_checkpointing(...)`。新增训练入口前先确认是否真的需要对外公开。
+- 训练相关指标统一使用 **token-weighted mean loss**；不要在不同公开训练 API 中混用 sample-mean 与 token-mean。
+- `train_bucketed_sequential(...)` 的语义是“按批次组织样本 + 批内逐样本顺序更新”，**不是**严格的 batch 梯度平均更新；后续文档与命名必须保持这一点。
+- 教学主线优先围绕 `PreparedTrainingStep`、`prepare_training_step(...)`、`backward_with_ctx(...)` 组织，避免重新复制单样本训练逻辑。
+- 删除无实际调用且教学价值不明确的训练变体 API，避免“功能开关式”入口持续膨胀。
+- 注释必须描述当前真实行为，不要保留过时能力说明（如未启用的并行 tokenization）或夸张性能承诺。
+
 ## Commit & Pull Request Guidelines
 
 - Git 历史同时存在命令式提交与 Conventional Commits；新提交建议统一使用下列格式（scope 可选）：

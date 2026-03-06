@@ -1239,7 +1239,7 @@ impl LLM {
     ///
     /// # 返回值
     /// 实际训练的 epoch 数
-    pub fn train_monitored_batch(
+    pub fn train_bucketed_sequential(
         &mut self,
         data: Vec<&str>,
         max_epochs: usize,

@@ -121,7 +121,7 @@ fn test_batch_training_with_small_model() {
     let data = vec!["你好 世界", "测试"];
 
     // 使用批量训练（小批次，少epoch）
-    let epochs_trained = model.train_monitored_batch(
+    let epochs_trained = model.train_bucketed_sequential(
         data, 2,     // max_epochs
         0.001, // initial_lr
         10,    // patience
