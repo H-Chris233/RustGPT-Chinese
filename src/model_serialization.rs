@@ -49,6 +49,20 @@ use crate::{
 const BINCODE_DECODE_LIMIT_BYTES: usize = 512 * 1024 * 1024; // 512MiB
 const JSON_DECODE_LIMIT_BYTES: u64 = 256 * 1024 * 1024; // 256MiB
 
+/// 按给定形状重建二维参数矩阵；若数据损坏或维度不匹配，则回退为零矩阵。
+///
+/// 这样可以把“加载失败时记录日志并兜底”的样板逻辑集中在一个地方，
+/// 让各层反序列化代码更像结构重建，而不是错误处理堆叠。
+fn rebuild_array2_or_zeros(shape: (usize, usize), data: &[f32], field_name: &str) -> Array2<f32> {
+    match Array2::from_shape_vec(shape, data.to_vec()) {
+        Ok(arr) => arr,
+        Err(error) => {
+            log::error!("Failed to reconstruct {}: {}", field_name, error);
+            Array2::zeros(shape)
+        }
+    }
+}
+
 fn count_transformer_blocks(network: &[Box<dyn Layer>]) -> usize {
     network
         .iter()
@@ -95,28 +109,13 @@ impl SerializableAdam {
     }
 
     pub fn to_adam(&self) -> Adam {
-        let m = match Array2::from_shape_vec(self.m_shape, self.m_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct m matrix: {}", e);
-                Array2::zeros(self.m_shape)
-            }
-        };
-        let v = match Array2::from_shape_vec(self.v_shape, self.v_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct v matrix: {}", e);
-                Array2::zeros(self.v_shape)
-            }
-        };
-
         Adam {
             beta1: self.beta1,
             beta2: self.beta2,
             epsilon: self.epsilon,
             timestep: self.timestep,
-            m,
-            v,
+            m: rebuild_array2_or_zeros(self.m_shape, &self.m_data, "m matrix"),
+            v: rebuild_array2_or_zeros(self.v_shape, &self.v_data, "v matrix"),
         }
     }
 }
@@ -261,15 +260,11 @@ impl SerializableLayer {
     }
 
     fn deserialize_embeddings(s: &SerializableEmbeddings) -> Embeddings {
-        let token_embeddings =
-            match Array2::from_shape_vec(s.token_embeddings_shape, s.token_embeddings_data.clone())
-            {
-                Ok(arr) => arr,
-                Err(e) => {
-                    log::error!("Failed to reconstruct token_embeddings: {}", e);
-                    Array2::zeros(s.token_embeddings_shape)
-                }
-            };
+        let token_embeddings = rebuild_array2_or_zeros(
+            s.token_embeddings_shape,
+            &s.token_embeddings_data,
+            "token_embeddings",
+        );
 
         Embeddings {
             token_embeddings,
@@ -317,43 +312,14 @@ impl SerializableLayer {
     }
 
     fn deserialize_self_attention(s: &SerializableSelfAttention) -> SelfAttention {
-        let w_q = match Array2::from_shape_vec(s.w_q_shape, s.w_q_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct w_q: {}", e);
-                Array2::zeros(s.w_q_shape)
-            }
-        };
-        let w_k = match Array2::from_shape_vec(s.w_k_shape, s.w_k_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct w_k: {}", e);
-                Array2::zeros(s.w_k_shape)
-            }
-        };
-        let w_v = match Array2::from_shape_vec(s.w_v_shape, s.w_v_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct w_v: {}", e);
-                Array2::zeros(s.w_v_shape)
-            }
-        };
-        let w_o = match Array2::from_shape_vec(s.w_o_shape, s.w_o_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct w_o: {}", e);
-                Array2::zeros(s.w_o_shape)
-            }
-        };
-
         SelfAttention {
             embedding_dim: s.embedding_dim,
             num_heads: s.num_heads,
             head_dim: s.head_dim,
-            w_q,
-            w_k,
-            w_v,
-            w_o,
+            w_q: rebuild_array2_or_zeros(s.w_q_shape, &s.w_q_data, "w_q"),
+            w_k: rebuild_array2_or_zeros(s.w_k_shape, &s.w_k_data, "w_k"),
+            w_v: rebuild_array2_or_zeros(s.w_v_shape, &s.w_v_data, "w_v"),
+            w_o: rebuild_array2_or_zeros(s.w_o_shape, &s.w_o_data, "w_o"),
             kv_cache: None,      // KV缓存初始化为None
             use_kv_cache: false, // 默认不使用KV缓存
             freeze_updates: false,
@@ -403,40 +369,11 @@ impl SerializableLayer {
     }
 
     fn deserialize_feed_forward(s: &SerializableFeedForward) -> FeedForward {
-        let w1 = match Array2::from_shape_vec(s.w1_shape, s.w1_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct w1: {}", e);
-                Array2::zeros(s.w1_shape)
-            }
-        };
-        let b1 = match Array2::from_shape_vec(s.b1_shape, s.b1_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct b1: {}", e);
-                Array2::zeros(s.b1_shape)
-            }
-        };
-        let w2 = match Array2::from_shape_vec(s.w2_shape, s.w2_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct w2: {}", e);
-                Array2::zeros(s.w2_shape)
-            }
-        };
-        let b2 = match Array2::from_shape_vec(s.b2_shape, s.b2_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct b2: {}", e);
-                Array2::zeros(s.b2_shape)
-            }
-        };
-
         FeedForward {
-            w1,
-            b1,
-            w2,
-            b2,
+            w1: rebuild_array2_or_zeros(s.w1_shape, &s.w1_data, "w1"),
+            b1: rebuild_array2_or_zeros(s.b1_shape, &s.b1_data, "b1"),
+            w2: rebuild_array2_or_zeros(s.w2_shape, &s.w2_data, "w2"),
+            b2: rebuild_array2_or_zeros(s.b2_shape, &s.b2_data, "b2"),
             optimizer_w1: s.optimizer_w1.to_adam(),
             optimizer_b1: s.optimizer_b1.to_adam(),
             optimizer_w2: s.optimizer_w2.to_adam(),
@@ -469,25 +406,10 @@ impl SerializableLayer {
     }
 
     fn deserialize_layer_norm(s: &SerializableLayerNorm) -> LayerNorm {
-        let gamma = match Array2::from_shape_vec(s.gamma_shape, s.gamma_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct gamma: {}", e);
-                Array2::zeros(s.gamma_shape)
-            }
-        };
-        let beta = match Array2::from_shape_vec(s.beta_shape, s.beta_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct beta: {}", e);
-                Array2::zeros(s.beta_shape)
-            }
-        };
-
         LayerNorm {
             epsilon: s.epsilon,
-            gamma,
-            beta,
+            gamma: rebuild_array2_or_zeros(s.gamma_shape, &s.gamma_data, "gamma"),
+            beta: rebuild_array2_or_zeros(s.beta_shape, &s.beta_data, "beta"),
             optimizer_gamma: s.optimizer_gamma.to_adam(),
             optimizer_beta: s.optimizer_beta.to_adam(),
             grad_gamma_accum: Array2::zeros(s.gamma_shape),
@@ -527,24 +449,9 @@ impl SerializableLayer {
         s: &SerializableOutputProjection,
         _vocab_size: usize,
     ) -> OutputProjection {
-        let w_out = match Array2::from_shape_vec(s.w_out_shape, s.w_out_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct w_out: {}", e);
-                Array2::zeros(s.w_out_shape)
-            }
-        };
-        let b_out = match Array2::from_shape_vec(s.b_out_shape, s.b_out_data.clone()) {
-            Ok(arr) => arr,
-            Err(e) => {
-                log::error!("Failed to reconstruct b_out: {}", e);
-                Array2::zeros(s.b_out_shape)
-            }
-        };
-
         OutputProjection {
-            w_out,
-            b_out,
+            w_out: rebuild_array2_or_zeros(s.w_out_shape, &s.w_out_data, "w_out"),
+            b_out: rebuild_array2_or_zeros(s.b_out_shape, &s.b_out_data, "b_out"),
             optimizer: s.optimizer.to_adam(),
             grad_w_out_accum: Array2::zeros(s.w_out_shape),
             grad_b_out_accum: Array2::zeros(s.b_out_shape),
@@ -608,30 +515,27 @@ pub struct TrainingInfo {
 // 主要 API
 // ============================================================================
 
-/// 保存模型到二进制文件
-pub fn save_model_binary<P: AsRef<Path>>(
-    model: &LLM,
-    path: P,
-) -> Result<(), Box<dyn std::error::Error>> {
-    println!("💾 开始保存模型到二进制文件...");
-    println!("   路径: {:?}", path.as_ref());
-
-    let mut serializable_layers = Vec::new();
+/// 先把运行中的 LLM 显式展开成可序列化结构，避免 binary/json 两条保存路径重复拼装模型。
+fn build_serializable_model(model: &LLM) -> Result<SerializableModel, std::io::Error> {
+    let mut serializable_layers = Vec::with_capacity(model.network.len());
     for (i, layer) in model.network.iter().enumerate() {
         print!("   [{}] 序列化 {} 层...", i + 1, layer.layer_type());
         match SerializableLayer::from_layer(layer) {
-            Ok(s_layer) => {
-                serializable_layers.push(s_layer);
+            Ok(serialized_layer) => {
+                serializable_layers.push(serialized_layer);
                 println!(" ✓");
             }
-            Err(e) => {
+            Err(error) => {
                 println!(" ✗");
-                return Err(format!("Failed to serialize layer {}: {}", i, e).into());
+                return Err(std::io::Error::other(format!(
+                    "Failed to serialize layer {}: {}",
+                    i, error
+                )));
             }
         }
     }
 
-    let serializable_model = SerializableModel {
+    Ok(SerializableModel {
         version: 1,
         vocab: model.vocab.clone(),
         layers: serializable_layers,
@@ -644,7 +548,49 @@ pub fn save_model_binary<P: AsRef<Path>>(
             max_seq_len: model.max_context_length,
             training_info: None,
         },
-    };
+    })
+}
+
+/// 把磁盘上的 SerializableModel 重建回可运行的 LLM，避免 binary/json 两条加载路径重复回填运行时字段。
+fn build_llm_from_serializable(serializable_model: SerializableModel) -> LLM {
+    let SerializableModel {
+        vocab,
+        layers,
+        context_window,
+        metadata,
+        ..
+    } = serializable_model;
+
+    let vocab_size = vocab.words.len();
+    let vocab_len = vocab.len();
+    let mut network: Vec<Box<dyn Layer>> = Vec::with_capacity(layers.len());
+    for (i, serializable_layer) in layers.iter().enumerate() {
+        print!("   [{}] 重建层...", i + 1);
+        network.push(serializable_layer.to_layer(vocab_len));
+        println!(" ✓");
+    }
+
+    LLM {
+        vocab,
+        network,
+        context_window,
+        max_context_length: metadata.max_seq_len,
+        training: false,
+        sampling_prob_buffer: Vec::with_capacity(vocab_size),
+        sampling_idx_buffer: Vec::with_capacity(vocab_size),
+        beam_candidates_buffer: Vec::with_capacity(50),
+    }
+}
+
+/// 保存模型到二进制文件
+pub fn save_model_binary<P: AsRef<Path>>(
+    model: &LLM,
+    path: P,
+) -> Result<(), Box<dyn std::error::Error>> {
+    println!("💾 开始保存模型到二进制文件...");
+    println!("   路径: {:?}", path.as_ref());
+
+    let serializable_model = build_serializable_model(model)?;
 
     print!("   写入文件...");
     let file = File::create(path.as_ref())?;
@@ -678,25 +624,7 @@ pub fn load_model_binary<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::er
     println!("   词汇量: {}", serializable_model.vocab.len());
     println!("   网络层数: {}", serializable_model.layers.len());
 
-    let mut network: Vec<Box<dyn Layer>> = Vec::new();
-    for (i, s_layer) in serializable_model.layers.iter().enumerate() {
-        print!("   [{}] 重建层...", i + 1);
-        let layer = s_layer.to_layer(serializable_model.vocab.len());
-        network.push(layer);
-        println!(" ✓");
-    }
-
-    let vocab_size = serializable_model.vocab.words.len();
-    let llm = LLM {
-        vocab: serializable_model.vocab,
-        network,
-        context_window: serializable_model.context_window,
-        max_context_length: serializable_model.metadata.max_seq_len,
-        training: false,
-        sampling_prob_buffer: Vec::with_capacity(vocab_size),
-        sampling_idx_buffer: Vec::with_capacity(vocab_size),
-        beam_candidates_buffer: Vec::with_capacity(50),
-    };
+    let llm = build_llm_from_serializable(serializable_model);
 
     println!("✅ 模型加载成功!");
     println!("   总参数量: {}", llm.total_parameters());
@@ -712,35 +640,7 @@ pub fn save_model_json<P: AsRef<Path>>(
     println!("💾 开始保存模型到 JSON 文件...");
     println!("   路径: {:?}", path.as_ref());
 
-    let mut serializable_layers = Vec::new();
-    for (i, layer) in model.network.iter().enumerate() {
-        print!("   [{}] 序列化 {} 层...", i + 1, layer.layer_type());
-        match SerializableLayer::from_layer(layer) {
-            Ok(s_layer) => {
-                serializable_layers.push(s_layer);
-                println!(" ✓");
-            }
-            Err(e) => {
-                println!(" ✗");
-                return Err(format!("Failed to serialize layer {}: {}", i, e).into());
-            }
-        }
-    }
-
-    let serializable_model = SerializableModel {
-        version: 1,
-        vocab: model.vocab.clone(),
-        layers: serializable_layers,
-        context_window: model.context_window.clone(),
-        metadata: ModelMetadata {
-            embedding_dim: EMBEDDING_DIM,
-            hidden_dim: HIDDEN_DIM,
-            num_transformer_blocks: count_transformer_blocks(&model.network),
-            vocab_size: model.vocab.len(),
-            max_seq_len: model.max_context_length,
-            training_info: None,
-        },
-    };
+    let serializable_model = build_serializable_model(model)?;
 
     print!("   写入 JSON 文件...");
     let file = File::create(path.as_ref())?;
@@ -771,25 +671,7 @@ pub fn load_model_json<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::erro
     println!("   词汇量: {}", serializable_model.vocab.len());
     println!("   网络层数: {}", serializable_model.layers.len());
 
-    let mut network: Vec<Box<dyn Layer>> = Vec::new();
-    for (i, s_layer) in serializable_model.layers.iter().enumerate() {
-        print!("   [{}] 重建层...", i + 1);
-        let layer = s_layer.to_layer(serializable_model.vocab.len());
-        network.push(layer);
-        println!(" ✓");
-    }
-
-    let vocab_size = serializable_model.vocab.words.len();
-    let llm = LLM {
-        vocab: serializable_model.vocab,
-        network,
-        context_window: serializable_model.context_window,
-        max_context_length: serializable_model.metadata.max_seq_len,
-        training: false,
-        sampling_prob_buffer: Vec::with_capacity(vocab_size),
-        sampling_idx_buffer: Vec::with_capacity(vocab_size),
-        beam_candidates_buffer: Vec::with_capacity(50),
-    };
+    let llm = build_llm_from_serializable(serializable_model);
 
     println!("✅ 模型加载成功!");
     println!("   总参数量: {}", llm.total_parameters());
