@@ -50,6 +50,10 @@ pub struct SessionSnapshot {
     kv_caches: Vec<Option<(Array2<f32>, Array2<f32>)>>,
 }
 
+// 当 temperature 足够接近 0 时，语义上应退化为 greedy / argmax。
+// 这里给出一个保守阈值，避免概率幂变换在极端温度下把整行压成 0。
+const GREEDY_TEMPERATURE_EPS: f32 = 1e-4;
+
 pub struct InferenceSession<'a> {
     llm: &'a mut LLM,
     processed_tokens: usize,
@@ -116,15 +120,8 @@ impl<'a> InferenceSession<'a> {
 
     pub fn sample_next_token(&mut self, logits: &Array2<f32>) -> usize {
         let probs = softmax(logits);
-        let adjusted = LLM::apply_temperature(&probs, self.temperature);
-
-        let candidates = if self.top_k > 0 {
-            self.llm.top_k_sampling(&adjusted, self.top_k)
-        } else {
-            self.llm.top_p_sampling(&adjusted, self.top_p)
-        };
-
-        candidates.into_iter().next().unwrap_or(0)
+        self.llm
+            .sample_token_from_probs(&probs, self.temperature, self.top_p, self.top_k)
     }
 
     pub fn snapshot(&mut self) -> SessionSnapshot {
@@ -505,6 +502,46 @@ impl LLM {
         let top_slice = &mut self.sampling_idx_buffer[..top_k];
         top_slice.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
         top_slice.iter().map(|&(prob, idx)| (idx, prob)).collect()
+    }
+
+    fn argmax_index(values: &[f32]) -> usize {
+        let mut best_idx = 0usize;
+        let mut best_value = f32::NEG_INFINITY;
+
+        for (idx, &value) in values.iter().enumerate() {
+            if value > best_value {
+                best_idx = idx;
+                best_value = value;
+            }
+        }
+
+        best_idx
+    }
+
+    fn sample_token_from_probs(
+        &mut self,
+        probs: &Array2<f32>,
+        temperature: f32,
+        top_p: f32,
+        top_k: usize,
+    ) -> usize {
+        let last_row = probs.row(probs.nrows().saturating_sub(1));
+        if temperature <= GREEDY_TEMPERATURE_EPS {
+            let greedy: Vec<f32> = last_row.iter().copied().collect();
+            return Self::argmax_index(&greedy);
+        }
+
+        let adjusted = Self::apply_temperature(probs, temperature);
+        let candidates = if top_k > 0 {
+            self.top_k_sampling(&adjusted, top_k)
+        } else {
+            self.top_p_sampling(&adjusted, top_p)
+        };
+
+        candidates
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| Self::argmax_index(&last_row.iter().copied().collect::<Vec<_>>()))
     }
 
     /// 当前增量推理的最低要求：首层必须是 Embeddings。
@@ -1559,20 +1596,44 @@ impl LLM {
             return probs.clone();
         }
 
-        let power = 1.0 / temperature;
+        // 直接对概率做 `powf(1 / temperature)` 在极小 temperature 下容易整体下溢为 0，
+        // 最终让采样退化到“sum == 0 -> 随机 token”。
+        //
+        // 这里改为在 log 概率空间完成同等变换：
+        //   p_i^(1/T) / Z  ==  softmax(log(p_i) / T)
+        // 并通过“减去行内最大 logit”保持数值稳定。
         let mut adjusted = probs.clone();
 
         for mut row in adjusted.rows_mut() {
-            let mut sum = 0.0;
-            for value in row.iter_mut() {
-                *value = (*value).max(SOFTMAX_EPSILON).powf(power);
+            let original_row: Vec<f32> = row.iter().copied().collect();
+            let scaled_logs: Vec<f32> = original_row
+                .iter()
+                .map(|&value| value.max(SOFTMAX_EPSILON).ln() / temperature)
+                .collect();
+
+            let max_scaled_log = scaled_logs
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max);
+
+            if !max_scaled_log.is_finite() {
+                continue;
+            }
+
+            let mut sum = 0.0_f32;
+            for (value, scaled_log) in row.iter_mut().zip(scaled_logs.iter().copied()) {
+                *value = (scaled_log - max_scaled_log).exp();
                 sum += *value;
             }
 
-            if sum > 0.0 {
+            if sum > 0.0 && sum.is_finite() {
                 for value in row.iter_mut() {
                     *value /= sum;
                 }
+            } else {
+                let argmax = Self::argmax_index(&original_row);
+                row.fill(0.0);
+                row[argmax] = 1.0;
             }
         }
 
@@ -1679,8 +1740,8 @@ impl LLM {
         let mut rng = rng();
         let sum: f32 = probs.iter().sum();
 
-        if sum == 0.0 {
-            return rng.random_range(0..probs.len());
+        if !(sum.is_finite() && sum > 0.0) {
+            return Self::argmax_index(probs);
         }
 
         let mut normalized_probs = Vec::new();
@@ -1752,19 +1813,7 @@ impl LLM {
                 .insert_axis(Axis(0));
 
             let probs = softmax(&last_logit);
-            let adjusted_probs = Self::apply_temperature(&probs, temperature);
-
-            let next_token = if top_k > 0 {
-                self.top_k_sampling(&adjusted_probs, top_k)
-                    .into_iter()
-                    .next()
-                    .unwrap_or(0)
-            } else {
-                self.top_p_sampling(&adjusted_probs, top_p)
-                    .into_iter()
-                    .next()
-                    .unwrap_or(0)
-            };
+            let next_token = self.sample_token_from_probs(&probs, temperature, top_p, top_k);
 
             output_tokens.push(next_token);
             tokenized.push(next_token);
@@ -2474,5 +2523,45 @@ mod tests {
         assert!(max_diff(&embedding_weights(&monitored), &embedding_weights(&manual)) < tol);
         assert!(max_diff(&output_weights(&monitored), &output_weights(&manual)) < tol);
         assert!(max_diff(&output_bias(&monitored), &output_bias(&manual)) < tol);
+    }
+
+    #[test]
+    fn apply_temperature_keeps_extremely_low_temperature_sampling_stable() {
+        let probs = arr2(&[[0.7_f32, 0.2_f32, 0.1_f32]]);
+        let adjusted = LLM::apply_temperature(&probs, 1e-6);
+
+        let sum: f32 = adjusted.row(0).sum();
+        assert!(
+            (sum - 1.0).abs() < 1e-6,
+            "temperature-adjusted probabilities should stay normalized"
+        );
+        assert!(
+            adjusted.iter().all(|value| value.is_finite()),
+            "temperature-adjusted probabilities should stay finite"
+        );
+        assert!(
+            adjusted[[0, 0]] > 0.999_999,
+            "very low temperature should collapse toward the argmax token instead of random fallback"
+        );
+        assert!(adjusted[[0, 1]] < 1e-6);
+        assert!(adjusted[[0, 2]] < 1e-6);
+    }
+
+    #[test]
+    fn sample_token_from_probs_uses_greedy_path_for_non_positive_temperature() {
+        let vocab = Vocab::build_from_texts(&["a".to_string(), "b".to_string(), "c".to_string()]);
+        let mut model = make_two_layer_training_model(vocab);
+        let probs = arr2(&[[0.1_f32, 0.7_f32, 0.2_f32]]);
+
+        let next = model.sample_token_from_probs(&probs, 0.0, 0.9, 0);
+        assert_eq!(next, 1);
+    }
+
+    #[test]
+    fn sample_from_probs_zero_sum_falls_back_to_argmax_instead_of_random() {
+        let vocab = Vocab::build_from_texts(&["a".to_string(), "b".to_string(), "c".to_string()]);
+        let model = make_two_layer_training_model(vocab);
+        let choice = model.sample_from_probs(&[0.0_f32, 0.0_f32, 0.0_f32]);
+        assert_eq!(choice, 0);
     }
 }
