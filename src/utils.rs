@@ -7,6 +7,14 @@ use rand::Rng;
 // Softmax专用的epsilon常量（避免除零）
 const SOFTMAX_EPS: f32 = 1e-12;
 
+fn uniform_prob_value(class_count: usize) -> f32 {
+    1.0 / (class_count.max(1) as f32)
+}
+
+fn uniform_log_prob_value(class_count: usize) -> f32 {
+    -((class_count.max(1) as f32).ln())
+}
+
 /// Softmax激活函数
 ///
 /// 对输入张量的每一行应用softmax，将数值转换为概率分布。
@@ -24,16 +32,36 @@ const SOFTMAX_EPS: f32 = 1e-12;
 pub fn softmax(logits: &Array2<f32>) -> Array2<f32> {
     let mut result = logits.clone();
 
-    for mut row in result.rows_mut() {
+    for (row_idx, mut row) in result.rows_mut().into_iter().enumerate() {
         // 找到该行的最大值（用于数值稳定）
         let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        // 对通用 softmax 来说，整行出现 NaN / ±∞ 已经属于病态输入。
+        // 为避免 NaN 继续污染 loss 与梯度，这里退化为均匀分布。
+        if !max_val.is_finite() {
+            log::warn!(
+                "softmax: row {} contains non-finite values; falling back to uniform distribution",
+                row_idx
+            );
+            row.fill(uniform_prob_value(row.len()));
+            continue;
+        }
 
         // 计算exp(x - max)
         row.mapv_inplace(|x| (x - max_val).exp());
 
         // 归一化
         let sum_exp: f32 = row.sum();
-        row.mapv_inplace(|x| x / sum_exp.max(SOFTMAX_EPS));
+        if sum_exp.is_finite() && sum_exp > SOFTMAX_EPS {
+            row.mapv_inplace(|x| x / sum_exp);
+        } else {
+            log::warn!(
+                "softmax: row {} has invalid normalizer (sum_exp={}); falling back to uniform distribution",
+                row_idx,
+                sum_exp
+            );
+            row.fill(uniform_prob_value(row.len()));
+        }
     }
 
     result
@@ -46,17 +74,38 @@ pub fn softmax(logits: &Array2<f32>) -> Array2<f32> {
 pub fn log_softmax(logits: &Array2<f32>) -> Array2<f32> {
     let mut result = logits.clone();
 
-    for mut row in result.rows_mut() {
+    for (row_idx, mut row) in result.rows_mut().into_iter().enumerate() {
         // 数值稳定：减去该行最大值
         let max_val = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+        if !max_val.is_finite() {
+            log::warn!(
+                "log_softmax: row {} contains non-finite values; falling back to uniform log-probabilities",
+                row_idx
+            );
+            row.fill(uniform_log_prob_value(row.len()));
+            continue;
+        }
+
         // 先计算 shifted = x - max
         let mut sum_exp = 0.0f32;
         for v in row.iter_mut() {
             *v = *v - max_val;
             sum_exp += v.exp();
         }
+
+        if !(sum_exp.is_finite() && sum_exp > SOFTMAX_EPS) {
+            log::warn!(
+                "log_softmax: row {} has invalid normalizer (sum_exp={}); falling back to uniform log-probabilities",
+                row_idx,
+                sum_exp
+            );
+            row.fill(uniform_log_prob_value(row.len()));
+            continue;
+        }
+
         // logsumexp = log(sum(exp(shifted)))
-        let log_sum_exp = sum_exp.max(SOFTMAX_EPS).ln();
+        let log_sum_exp = sum_exp.ln();
         // log_softmax = shifted - logsumexp
         for v in row.iter_mut() {
             *v = *v - log_sum_exp;
@@ -162,6 +211,29 @@ mod tests {
         }
         // log_softmax 的指数应当归一化为1
         let sum_exp: f32 = (0..3).map(|i| ls[[0, i]].exp()).sum();
+        assert!((sum_exp - 1.0).abs() < 1e-6);
+    }
+    #[test]
+    fn test_softmax_all_neg_inf_falls_back_to_uniform() {
+        let input = Array2::from_shape_vec((1, 3), vec![f32::NEG_INFINITY; 3]).unwrap();
+        let output = softmax(&input);
+
+        for i in 0..3 {
+            assert!((output[[0, i]] - (1.0 / 3.0)).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn test_log_softmax_nan_row_falls_back_to_uniform_log_probs() {
+        let input = Array2::from_shape_vec((1, 3), vec![f32::NAN, 1.0, 2.0]).unwrap();
+        let output = log_softmax(&input);
+        let expected = -(3.0f32).ln();
+
+        for i in 0..3 {
+            assert!((output[[0, i]] - expected).abs() < 1e-6);
+        }
+
+        let sum_exp: f32 = (0..3).map(|i| output[[0, i]].exp()).sum();
         assert!((sum_exp - 1.0).abs() < 1e-6);
     }
 }
