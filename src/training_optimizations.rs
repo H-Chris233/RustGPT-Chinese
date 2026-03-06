@@ -7,8 +7,6 @@
 //!  4.  训练监控增强
 //!  5.  检查点管理集成
 
-use ndarray::{Array1, Array2};
-use crate::utils::log_softmax;
 use crate::llm::LLM;
 
 impl LLM {
@@ -44,57 +42,15 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
 
-                //  Forward  pass
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                // 前向传播：收集每层 ctx，供反向传播使用（避免缓存覆盖）
-                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
-                    Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                let log_probs = log_softmax(&logits);
-
-                //  Backward  pass
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output =
-                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
-                        Ok(Some(grads)) => grads,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                            continue;
-                        }
-                    };
-
-                let n_targets = target_ids
-                    .iter()
-                    .filter(|&&t| t != pad_token_id)
-                    .count();
-                if n_targets == 0 {
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
                     continue;
-                }
-                let loss_mean =
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
-                total_nll += loss_mean * (n_targets as f32);
-                total_tokens += n_targets;
-                Self::clip_gradients(&mut grads_output, 5.0);
+                };
 
-                for (layer, ctx) in self
-                    .network
-                    .iter_mut()
-                    .rev()
-                    .zip(layer_ctxs.iter().rev())
-                {
-                    grads_output = layer.backward(ctx, &grads_output, current_lr);
-                }
+                total_nll += step.loss_mean * (step.n_targets as f32);
+                total_tokens += step.n_targets;
+                Self::clip_gradients(&mut step.grads_output, 5.0);
+                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
 
             }
 
@@ -140,54 +96,15 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
 
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
-                    Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                let log_probs = log_softmax(&logits);
-
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output =
-                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
-                        Ok(Some(grads)) => grads,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                            continue;
-                        }
-                    };
-
-                let n_targets = target_ids
-                    .iter()
-                    .filter(|&&t| t != pad_token_id)
-                    .count();
-                if n_targets == 0 {
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
                     continue;
-                }
-                let loss_mean =
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
-                total_nll += loss_mean * (n_targets as f32);
-                total_tokens += n_targets;
-                Self::clip_gradients(&mut grads_output, 5.0);
+                };
 
-                for (layer, ctx) in self
-                    .network
-                    .iter_mut()
-                    .rev()
-                    .zip(layer_ctxs.iter().rev())
-                {
-                    grads_output = layer.backward(ctx, &grads_output, current_lr);
-                }
+                total_nll += step.loss_mean * (step.n_targets as f32);
+                total_tokens += step.n_targets;
+                Self::clip_gradients(&mut step.grads_output, 5.0);
+                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
 
             }
 
@@ -246,54 +163,15 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
 
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
-                    Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                let log_probs = log_softmax(&logits);
-
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output =
-                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
-                        Ok(Some(grads)) => grads,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                            continue;
-                        }
-                    };
-
-                let n_targets = target_ids
-                    .iter()
-                    .filter(|&&t| t != pad_token_id)
-                    .count();
-                if n_targets == 0 {
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
                     continue;
-                }
-                let loss_mean =
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
-                total_nll += loss_mean * (n_targets as f32);
-                total_tokens += n_targets;
-                Self::clip_gradients(&mut grads_output, 5.0);
+                };
 
-                for (layer, ctx) in self
-                    .network
-                    .iter_mut()
-                    .rev()
-                    .zip(layer_ctxs.iter().rev())
-                {
-                    grads_output = layer.backward(ctx, &grads_output, current_lr);
-                }
+                total_nll += step.loss_mean * (step.n_targets as f32);
+                total_tokens += step.n_targets;
+                Self::clip_gradients(&mut step.grads_output, 5.0);
+                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
 
             }
 
@@ -371,58 +249,19 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
 
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
-                    Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                let log_probs = log_softmax(&logits);
-
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output =
-                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
-                        Ok(Some(grads)) => grads,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                            continue;
-                        }
-                    };
-
-                let n_targets = target_ids
-                    .iter()
-                    .filter(|&&t| t != pad_token_id)
-                    .count();
-                if n_targets == 0 {
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
                     continue;
-                }
-                let loss_mean =
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
-                total_nll += loss_mean * (n_targets as f32);
-                total_tokens += n_targets;
+                };
+
+                total_nll += step.loss_mean * (step.n_targets as f32);
+                total_tokens += step.n_targets;
 
                 //  记录梯度范数
-                total_grad_norm += Self::compute_grad_norm(&grads_output);
+                total_grad_norm += Self::compute_grad_norm(&step.grads_output);
 
-                Self::clip_gradients(&mut grads_output, 5.0);
-
-                for (layer, ctx) in self
-                    .network
-                    .iter_mut()
-                    .rev()
-                    .zip(layer_ctxs.iter().rev())
-                {
-                    grads_output = layer.backward(ctx, &grads_output, current_lr);
-                }
+                Self::clip_gradients(&mut step.grads_output, 5.0);
+                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
 
                 sample_count += 1;
             }
@@ -552,59 +391,20 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
 
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                let mut layer_ctxs: Vec<crate::llm::LayerContext> =
-                    Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                let log_probs = log_softmax(&logits);
-
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output =
-                    match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
-                        Ok(Some(grads)) => grads,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                            continue;
-                        }
-                    };
-
-                let n_targets = target_ids
-                    .iter()
-                    .filter(|&&t| t != pad_token_id)
-                    .count();
-                if n_targets == 0 {
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
                     continue;
-                }
-                let loss_mean =
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
-                total_nll += loss_mean * (n_targets as f32);
-                total_tokens += n_targets;
+                };
+
+                total_nll += step.loss_mean * (step.n_targets as f32);
+                total_tokens += step.n_targets;
 
                 //  记录梯度范数
-                total_grad_norm += Self::compute_grad_norm(&grads_output);
+                total_grad_norm += Self::compute_grad_norm(&step.grads_output);
 
                 // 与 `train_monitored()` 保持一致：使用更严格的裁剪阈值提升稳定性。
-                Self::clip_gradients(&mut grads_output, 1.0);
-
-                for (layer, ctx) in self
-                    .network
-                    .iter_mut()
-                    .rev()
-                    .zip(layer_ctxs.iter().rev())
-                {
-                    grads_output = layer.backward(ctx, &grads_output, current_lr);
-                }
+                Self::clip_gradients(&mut step.grads_output, 1.0);
+                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
 
                 sample_count += 1;
             }

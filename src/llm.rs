@@ -285,6 +285,21 @@ pub enum TrainingSignalError {
     },
 }
 
+
+/// 单样本训练步的中间结果。
+///
+/// 说明：
+/// - `layer_ctxs`：逐层保存的前向上下文，供 backward/accumulate 使用；
+/// - `grads_output`：loss 对 logits 的梯度；
+/// - `loss_mean`：按有效 token 平均后的交叉熵；
+/// - `n_targets`：有效 target（非 PAD）数量。
+pub(crate) struct PreparedTrainingStep {
+    pub(crate) layer_ctxs: Vec<LayerContext>,
+    pub(crate) grads_output: Array2<f32>,
+    pub(crate) loss_mean: f32,
+    pub(crate) n_targets: usize,
+}
+
 /// 早停机制
 ///
 /// 监控训练loss，如果长时间不改善则自动停止训练
@@ -711,60 +726,14 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1]; // Exclude the last token
                 let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab. 
 
-                // Forward pass
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                // ==========================
-                // 前向传播（显式上下文）
-                // ==========================
-                //
-                // 教学说明：
-                // - 新版 Layer::forward 返回 (output, ctx)；
-                // - ctx 保存 backward 所需的中间量（例如 FFN 的激活、Attention 的权重、Dropout 的 mask 等）；
-                // - 我们把每一层的 ctx 按顺序存入 `layer_ctxs`，并在反向传播时按相反顺序取回。
-                //
-                // 这样即便未来实现“真正 batch”，也不会再出现“forward 缓存被覆盖导致静默错误梯度”的问题。
-                let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                let log_probs = log_softmax(&logits);
-
-                // Backward pass: grad = softmax(logits) - one_hot
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = match Self::compute_gradients_step(
-                    &probs,
-                    target_ids,
-                    pad_token_id,
-                ) {
-                    Ok(Some(grads)) => grads,
-                    Ok(None) => continue, // 全 PAD：跳过 optimizer step，避免 Adam 动量漂移
-                    Err(err) => {
-                        log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                        continue;
-                    }
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
+                    continue;
                 };
 
-                total_loss +=
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
-
-                Self::clip_gradients(&mut grads_output, 1.0);
-
-                for (layer, ctx) in self
-                    .network
-                    .iter_mut()
-                    .rev()
-                    .zip(layer_ctxs.iter().rev())
-                {
-                    grads_output = layer.backward(ctx, &grads_output, current_lr);
-                }
+                total_loss += step.loss_mean;
+                Self::clip_gradients(&mut step.grads_output, 1.0);
+                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
                 sample_count += 1;
             }
 
@@ -813,53 +782,16 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
 
-                // 前向传播
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                // 前向传播：收集每层 ctx，供反向传播使用（避免缓存覆盖）
-                let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                // 使用 log_softmax + NLL 提升数值稳定性
-                let log_probs = log_softmax(&logits);
-
-                // 反向传播：grad = softmax(logits) - one_hot
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = match Self::compute_gradients_step(
-                    &probs,
-                    target_ids,
-                    pad_token_id,
-                ) {
-                    Ok(Some(grads)) => grads,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                        continue;
-                    }
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
+                    continue;
                 };
 
-                total_loss +=
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+                total_loss += step.loss_mean;
 
                 // 更强的梯度裁剪提升稳定性
-                Self::clip_gradients(&mut grads_output, 1.0);
-
-                for (layer, ctx) in self
-                    .network
-                    .iter_mut()
-                    .rev()
-                    .zip(layer_ctxs.iter().rev())
-                {
-                    grads_output = layer.backward(ctx, &grads_output, current_lr);
-                }
+                Self::clip_gradients(&mut step.grads_output, 1.0);
+                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
 
                 sample_count += 1;
             }
@@ -1075,6 +1007,74 @@ impl LLM {
         }
     }
 
+
+    /// 单样本训练步：执行前向传播，收集 ctx，并计算 loss 与 dL/dlogits。
+    ///
+    /// 返回 `None` 表示当前样本没有有效训练信号（例如全 PAD）。
+    pub(crate) fn prepare_training_step(
+        &mut self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+        pad_token_id: usize,
+    ) -> Option<PreparedTrainingStep> {
+        let n_targets = target_ids.iter().filter(|&&t| t != pad_token_id).count();
+        if input_ids.is_empty() || n_targets == 0 {
+            return None;
+        }
+
+        let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
+        input
+            .row_mut(0)
+            .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
+
+        let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
+        for layer in &mut self.network {
+            let (out, ctx) = layer.forward(&input);
+            layer_ctxs.push(ctx);
+            input = out;
+        }
+
+        let log_probs = log_softmax(&input);
+        let probs = log_probs.mapv(|x| x.exp());
+        let grads_output = match Self::compute_gradients_step(&probs, target_ids, pad_token_id) {
+            Ok(Some(grads)) => grads,
+            Ok(None) => return None,
+            Err(err) => {
+                log::error!("训练信号错误({err:?})，已跳过 optimizer step");
+                return None;
+            }
+        };
+
+        let loss_mean = Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
+
+        Some(PreparedTrainingStep {
+            layer_ctxs,
+            grads_output,
+            loss_mean,
+            n_targets,
+        })
+    }
+
+    /// 逐层取回 ctx 并执行标准反向传播。
+    pub(crate) fn backward_with_ctx(
+        &mut self,
+        layer_ctxs: &[LayerContext],
+        grads_output: &Array2<f32>,
+        lr: f32,
+    ) -> Array2<f32> {
+        assert_eq!(
+            layer_ctxs.len(),
+            self.network.len(),
+            "LLM.backward_with_ctx: layer_ctxs.len() must equal network.len()"
+        );
+
+        let mut grads = grads_output.clone();
+        for (layer, ctx) in self.network.iter_mut().rev().zip(layer_ctxs.iter().rev()) {
+            grads = layer.backward(ctx, &grads, lr);
+        }
+        grads
+    }
+
     /// 完整优化的训练方法（集成并行预处理与监控）
     ///
     /// # 特性
@@ -1172,60 +1172,15 @@ impl LLM {
                 // 前向传播
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
-                let n_targets = target_ids
-                    .iter()
-                    .filter(|&&t| t != pad_token_id)
-                    .count();
-                if n_targets == 0 {
+                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                else {
                     continue;
-                }
-
-                let mut input: Array2<f32> = Array2::zeros((1, input_ids.len()));
-                input
-                    .row_mut(0)
-                    .assign(&input_ids.iter().map(|&x| x as f32).collect::<Array1<f32>>());
-
-                // 前向传播：必须显式收集每层 ctx，供梯度累积路径使用。
-                //
-                // 教学说明：
-                // - 在**旧版**实现中，各层会把中间量写入 `self.cached_*`，若不立刻 backward 就可能被覆盖；
-                // - 本轮重构已将中间量改为 **ctx 驱动**（forward 返回 ctx，反传显式消费 ctx），从而可以逐步
-                //   删除 `cached_*` 字段并避免“层内缓存污染”；
-                // - 但梯度累积仍然有一个不变的约束：必须为每个 micro-batch 保留其对应的 `layer_ctxs`，
-                //   并在累积反传时把 ctx 逐层归还（否则中间量会丢失/错配）。
-                let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
-                for layer in &mut self.network {
-                    let (out, ctx) = layer.forward(&input);
-                    layer_ctxs.push(ctx);
-                    input = out;
-                }
-
-                let logits = input;
-                let log_probs = log_softmax(&logits);
-
-                // 计算输出梯度
-                let probs = log_probs.mapv(|x| x.exp());
-                let mut grads_output = match Self::compute_gradients_step(
-                    &probs,
-                    target_ids,
-                    pad_token_id,
-                ) {
-                    Ok(Some(grads)) => grads,
-                    Ok(None) => continue,
-                    Err(err) => {
-                        log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                        continue;
-                    }
                 };
 
-                let loss_mean =
-                    Self::cross_entropy_from_log_probs(&log_probs, target_ids, pad_token_id);
-                total_nll += loss_mean * (n_targets as f32);
-                total_tokens += n_targets;
-
-                total_grad_norm += Self::compute_grad_norm(&grads_output);
-
-                Self::clip_gradients(&mut grads_output, 1.0);
+                total_nll += step.loss_mean * (step.n_targets as f32);
+                total_tokens += step.n_targets;
+                total_grad_norm += Self::compute_grad_norm(&step.grads_output);
+                Self::clip_gradients(&mut step.grads_output, 1.0);
 
                 // ==========================
                 // 正确的梯度累积实现
@@ -1241,10 +1196,11 @@ impl LLM {
                 // - 若直接对 micro-batch 求平均，会变成 sequence-weighted（每条序列权重相同）；
                 // - 我们把 logits 梯度乘回 n_targets，使其对应 “sum NLL” 的梯度，
                 //   然后在 step 时用 `scale = 1/accum_tokens` 做统一平均，得到 token-weighted 梯度。
-                grads_output.mapv_inplace(|x| x * (n_targets as f32));
-                self.backward_accumulate_with_ctx(&layer_ctxs, &grads_output);
+                step.grads_output
+                    .mapv_inplace(|x| x * (step.n_targets as f32));
+                self.backward_accumulate_with_ctx(&step.layer_ctxs, &step.grads_output);
                 accum_counter += 1;
-                accum_tokens += n_targets;
+                accum_tokens += step.n_targets;
                 if accum_counter >= effective_accum_steps {
                     self.step_accumulated(current_lr, 1.0 / accum_tokens as f32);
                     accum_counter = 0;
@@ -1422,67 +1378,17 @@ impl LLM {
                     let sample_ids: Vec<usize> =
                         sample_tokens.iter().take(target_len).copied().collect();
 
-                    // forward
-                    let mut input: Array2<f32> = Array2::zeros((1, sample_ids.len()));
-                    input.row_mut(0).assign(
-                        &sample_ids
-                            .iter()
-                            .map(|&x| x as f32)
-                            .collect::<Array1<f32>>(),
-                    );
-
-                    // ==========================
-                    // forward（显式上下文）
-                    // ==========================
-                    //
-                    // 教学说明：
-                    // - 本项目 Layer 的 backward 需要 forward 的中间量；
-                    // - 旧版把中间量缓存在 self 中，batch 内多次 forward 会覆盖缓存；
-                    // - 新版把中间量放到 ctx 中，因此我们必须在 forward 时收集每层 ctx。
-                    let mut layer_ctxs: Vec<LayerContext> =
-                        Vec::with_capacity(self.network.len());
-                    for layer in &mut self.network {
-                        let (out, ctx) = layer.forward(&input);
-                        layer_ctxs.push(ctx);
-                        input = out;
-                    }
-
-                    let logits = input;
-                    let log_probs = log_softmax(&logits);
-
-                    // grads (dL/dlogits)
-                    let probs = log_probs.mapv(|x| x.exp());
-                    let mut grads = match Self::compute_gradients_step(
-                        &probs,
-                        &target_ids,
-                        pad_token_id,
-                    ) {
-                        Ok(Some(grads)) => grads,
-                        Ok(None) => continue,
-                        Err(err) => {
-                            log::error!("训练信号错误({err:?})，已跳过 optimizer step");
-                            continue;
-                        }
+                    let Some(mut step) = self.prepare_training_step(&sample_ids, &target_ids, pad_token_id)
+                    else {
+                        continue;
                     };
 
                     // loss（仅在本步会更新参数时计入）
-                    total_loss +=
-                        Self::cross_entropy_from_log_probs(&log_probs, &target_ids, pad_token_id);
+                    total_loss += step.loss_mean;
 
-                    total_grad_norm += Self::compute_grad_norm(&grads);
-                    Self::clip_gradients(&mut grads, 1.0);
-
-                    // ==========================
-                    // backward（按层取回 ctx）
-                    // ==========================
-                    for (layer, ctx) in self
-                        .network
-                        .iter_mut()
-                        .rev()
-                        .zip(layer_ctxs.iter().rev())
-                    {
-                        grads = layer.backward(ctx, &grads, current_lr);
-                    }
+                    total_grad_norm += Self::compute_grad_norm(&step.grads_output);
+                    Self::clip_gradients(&mut step.grads_output, 1.0);
+                    self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
 
                     sample_count += 1;
                 }
