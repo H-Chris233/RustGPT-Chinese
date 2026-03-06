@@ -363,7 +363,11 @@ impl CheckpointManager {
         Ok((llm, checkpoint.metadata))
     }
 
-    /// 获取最佳检查点路径
+    /// 获取当前“最佳 checkpoint”对应的文件路径。
+    ///
+    /// 说明：
+    /// - 这里依赖管理器内部记录的 `best_loss` 判断当前是否存在 best checkpoint；
+    /// - 真正选中的文件来自磁盘扫描结果，并按文件修改时间取最新一个。
     pub fn get_best_checkpoint(&self) -> Option<PathBuf> {
         if self.best_loss == f32::INFINITY {
             return None;
@@ -387,7 +391,10 @@ impl CheckpointManager {
         best_checkpoints.first().map(|entry| entry.path())
     }
 
-    /// 获取最新检查点路径
+    /// 获取 `checkpoint_last.bin` 的路径。
+    ///
+    /// 这个接口只反映“最近一次保存的 last checkpoint 是否存在”，
+    /// 不负责判断它是否也是最佳模型。
     pub fn get_last_checkpoint(&self) -> Option<PathBuf> {
         let last_path = self.checkpoint_dir.join("checkpoint_last.bin");
         if last_path.exists() {
@@ -427,7 +434,10 @@ impl CheckpointManager {
         Ok(checkpoints)
     }
 
-    /// 清理旧的检查点，只保留最佳的N个
+    /// 清理多余的 best checkpoint，仅保留 loss 最优的前 `keep_best_n` 个。
+    ///
+    /// 教学说明：这里按 metadata 中的 `loss` 排序，而不是按文件时间排序，
+    /// 因为“最新保存”不一定等于“损失最优”。
     fn cleanup_old_checkpoints(&self) -> Result<(), String> {
         let mut best_checkpoints: Vec<_> = fs::read_dir(&self.checkpoint_dir)
             .map_err(|e| format!("读取检查点目录失败: {}", e))?

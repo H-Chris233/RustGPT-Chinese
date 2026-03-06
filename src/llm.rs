@@ -290,7 +290,7 @@ pub enum TrainingSignalError {
 ///
 /// 说明：
 /// - `layer_ctxs`：逐层保存前向传播上下文，供 `backward_with_ctx()` 或梯度累积流程复用；
-/// - `grads_output`：loss 对 logits 的梯度；
+/// - `grads_output`：loss 对 logits 的梯度，且当前口径已经按有效 token 做过平均；
 /// - `loss_mean`：按有效 token 平均后的交叉熵；
 /// - `n_targets`：有效 target（非 PAD）数量。
 pub(crate) struct PreparedTrainingStep {
@@ -699,6 +699,12 @@ impl LLM {
         output_tokens
     }
 
+    /// 最基础的教学训练入口。
+    ///
+    /// 说明：
+    /// - 保留最少参数，便于讲解“tokenize -> forward -> loss -> backward”主线；
+    /// - 学习率使用简单指数衰减；
+    /// - 每个样本独立更新一次参数，不包含早停、checkpoint 或梯度累积。
     pub fn train(&mut self, data: Vec<&str>, epochs: usize, initial_lr: f32) {
         self.set_training_mode(true);
 
@@ -723,9 +729,9 @@ impl LLM {
                     continue;
                 }
 
-                // 1. Slice input and targets
-                let input_ids = &training_row[..training_row.len() - 1]; // Exclude the last token
-                let target_ids = &training_row[1..]; // This is a vector. Each element is the index in the vocab. 
+                // 训练样本按“前 N-1 个 token 预测后 N-1 个 token”切分。
+                let input_ids = &training_row[..training_row.len() - 1];
+                let target_ids = &training_row[1..];
 
                 let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
                 else {
@@ -950,9 +956,13 @@ impl LLM {
     }
 
 
-    /// 单样本训练步：执行前向传播，收集 ctx，并计算 loss 与 dL/dlogits。
+    /// 单样本训练步：执行前向传播，收集 ctx，并计算 loss 与 `dL/dlogits`。
     ///
-    /// 返回 `None` 表示当前样本没有有效训练信号（例如全 PAD）。
+    /// 教学说明：
+    /// - 这是当前训练主线的核心拼装点，负责把“一个样本”整理成可反传的数据包；
+    /// - 它只做 `forward + ctx 收集 + loss/梯度构造`，不直接执行参数更新；
+    /// - 调用方随后还需要决定是立刻 `backward_with_ctx()`，还是先走梯度累积路径；
+    /// - 返回 `None` 表示当前样本没有有效训练信号（例如输入为空、target 全 PAD，或训练信号非法）。
     pub(crate) fn prepare_training_step(
         &mut self,
         input_ids: &[usize],
@@ -998,6 +1008,11 @@ impl LLM {
     }
 
     /// 逐层取回 ctx 并执行标准反向传播。
+    ///
+    /// 与旧版 `cached_*` 隐式缓存不同，这里显式消费每层 forward 返回的 `ctx`：
+    /// - 这样更容易看清数据流；
+    /// - 也避免多个样本/多次 forward 之间发生中间量覆盖；
+    /// - 该路径会在各层 `backward()` 中立即应用参数更新，对应“标准单步训练”。
     pub(crate) fn backward_with_ctx(
         &mut self,
         layer_ctxs: &[LayerContext],
@@ -1257,7 +1272,7 @@ impl LLM {
         println!("📝 正在预处理训练数据...");
         let preprocess_start = std::time::Instant::now();
 
-        // Tokenize 所有数据
+        // 先把所有训练文本转成带 BOS/EOS 的 token 序列。
         let tokenized_data: Vec<Vec<usize>> = data
             .iter()
             // 训练序列必须包含 BOS/EOS（否则模型学不到“何时结束”）

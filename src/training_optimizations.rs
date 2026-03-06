@@ -5,11 +5,22 @@
 //!  当前对外仅保留：
 //!  1.  带检查点管理的训练接口
 //!
+//!  推荐阅读顺序：
+//!  `train_with_checkpointing()`
+//!    -> `run_checkpoint_epoch()`
+//!    -> `prepare_training_step()`
+//!    -> `backward_with_ctx()`
+//!
 //!  其余历史训练变体已删除，以减少教学项目的 API 表面积。
 
 use crate::checkpoint_manager::{CheckpointManager, CheckpointMetadata};
 use crate::llm::LLM;
 
+/// 单个 checkpoint 训练 epoch 的汇总指标。
+///
+/// 这是 `train_with_checkpointing()` 的内部数据载体：
+/// - `run_checkpoint_epoch()` 只负责跑完一轮训练并汇总指标；
+/// - 外层函数再决定打印、早停、保存检查点等控制流。
 struct CheckpointEpochMetrics {
     avg_loss: f32,
     avg_grad_norm: f32,
@@ -20,6 +31,12 @@ struct CheckpointEpochMetrics {
 }
 
 impl LLM {
+    /// 执行一个 epoch 的 checkpoint 训练主循环，并返回该轮聚合指标。
+    ///
+    /// 教学说明：
+    /// - 这里故意只做“单轮训练 + 指标汇总”，不掺杂早停/检查点策略；
+    /// - loss 口径保持为 token-weighted mean；
+    /// - 若整轮都没有有效样本，会返回 `None`，由外层决定如何提前结束。
     fn run_checkpoint_epoch(
         &mut self,
         tokenized_data: &[Vec<usize>],
@@ -85,6 +102,14 @@ impl LLM {
         })
     }
 
+    /// 按当前状态尝试保存检查点。
+    ///
+    /// 返回值表示“本轮是否真的发生了写盘”：
+    /// - `true`：至少写入了一个检查点文件；
+    /// - `false`：没有管理器、策略判定无需保存，或保存失败。
+    ///
+    /// 说明：`CheckpointManager::save_checkpoint()` 在“不需要保存”时会返回空 `PathBuf`，
+    /// 因此这里统一把“空路径”解释为“未写盘”。
     fn maybe_save_checkpoint(
         &self,
         checkpoint_manager: Option<&mut CheckpointManager>,
@@ -120,6 +145,11 @@ impl LLM {
         }
     }
 
+    /// 在早停触发后尝试回滚到最佳检查点。
+    ///
+    /// 这里刻意只恢复 `network` 参数，不整体替换整个 `LLM`：
+    /// - 这样可以保留当前实例上的词表、运行期 buffer 与外围状态；
+    /// - 也更符合“只回滚模型权重”的教学表达。
     fn maybe_restore_best_checkpoint(&mut self, checkpoint_manager: Option<&CheckpointManager>) {
         let Some(manager) = checkpoint_manager else {
             return;
@@ -145,13 +175,21 @@ impl LLM {
     ///
     ///  该接口组合了早停、学习率调度以及检查点保存/恢复能力。
     ///
+    ///  教学主线：
+    ///  1. `run_checkpoint_epoch()` 负责单轮训练；
+    ///  2. 外层函数负责打印、早停判定与 checkpoint 编排；
+    ///  3. 指标口径统一使用 token-weighted mean loss。
+    ///
     ///  #  参数
     ///  -  `checkpoint_manager`:  检查点管理器（可选）
     ///  -  `phase`:  训练阶段标识（如"pretraining", "instruction_tuning"）
     ///  -  `resume_epoch`:  从哪个epoch开始（用于resume训练）
     ///
     ///  #  返回值
-    ///  返回实际训练的epoch数
+    ///  返回当前训练停止时的绝对 epoch 坐标：
+    ///  - 正常完成时返回 `max_epochs`；
+    ///  - 早停时返回 `epoch + 1`；
+    ///  - 若在 resume 训练中立即遇到零样本，则返回传入的 `resume_epoch`。
     pub fn train_with_checkpointing(
         &mut self,
         tokenized_data: Vec<Vec<usize>>,
