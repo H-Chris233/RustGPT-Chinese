@@ -5,6 +5,7 @@
 use llm::{
     CheckpointManager, CheckpointMetadata, CheckpointStrategy, Embeddings, LLM, OutputProjection,
     TransformerBlock, Vocab, EMBEDDING_DIM, HIDDEN_DIM, Layer, LayerContext,
+    checkpoint_manager::Checkpoint, model_serialization::SerializableLayer,
 };
 use ndarray::Array2;
 use std::fs;
@@ -941,5 +942,58 @@ fn test_checkpoint_adam_optimizer_state_preservation() {
     println!("   • 词汇表大小: {}", loaded_llm.vocab.len());
 
     // 清理
+    fs::remove_dir_all(checkpoint_dir).ok();
+}
+
+#[test]
+fn test_load_checkpoint_rejects_corrupted_layer_shape() {
+    let checkpoint_dir = "test_checkpoints_corrupted_load";
+    if std::path::Path::new(checkpoint_dir).exists() {
+        fs::remove_dir_all(checkpoint_dir).ok();
+    }
+
+    let mut manager = CheckpointManager::new(checkpoint_dir, CheckpointStrategy::Last, 1)
+        .expect("应该能创建检查点管理器");
+    let (llm, _) = create_test_model();
+    let metadata = CheckpointMetadata {
+        epoch: 1,
+        loss: 1.23,
+        learning_rate: 0.001,
+        timestamp: "2026-03-06 00:00:00".to_string(),
+        phase: "corruption_test".to_string(),
+    };
+    let checkpoint_path = manager
+        .save_checkpoint(&llm, metadata)
+        .expect("基线 checkpoint 应保存成功");
+
+    let bytes = fs::read(&checkpoint_path).expect("应能读取 checkpoint 文件");
+    let config = bincode::config::standard();
+    let (mut checkpoint, _): (Checkpoint, usize) =
+        bincode::decode_from_slice(&bytes, config).expect("应能解码基线 checkpoint");
+
+    match checkpoint.model.layers.get_mut(0) {
+        Some(SerializableLayer::Embeddings(embeddings)) => {
+            embeddings.token_embeddings_shape.0 += 1;
+        }
+        other => panic!(
+            "unexpected first layer: {:?}",
+            other.map(|_| "non-embedding")
+        ),
+    }
+
+    let corrupted =
+        bincode::encode_to_vec(&checkpoint, config).expect("应能重新编码损坏 checkpoint");
+    fs::write(&checkpoint_path, corrupted).expect("应能覆盖损坏 checkpoint 文件");
+
+    let err = match CheckpointManager::load_checkpoint(&checkpoint_path) {
+        Ok(_) => panic!("损坏 checkpoint 不应被静默加载"),
+        Err(err) => err,
+    };
+    assert!(
+        err.contains("token_embeddings") || err.contains("重建第 0 层失败"),
+        "错误信息应指出损坏层: {}",
+        err
+    );
+
     fs::remove_dir_all(checkpoint_dir).ok();
 }

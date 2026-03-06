@@ -402,8 +402,10 @@ impl CheckpointManager {
 
         // 重建模型
         let mut network: Vec<Box<dyn crate::llm::Layer>> = Vec::new();
-        for s_layer in checkpoint.model.layers.iter() {
-            let layer = s_layer.to_layer(checkpoint.model.vocab.len());
+        for (idx, s_layer) in checkpoint.model.layers.iter().enumerate() {
+            let layer = s_layer
+                .to_layer(checkpoint.model.vocab.len())
+                .map_err(|e| format!("重建第 {} 层失败: {}", idx, e))?;
             network.push(layer);
         }
 

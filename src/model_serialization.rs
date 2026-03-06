@@ -49,18 +49,57 @@ use crate::{
 const BINCODE_DECODE_LIMIT_BYTES: usize = 512 * 1024 * 1024; // 512MiB
 const JSON_DECODE_LIMIT_BYTES: u64 = 256 * 1024 * 1024; // 256MiB
 
-/// 按给定形状重建二维参数矩阵；若数据损坏或维度不匹配，则回退为零矩阵。
-///
-/// 这样可以把“加载失败时记录日志并兜底”的样板逻辑集中在一个地方，
-/// 让各层反序列化代码更像结构重建，而不是错误处理堆叠。
-fn rebuild_array2_or_zeros(shape: (usize, usize), data: &[f32], field_name: &str) -> Array2<f32> {
-    match Array2::from_shape_vec(shape, data.to_vec()) {
-        Ok(arr) => arr,
-        Err(error) => {
-            log::error!("Failed to reconstruct {}: {}", field_name, error);
-            Array2::zeros(shape)
-        }
+/// 校验序列化字段中是否包含非有限值；若包含，则返回精确错误而不是静默修补。
+fn ensure_finite_slice(data: &[f32], field_name: &str) -> Result<(), String> {
+    if let Some((idx, value)) = data
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(format!(
+            "字段 {} 含有非有限值: index={}, value={}",
+            field_name, idx, value
+        ));
     }
+    Ok(())
+}
+
+/// 将运行中的二维参数矩阵导出为可序列化向量；若矩阵已损坏，则直接失败。
+fn collect_finite_array2_data(matrix: &Array2<f32>, field_name: &str) -> Result<Vec<f32>, String> {
+    let data: Vec<f32> = matrix.iter().copied().collect();
+    ensure_finite_slice(&data, field_name)?;
+    Ok(data)
+}
+
+/// 按给定形状严格重建二维参数矩阵。
+///
+/// 与旧实现不同：
+/// - 维度不匹配时直接报错；
+/// - 数据包含 NaN/Inf 时直接报错；
+/// - 不再静默回退为零矩阵，以免把损坏 checkpoint 伪装成“加载成功”。
+fn rebuild_array2(
+    shape: (usize, usize),
+    data: &[f32],
+    field_name: &str,
+) -> Result<Array2<f32>, String> {
+    let expected_len = shape
+        .0
+        .checked_mul(shape.1)
+        .ok_or_else(|| format!("字段 {} 的形状乘积溢出: {:?}", field_name, shape))?;
+
+    if data.len() != expected_len {
+        return Err(format!(
+            "字段 {} 的元素数量与形状不匹配: expected={}, actual={}, shape={:?}",
+            field_name,
+            expected_len,
+            data.len(),
+            shape
+        ));
+    }
+
+    ensure_finite_slice(data, field_name)?;
+    Array2::from_shape_vec(shape, data.to_vec())
+        .map_err(|error| format!("重建字段 {} 失败: {}", field_name, error))
 }
 
 fn count_transformer_blocks(network: &[Box<dyn Layer>]) -> usize {
@@ -87,36 +126,32 @@ pub struct SerializableAdam {
 }
 
 impl SerializableAdam {
-    pub fn from_adam(adam: &Adam) -> Self {
-        Self {
+    pub fn from_adam(adam: &Adam) -> Result<Self, String> {
+        Ok(Self {
             beta1: 0.9,
             beta2: 0.999,
             epsilon: 1e-8,
             timestep: adam.timestep,
             m_shape: adam.m.dim(),
-            m_data: adam
-                .m
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            m_data: collect_finite_array2_data(&adam.m, "adam.m")?,
             v_shape: adam.v.dim(),
-            v_data: adam
-                .v
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
-        }
+            v_data: collect_finite_array2_data(&adam.v, "adam.v")?,
+        })
     }
 
-    pub fn to_adam(&self) -> Adam {
-        Adam {
+    pub fn to_adam(&self) -> Result<Adam, String> {
+        if !self.beta1.is_finite() || !self.beta2.is_finite() || !self.epsilon.is_finite() {
+            return Err("Adam 超参数含有非有限值".to_string());
+        }
+
+        Ok(Adam {
             beta1: self.beta1,
             beta2: self.beta2,
             epsilon: self.epsilon,
             timestep: self.timestep,
-            m: rebuild_array2_or_zeros(self.m_shape, &self.m_data, "m matrix"),
-            v: rebuild_array2_or_zeros(self.v_shape, &self.v_data, "v matrix"),
-        }
+            m: rebuild_array2(self.m_shape, &self.m_data, "adam.m")?,
+            v: rebuild_array2(self.v_shape, &self.v_data, "adam.v")?,
+        })
     }
 }
 
@@ -218,204 +253,169 @@ impl SerializableLayer {
         if let Some(embeddings) = layer.as_any().downcast_ref::<Embeddings>() {
             return Ok(SerializableLayer::Embeddings(Self::serialize_embeddings(
                 embeddings,
-            )));
+            )?));
         }
 
         if let Some(transformer) = layer.as_any().downcast_ref::<TransformerBlock>() {
             return Ok(SerializableLayer::TransformerBlock(
-                Self::serialize_transformer_block(transformer),
+                Self::serialize_transformer_block(transformer)?,
             ));
         }
 
         if let Some(output_proj) = layer.as_any().downcast_ref::<OutputProjection>() {
             return Ok(SerializableLayer::OutputProjection(
-                Self::serialize_output_projection(output_proj),
+                Self::serialize_output_projection(output_proj)?,
             ));
         }
 
         Err(format!("Unsupported layer type: {}", layer.layer_type()))
     }
 
-    pub fn to_layer(&self, vocab_size: usize) -> Box<dyn Layer> {
+    pub fn to_layer(&self, vocab_size: usize) -> Result<Box<dyn Layer>, String> {
         match self {
-            SerializableLayer::Embeddings(s) => Box::new(Self::deserialize_embeddings(s)),
+            SerializableLayer::Embeddings(s) => Ok(Box::new(Self::deserialize_embeddings(s)?)),
             SerializableLayer::TransformerBlock(s) => {
-                Box::new(Self::deserialize_transformer_block(s))
+                Ok(Box::new(Self::deserialize_transformer_block(s)?))
             }
-            SerializableLayer::OutputProjection(s) => {
-                Box::new(Self::deserialize_output_projection(s, vocab_size))
-            }
+            SerializableLayer::OutputProjection(s) => Ok(Box::new(
+                Self::deserialize_output_projection(s, vocab_size)?,
+            )),
         }
     }
 
-    fn serialize_embeddings(embeddings: &Embeddings) -> SerializableEmbeddings {
-        SerializableEmbeddings {
+    fn serialize_embeddings(embeddings: &Embeddings) -> Result<SerializableEmbeddings, String> {
+        Ok(SerializableEmbeddings {
             token_embeddings_shape: embeddings.token_embeddings.dim(),
-            token_embeddings_data: embeddings
-                .token_embeddings
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
-            token_optimizer: SerializableAdam::from_adam(&embeddings.token_optimizer),
-        }
+            token_embeddings_data: collect_finite_array2_data(
+                &embeddings.token_embeddings,
+                "embeddings.token_embeddings",
+            )?,
+            token_optimizer: SerializableAdam::from_adam(&embeddings.token_optimizer)?,
+        })
     }
 
-    fn deserialize_embeddings(s: &SerializableEmbeddings) -> Embeddings {
-        let token_embeddings = rebuild_array2_or_zeros(
+    fn deserialize_embeddings(s: &SerializableEmbeddings) -> Result<Embeddings, String> {
+        let token_embeddings = rebuild_array2(
             s.token_embeddings_shape,
             &s.token_embeddings_data,
             "token_embeddings",
-        );
+        )?;
 
-        Embeddings {
+        Ok(Embeddings {
             token_embeddings,
             position_encoder: PositionEncoding::new(),
-            token_optimizer: s.token_optimizer.to_adam(),
+            token_optimizer: s.token_optimizer.to_adam()?,
             token_grads_accum: Array2::<f32>::zeros(s.token_embeddings_shape),
             position_cache: Array2::<f32>::zeros((crate::MAX_SEQ_LEN, crate::EMBEDDING_DIM)),
-        }
+        })
     }
 
-    fn serialize_self_attention(attention: &SelfAttention) -> SerializableSelfAttention {
-        SerializableSelfAttention {
+    fn serialize_self_attention(
+        attention: &SelfAttention,
+    ) -> Result<SerializableSelfAttention, String> {
+        Ok(SerializableSelfAttention {
             embedding_dim: attention.embedding_dim,
             num_heads: attention.num_heads,
             head_dim: attention.head_dim,
             w_q_shape: attention.w_q.dim(),
-            w_q_data: attention
-                .w_q
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            w_q_data: collect_finite_array2_data(&attention.w_q, "self_attention.w_q")?,
             w_k_shape: attention.w_k.dim(),
-            w_k_data: attention
-                .w_k
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            w_k_data: collect_finite_array2_data(&attention.w_k, "self_attention.w_k")?,
             w_v_shape: attention.w_v.dim(),
-            w_v_data: attention
-                .w_v
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            w_v_data: collect_finite_array2_data(&attention.w_v, "self_attention.w_v")?,
             w_o_shape: attention.w_o.dim(),
-            w_o_data: attention
-                .w_o
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
-            optimizer_w_q: SerializableAdam::from_adam(&attention.optimizer_w_q),
-            optimizer_w_k: SerializableAdam::from_adam(&attention.optimizer_w_k),
-            optimizer_w_v: SerializableAdam::from_adam(&attention.optimizer_w_v),
-            optimizer_w_o: SerializableAdam::from_adam(&attention.optimizer_w_o),
-        }
+            w_o_data: collect_finite_array2_data(&attention.w_o, "self_attention.w_o")?,
+            optimizer_w_q: SerializableAdam::from_adam(&attention.optimizer_w_q)?,
+            optimizer_w_k: SerializableAdam::from_adam(&attention.optimizer_w_k)?,
+            optimizer_w_v: SerializableAdam::from_adam(&attention.optimizer_w_v)?,
+            optimizer_w_o: SerializableAdam::from_adam(&attention.optimizer_w_o)?,
+        })
     }
 
-    fn deserialize_self_attention(s: &SerializableSelfAttention) -> SelfAttention {
-        SelfAttention {
+    fn deserialize_self_attention(s: &SerializableSelfAttention) -> Result<SelfAttention, String> {
+        Ok(SelfAttention {
             embedding_dim: s.embedding_dim,
             num_heads: s.num_heads,
             head_dim: s.head_dim,
-            w_q: rebuild_array2_or_zeros(s.w_q_shape, &s.w_q_data, "w_q"),
-            w_k: rebuild_array2_or_zeros(s.w_k_shape, &s.w_k_data, "w_k"),
-            w_v: rebuild_array2_or_zeros(s.w_v_shape, &s.w_v_data, "w_v"),
-            w_o: rebuild_array2_or_zeros(s.w_o_shape, &s.w_o_data, "w_o"),
+            w_q: rebuild_array2(s.w_q_shape, &s.w_q_data, "w_q")?,
+            w_k: rebuild_array2(s.w_k_shape, &s.w_k_data, "w_k")?,
+            w_v: rebuild_array2(s.w_v_shape, &s.w_v_data, "w_v")?,
+            w_o: rebuild_array2(s.w_o_shape, &s.w_o_data, "w_o")?,
             kv_cache: None,      // KV缓存初始化为None
             use_kv_cache: false, // 默认不使用KV缓存
             freeze_updates: false,
             causal_mask_cache: std::collections::HashMap::new(), // 初始化掩码缓存
-            optimizer_w_q: s.optimizer_w_q.to_adam(),
-            optimizer_w_k: s.optimizer_w_k.to_adam(),
-            optimizer_w_v: s.optimizer_w_v.to_adam(),
-            optimizer_w_o: s.optimizer_w_o.to_adam(),
+            optimizer_w_q: s.optimizer_w_q.to_adam()?,
+            optimizer_w_k: s.optimizer_w_k.to_adam()?,
+            optimizer_w_v: s.optimizer_w_v.to_adam()?,
+            optimizer_w_o: s.optimizer_w_o.to_adam()?,
             grad_w_q_accum: Array2::zeros(s.w_q_shape),
             grad_w_k_accum: Array2::zeros(s.w_k_shape),
             grad_w_v_accum: Array2::zeros(s.w_v_shape),
             grad_w_o_accum: Array2::zeros(s.w_o_shape),
-        }
+        })
     }
 
-    fn serialize_feed_forward(ff: &FeedForward) -> SerializableFeedForward {
-        SerializableFeedForward {
+    fn serialize_feed_forward(ff: &FeedForward) -> Result<SerializableFeedForward, String> {
+        Ok(SerializableFeedForward {
             w1_shape: ff.w1.dim(),
-            w1_data: ff
-                .w1
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            w1_data: collect_finite_array2_data(&ff.w1, "feed_forward.w1")?,
             b1_shape: ff.b1.dim(),
-            b1_data: ff
-                .b1
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            b1_data: collect_finite_array2_data(&ff.b1, "feed_forward.b1")?,
             w2_shape: ff.w2.dim(),
-            w2_data: ff
-                .w2
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            w2_data: collect_finite_array2_data(&ff.w2, "feed_forward.w2")?,
             b2_shape: ff.b2.dim(),
-            b2_data: ff
-                .b2
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
-            optimizer_w1: SerializableAdam::from_adam(&ff.optimizer_w1),
-            optimizer_b1: SerializableAdam::from_adam(&ff.optimizer_b1),
-            optimizer_w2: SerializableAdam::from_adam(&ff.optimizer_w2),
-            optimizer_b2: SerializableAdam::from_adam(&ff.optimizer_b2),
-        }
+            b2_data: collect_finite_array2_data(&ff.b2, "feed_forward.b2")?,
+            optimizer_w1: SerializableAdam::from_adam(&ff.optimizer_w1)?,
+            optimizer_b1: SerializableAdam::from_adam(&ff.optimizer_b1)?,
+            optimizer_w2: SerializableAdam::from_adam(&ff.optimizer_w2)?,
+            optimizer_b2: SerializableAdam::from_adam(&ff.optimizer_b2)?,
+        })
     }
 
-    fn deserialize_feed_forward(s: &SerializableFeedForward) -> FeedForward {
-        FeedForward {
-            w1: rebuild_array2_or_zeros(s.w1_shape, &s.w1_data, "w1"),
-            b1: rebuild_array2_or_zeros(s.b1_shape, &s.b1_data, "b1"),
-            w2: rebuild_array2_or_zeros(s.w2_shape, &s.w2_data, "w2"),
-            b2: rebuild_array2_or_zeros(s.b2_shape, &s.b2_data, "b2"),
-            optimizer_w1: s.optimizer_w1.to_adam(),
-            optimizer_b1: s.optimizer_b1.to_adam(),
-            optimizer_w2: s.optimizer_w2.to_adam(),
-            optimizer_b2: s.optimizer_b2.to_adam(),
+    fn deserialize_feed_forward(s: &SerializableFeedForward) -> Result<FeedForward, String> {
+        Ok(FeedForward {
+            w1: rebuild_array2(s.w1_shape, &s.w1_data, "w1")?,
+            b1: rebuild_array2(s.b1_shape, &s.b1_data, "b1")?,
+            w2: rebuild_array2(s.w2_shape, &s.w2_data, "w2")?,
+            b2: rebuild_array2(s.b2_shape, &s.b2_data, "b2")?,
+            optimizer_w1: s.optimizer_w1.to_adam()?,
+            optimizer_b1: s.optimizer_b1.to_adam()?,
+            optimizer_w2: s.optimizer_w2.to_adam()?,
+            optimizer_b2: s.optimizer_b2.to_adam()?,
             grad_w1_accum: Array2::zeros(s.w1_shape),
             grad_b1_accum: Array2::zeros(s.b1_shape),
             grad_w2_accum: Array2::zeros(s.w2_shape),
             grad_b2_accum: Array2::zeros(s.b2_shape),
-        }
+        })
     }
 
-    fn serialize_layer_norm(ln: &LayerNorm) -> SerializableLayerNorm {
-        SerializableLayerNorm {
+    fn serialize_layer_norm(ln: &LayerNorm) -> Result<SerializableLayerNorm, String> {
+        Ok(SerializableLayerNorm {
             epsilon: ln.epsilon,
             gamma_shape: ln.gamma.dim(),
-            gamma_data: ln
-                .gamma
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 1.0 })
-                .collect(),
+            gamma_data: collect_finite_array2_data(&ln.gamma, "layer_norm.gamma")?,
             beta_shape: ln.beta.dim(),
-            beta_data: ln
-                .beta
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
-            optimizer_gamma: SerializableAdam::from_adam(&ln.optimizer_gamma),
-            optimizer_beta: SerializableAdam::from_adam(&ln.optimizer_beta),
-        }
+            beta_data: collect_finite_array2_data(&ln.beta, "layer_norm.beta")?,
+            optimizer_gamma: SerializableAdam::from_adam(&ln.optimizer_gamma)?,
+            optimizer_beta: SerializableAdam::from_adam(&ln.optimizer_beta)?,
+        })
     }
 
-    fn deserialize_layer_norm(s: &SerializableLayerNorm) -> LayerNorm {
-        LayerNorm {
+    fn deserialize_layer_norm(s: &SerializableLayerNorm) -> Result<LayerNorm, String> {
+        if !s.epsilon.is_finite() {
+            return Err("LayerNorm epsilon 含有非有限值".to_string());
+        }
+
+        Ok(LayerNorm {
             epsilon: s.epsilon,
-            gamma: rebuild_array2_or_zeros(s.gamma_shape, &s.gamma_data, "gamma"),
-            beta: rebuild_array2_or_zeros(s.beta_shape, &s.beta_data, "beta"),
-            optimizer_gamma: s.optimizer_gamma.to_adam(),
-            optimizer_beta: s.optimizer_beta.to_adam(),
+            gamma: rebuild_array2(s.gamma_shape, &s.gamma_data, "gamma")?,
+            beta: rebuild_array2(s.beta_shape, &s.beta_data, "beta")?,
+            optimizer_gamma: s.optimizer_gamma.to_adam()?,
+            optimizer_beta: s.optimizer_beta.to_adam()?,
             grad_gamma_accum: Array2::zeros(s.gamma_shape),
             grad_beta_accum: Array2::zeros(s.beta_shape),
-        }
+        })
     }
 
     fn serialize_dropout(dropout: &Dropout) -> SerializableDropout {
@@ -428,59 +428,57 @@ impl SerializableLayer {
         Dropout::new(s.dropout_rate)
     }
 
-    fn serialize_output_projection(op: &OutputProjection) -> SerializableOutputProjection {
-        SerializableOutputProjection {
+    fn serialize_output_projection(
+        op: &OutputProjection,
+    ) -> Result<SerializableOutputProjection, String> {
+        Ok(SerializableOutputProjection {
             w_out_shape: op.w_out.dim(),
-            w_out_data: op
-                .w_out
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
+            w_out_data: collect_finite_array2_data(&op.w_out, "output_projection.w_out")?,
             b_out_shape: op.b_out.dim(),
-            b_out_data: op
-                .b_out
-                .iter()
-                .map(|&x| if x.is_finite() { x } else { 0.0 })
-                .collect(),
-            optimizer: SerializableAdam::from_adam(&op.optimizer),
-            optimizer_bias: SerializableAdam::from_adam(&op.optimizer_bias),
-        }
+            b_out_data: collect_finite_array2_data(&op.b_out, "output_projection.b_out")?,
+            optimizer: SerializableAdam::from_adam(&op.optimizer)?,
+            optimizer_bias: SerializableAdam::from_adam(&op.optimizer_bias)?,
+        })
     }
 
     fn deserialize_output_projection(
         s: &SerializableOutputProjection,
         _vocab_size: usize,
-    ) -> OutputProjection {
-        OutputProjection {
-            w_out: rebuild_array2_or_zeros(s.w_out_shape, &s.w_out_data, "w_out"),
-            b_out: rebuild_array2_or_zeros(s.b_out_shape, &s.b_out_data, "b_out"),
-            optimizer: s.optimizer.to_adam(),
-            optimizer_bias: s.optimizer_bias.to_adam(),
+    ) -> Result<OutputProjection, String> {
+        Ok(OutputProjection {
+            w_out: rebuild_array2(s.w_out_shape, &s.w_out_data, "w_out")?,
+            b_out: rebuild_array2(s.b_out_shape, &s.b_out_data, "b_out")?,
+            optimizer: s.optimizer.to_adam()?,
+            optimizer_bias: s.optimizer_bias.to_adam()?,
             grad_w_out_accum: Array2::zeros(s.w_out_shape),
             grad_b_out_accum: Array2::zeros(s.b_out_shape),
-        }
+        })
     }
 
-    fn serialize_transformer_block(tb: &TransformerBlock) -> SerializableTransformerBlock {
-        SerializableTransformerBlock {
-            attention: Self::serialize_self_attention(&tb.attention),
-            feed_forward: Self::serialize_feed_forward(&tb.feed_forward),
+    fn serialize_transformer_block(
+        tb: &TransformerBlock,
+    ) -> Result<SerializableTransformerBlock, String> {
+        Ok(SerializableTransformerBlock {
+            attention: Self::serialize_self_attention(&tb.attention)?,
+            feed_forward: Self::serialize_feed_forward(&tb.feed_forward)?,
             dropout1: Self::serialize_dropout(&tb.dropout1),
             dropout2: Self::serialize_dropout(&tb.dropout2),
-            norm1: Self::serialize_layer_norm(&tb.norm1),
-            norm2: Self::serialize_layer_norm(&tb.norm2),
-        }
+            norm1: Self::serialize_layer_norm(&tb.norm1)?,
+            norm2: Self::serialize_layer_norm(&tb.norm2)?,
+        })
     }
 
-    fn deserialize_transformer_block(s: &SerializableTransformerBlock) -> TransformerBlock {
-        TransformerBlock {
-            attention: Self::deserialize_self_attention(&s.attention),
-            feed_forward: Self::deserialize_feed_forward(&s.feed_forward),
+    fn deserialize_transformer_block(
+        s: &SerializableTransformerBlock,
+    ) -> Result<TransformerBlock, String> {
+        Ok(TransformerBlock {
+            attention: Self::deserialize_self_attention(&s.attention)?,
+            feed_forward: Self::deserialize_feed_forward(&s.feed_forward)?,
             dropout1: Self::deserialize_dropout(&s.dropout1),
             dropout2: Self::deserialize_dropout(&s.dropout2),
-            norm1: Self::deserialize_layer_norm(&s.norm1),
-            norm2: Self::deserialize_layer_norm(&s.norm2),
-        }
+            norm1: Self::deserialize_layer_norm(&s.norm1)?,
+            norm2: Self::deserialize_layer_norm(&s.norm2)?,
+        })
     }
 }
 
@@ -555,7 +553,9 @@ fn build_serializable_model(model: &LLM) -> Result<SerializableModel, std::io::E
 }
 
 /// 把磁盘上的 SerializableModel 重建回可运行的 LLM，避免 binary/json 两条加载路径重复回填运行时字段。
-fn build_llm_from_serializable(serializable_model: SerializableModel) -> LLM {
+fn build_llm_from_serializable(
+    serializable_model: SerializableModel,
+) -> Result<LLM, std::io::Error> {
     let SerializableModel {
         vocab,
         layers,
@@ -569,11 +569,14 @@ fn build_llm_from_serializable(serializable_model: SerializableModel) -> LLM {
     let mut network: Vec<Box<dyn Layer>> = Vec::with_capacity(layers.len());
     for (i, serializable_layer) in layers.iter().enumerate() {
         print!("   [{}] 重建层...", i + 1);
-        network.push(serializable_layer.to_layer(vocab_len));
+        let layer = serializable_layer.to_layer(vocab_len).map_err(|error| {
+            std::io::Error::other(format!("Failed to rebuild layer {}: {}", i, error))
+        })?;
+        network.push(layer);
         println!(" ✓");
     }
 
-    LLM {
+    Ok(LLM {
         vocab,
         network,
         context_window,
@@ -582,7 +585,7 @@ fn build_llm_from_serializable(serializable_model: SerializableModel) -> LLM {
         sampling_prob_buffer: Vec::with_capacity(vocab_size),
         sampling_idx_buffer: Vec::with_capacity(vocab_size),
         beam_candidates_buffer: Vec::with_capacity(50),
-    }
+    })
 }
 
 /// 保存模型到二进制文件
@@ -627,7 +630,7 @@ pub fn load_model_binary<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::er
     println!("   词汇量: {}", serializable_model.vocab.len());
     println!("   网络层数: {}", serializable_model.layers.len());
 
-    let llm = build_llm_from_serializable(serializable_model);
+    let llm = build_llm_from_serializable(serializable_model)?;
 
     println!("✅ 模型加载成功!");
     println!("   总参数量: {}", llm.total_parameters());
@@ -674,7 +677,7 @@ pub fn load_model_json<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::erro
     println!("   词汇量: {}", serializable_model.vocab.len());
     println!("   网络层数: {}", serializable_model.layers.len());
 
-    let llm = build_llm_from_serializable(serializable_model);
+    let llm = build_llm_from_serializable(serializable_model)?;
 
     println!("✅ 模型加载成功!");
     println!("   总参数量: {}", llm.total_parameters());
