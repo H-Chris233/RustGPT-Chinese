@@ -202,9 +202,7 @@ pub trait Layer {
         for b in 0..batch_size {
             let sample = input.slice(ndarray::s![b, .., ..]).to_owned();
             let (sample_out, ctx) = self.forward(&sample);
-            output
-                .slice_mut(ndarray::s![b, .., ..])
-                .assign(&sample_out);
+            output.slice_mut(ndarray::s![b, .., ..]).assign(&sample_out);
             ctxs.push(ctx);
         }
 
@@ -275,7 +273,10 @@ pub struct LLM {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrainingSignalError {
     /// `probs.shape()[0] != target.len()`（常见于 target 对齐错误或 logits/softmax shape 错误）。
-    ShapeMismatch { probs_rows: usize, target_len: usize },
+    ShapeMismatch {
+        probs_rows: usize,
+        target_len: usize,
+    },
     /// target id 超出 vocab_size（常见于词表/输出层维度不一致）。
     TargetOutOfRange {
         row_idx: usize,
@@ -283,7 +284,6 @@ pub enum TrainingSignalError {
         vocab_size: usize,
     },
 }
-
 
 /// 单样本训练步的中间结果。
 ///
@@ -645,7 +645,8 @@ impl LLM {
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
 
-                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                let Some(mut step) =
+                    self.prepare_training_step(input_ids, target_ids, pad_token_id)
                 else {
                     continue;
                 };
@@ -775,6 +776,29 @@ impl LLM {
         grads.iter().map(|&x| x * x).sum::<f32>().sqrt()
     }
 
+    /// 将“token-mean loss”的 logits 梯度还原为“sum NLL”的梯度。
+    ///
+    /// 训练语义：`compute_gradients_step()` 已经按 `n_targets` 做了平均；
+    /// 梯度累积阶段必须先乘回 `n_targets`，否则多个不同长度序列会退化为 sequence-weighted。
+    pub(crate) fn rescale_logits_grads_for_accumulation(grads: &mut Array2<f32>, n_targets: usize) {
+        debug_assert!(n_targets > 0, "n_targets must be > 0 for accumulation");
+        grads.mapv_inplace(|x| x * (n_targets as f32));
+    }
+
+    /// 计算当前累积窗口内的 token-weighted 平均缩放系数。
+    pub(crate) fn token_weighted_accum_scale(accum_tokens: usize) -> f32 {
+        assert!(
+            accum_tokens > 0,
+            "token_weighted_accum_scale requires accum_tokens > 0"
+        );
+        1.0 / accum_tokens as f32
+    }
+
+    /// 当前 micro-batch 在整个累积窗口中的 token 权重。
+    pub(crate) fn token_weighted_micro_batch_weight(n_targets: usize, accum_tokens: usize) -> f32 {
+        (n_targets as f32) * Self::token_weighted_accum_scale(accum_tokens)
+    }
+
     // =====================================================================
     // 梯度累积：跨层统一调度（网络级别）
     // =====================================================================
@@ -827,12 +851,7 @@ impl LLM {
         }
 
         let mut grads = grads_output.clone();
-        for (layer, ctx) in self
-            .network
-            .iter_mut()
-            .rev()
-            .zip(layer_ctxs.iter().rev())
-        {
+        for (layer, ctx) in self.network.iter_mut().rev().zip(layer_ctxs.iter().rev()) {
             grads = if let Some(op) = layer.as_any_mut().downcast_mut::<OutputProjection>() {
                 op.backward_accumulate_with_ctx(ctx, &grads)
             } else if let Some(tb) = layer.as_any_mut().downcast_mut::<TransformerBlock>() {
@@ -866,7 +885,6 @@ impl LLM {
             }
         }
     }
-
 
     /// 单样本训练步：执行前向传播，收集 ctx，并计算 loss 与 `dL/dlogits`。
     ///
@@ -1040,7 +1058,8 @@ impl LLM {
                 // 前向传播
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
-                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
+                let Some(mut step) =
+                    self.prepare_training_step(input_ids, target_ids, pad_token_id)
                 else {
                     continue;
                 };
@@ -1064,13 +1083,15 @@ impl LLM {
                 // - 若直接对 micro-batch 求平均，会变成 sequence-weighted（每条序列权重相同）；
                 // - 我们把 logits 梯度乘回 n_targets，使其对应 “sum NLL” 的梯度，
                 //   然后在 step 时用 `scale = 1/accum_tokens` 做统一平均，得到 token-weighted 梯度。
-                step.grads_output
-                    .mapv_inplace(|x| x * (step.n_targets as f32));
+                Self::rescale_logits_grads_for_accumulation(&mut step.grads_output, step.n_targets);
                 self.backward_accumulate_with_ctx(&step.layer_ctxs, &step.grads_output);
                 accum_counter += 1;
                 accum_tokens += step.n_targets;
                 if accum_counter >= effective_accum_steps {
-                    self.step_accumulated(current_lr, 1.0 / accum_tokens as f32);
+                    self.step_accumulated(
+                        current_lr,
+                        Self::token_weighted_accum_scale(accum_tokens),
+                    );
                     accum_counter = 0;
                     accum_tokens = 0;
                 }
@@ -1080,7 +1101,7 @@ impl LLM {
 
             // 处理最后一个“不满 accumulation_steps”的尾批次
             if accum_counter > 0 {
-                self.step_accumulated(current_lr, 1.0 / accum_tokens as f32);
+                self.step_accumulated(current_lr, Self::token_weighted_accum_scale(accum_tokens));
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
@@ -1198,8 +1219,7 @@ impl LLM {
         );
 
         // 创建批量加载器
-        let batch_loader =
-            BatchLoader::new_with_pad_token_id(batch_size, true, 16, pad_token_id);
+        let batch_loader = BatchLoader::new_with_pad_token_id(batch_size, true, 16, pad_token_id);
 
         let mut early_stopping = EarlyStopping::new(patience, 0.01);
         let training_start_time = std::time::Instant::now();
@@ -1252,7 +1272,8 @@ impl LLM {
                     let sample_ids: Vec<usize> =
                         sample_tokens.iter().take(target_len).copied().collect();
 
-                    let Some(mut step) = self.prepare_training_step(&sample_ids, &target_ids, pad_token_id)
+                    let Some(mut step) =
+                        self.prepare_training_step(&sample_ids, &target_ids, pad_token_id)
                     else {
                         continue;
                     };
@@ -2299,4 +2320,48 @@ impl LLM {
 
     // 说明：旧版实现中存在 “logits 梯度累积后只 backward 一次” 的数学错误（缓存覆盖）。
     // 为了避免误用，我们已完全移除旧的梯度桶聚合函数。
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LLM;
+    use ndarray::arr2;
+
+    #[test]
+    fn accumulation_single_step_keeps_full_weight() {
+        let weight = LLM::token_weighted_micro_batch_weight(3, 3);
+        assert!((weight - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn accumulation_weights_are_token_weighted_not_sequence_weighted() {
+        let short = LLM::token_weighted_micro_batch_weight(1, 3);
+        let long = LLM::token_weighted_micro_batch_weight(2, 3);
+
+        assert!((short - (1.0 / 3.0)).abs() < 1e-6);
+        assert!((long - (2.0 / 3.0)).abs() < 1e-6);
+        assert!((short + long - 1.0).abs() < 1e-6);
+        assert!(
+            (long - 0.5).abs() > 1e-6,
+            "long sequence should not collapse to sequence-weighted 0.5"
+        );
+    }
+
+    #[test]
+    fn accumulation_tail_batch_uses_remaining_tokens() {
+        let tail_short = LLM::token_weighted_micro_batch_weight(1, 4);
+        let tail_long = LLM::token_weighted_micro_batch_weight(3, 4);
+
+        assert!((tail_short - 0.25).abs() < 1e-6);
+        assert!((tail_long - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rescale_logits_grads_for_accumulation_restores_sum_nll_scale() {
+        let mut grads = arr2(&[[0.25_f32, -0.25_f32], [0.75_f32, -0.75_f32]]);
+        LLM::rescale_logits_grads_for_accumulation(&mut grads, 2);
+
+        let expected = arr2(&[[0.5_f32, -0.5_f32], [1.5_f32, -1.5_f32]]);
+        assert_eq!(grads, expected);
+    }
 }
