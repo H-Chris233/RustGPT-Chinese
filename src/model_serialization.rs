@@ -128,9 +128,9 @@ pub struct SerializableAdam {
 impl SerializableAdam {
     pub fn from_adam(adam: &Adam) -> Result<Self, String> {
         Ok(Self {
-            beta1: 0.9,
-            beta2: 0.999,
-            epsilon: 1e-8,
+            beta1: adam.beta1,
+            beta2: adam.beta2,
+            epsilon: adam.epsilon,
             timestep: adam.timestep,
             m_shape: adam.m.dim(),
             m_data: collect_finite_array2_data(&adam.m, "adam.m")?,

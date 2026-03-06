@@ -77,10 +77,18 @@ fn test_json_save_and_load() {
 fn test_model_state_preservation() {
     use llm::adam::Adam;
 
-    let adam = Adam::new((10, 20));
+    let mut adam = Adam::new((10, 20));
+    adam.beta1 = 0.85;
+    adam.beta2 = 0.97;
+    adam.epsilon = 1e-6;
+    adam.timestep = 7;
+
     let serialized = SerializableAdam::from_adam(&adam).expect("Adam 状态应能成功序列化");
     let deserialized = serialized.to_adam().expect("Adam 状态应能成功反序列化");
 
+    assert!((deserialized.beta1 - adam.beta1).abs() < 1e-12);
+    assert!((deserialized.beta2 - adam.beta2).abs() < 1e-12);
+    assert!((deserialized.epsilon - adam.epsilon).abs() < 1e-12);
     assert_eq!(deserialized.timestep, adam.timestep);
     assert_eq!(deserialized.m.dim(), adam.m.dim());
     assert_eq!(deserialized.v.dim(), adam.v.dim());
