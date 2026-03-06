@@ -795,6 +795,7 @@ impl LLM {
     }
 
     /// 当前 micro-batch 在整个累积窗口中的 token 权重。
+    #[cfg(test)]
     pub(crate) fn token_weighted_micro_batch_weight(n_targets: usize, accum_tokens: usize) -> f32 {
         (n_targets as f32) * Self::token_weighted_accum_scale(accum_tokens)
     }
