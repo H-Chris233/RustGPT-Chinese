@@ -205,6 +205,36 @@ pub(crate) struct PreparedTrainingStep {
     pub(crate) n_targets: usize,
 }
 
+#[derive(Default)]
+pub(crate) struct EpochAccumulator {
+    pub(crate) total_nll: f32,
+    pub(crate) total_tokens: usize,
+    pub(crate) total_grad_norm: f32,
+    pub(crate) sample_count: usize,
+}
+
+impl EpochAccumulator {
+    pub(crate) fn record_step(&mut self, step: &PreparedTrainingStep, grad_norm: f32) {
+        self.total_nll += step.loss_mean * (step.n_targets as f32);
+        self.total_tokens += step.n_targets;
+        self.total_grad_norm += grad_norm;
+        self.sample_count += 1;
+    }
+
+    pub(crate) fn has_valid_samples(&self) -> bool {
+        self.sample_count > 0 && self.total_tokens > 0
+    }
+
+    pub(crate) fn avg_loss(&self) -> Option<f32> {
+        self.has_valid_samples()
+            .then_some(self.total_nll / self.total_tokens as f32)
+    }
+
+    pub(crate) fn avg_grad_norm(&self) -> Option<f32> {
+        (self.sample_count > 0).then_some(self.total_grad_norm / self.sample_count as f32)
+    }
+}
+
 /// 早停机制
 ///
 /// 监控训练loss，如果长时间不改善则自动停止训练
@@ -554,8 +584,7 @@ impl LLM {
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
 
             // 训练指标口径：统一使用 token-weighted mean，避免短序列被隐式加权。
-            let mut total_nll = 0.0;
-            let mut total_tokens = 0usize;
+            let mut epoch_accumulator = EpochAccumulator::default();
             for training_row in &tokenized_data {
                 if training_row.len() < 2 {
                     continue;
@@ -564,27 +593,19 @@ impl LLM {
                 // 训练样本按“前 N-1 个 token 预测后 N-1 个 token”切分。
                 let input_ids = &training_row[..training_row.len() - 1];
                 let target_ids = &training_row[1..];
-
-                let Some(mut step) =
-                    self.prepare_training_step(input_ids, target_ids, pad_token_id)
-                else {
-                    continue;
-                };
-
-                total_nll += step.loss_mean * (step.n_targets as f32);
-                total_tokens += step.n_targets;
-                Self::clip_gradients(&mut step.grads_output, 1.0);
-                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
+                let _ = self.run_standard_training_step(
+                    input_ids,
+                    target_ids,
+                    pad_token_id,
+                    current_lr,
+                    &mut epoch_accumulator,
+                );
             }
 
             println!(
                 "Epoch {}: Loss = {:.4}, LR = {:.6}",
                 epoch,
-                if total_tokens > 0 {
-                    total_nll / total_tokens as f32
-                } else {
-                    0.0
-                },
+                epoch_accumulator.avg_loss().unwrap_or(0.0),
                 current_lr
             );
         }
@@ -858,6 +879,24 @@ impl LLM {
         })
     }
 
+    pub(crate) fn run_standard_training_step(
+        &mut self,
+        input_ids: &[usize],
+        target_ids: &[usize],
+        pad_token_id: usize,
+        current_lr: f32,
+        epoch_accumulator: &mut EpochAccumulator,
+    ) -> bool {
+        let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id) else {
+            return false;
+        };
+
+        epoch_accumulator.record_step(&step, Self::compute_grad_norm(&step.grads_output));
+        Self::clip_gradients(&mut step.grads_output, 1.0);
+        self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
+        true
+    }
+
     /// 逐层取回 ctx 并执行标准反向传播。
     ///
     /// 与旧版 `cached_*` 隐式缓存不同，这里显式消费每层 forward 返回的 `ctx`：
@@ -962,10 +1001,7 @@ impl LLM {
             //   → 会把短序列“隐式加权”得更重。
             // - 新实现：对所有有效 token 的 NLL 求和后再除以总 token 数
             //   → 与常见 LM/困惑度定义一致（token-weighted）。
-            let mut total_nll = 0.0;
-            let mut total_tokens = 0usize;
-            let mut total_grad_norm = 0.0;
-            let mut sample_count = 0usize;
+            let mut epoch_accumulator = EpochAccumulator::default();
             let mut accum_counter = 0usize; // micro-batch 计数（用于触发 step）
             let mut accum_tokens = 0usize; // micro-batch 内有效 token 数（用于 token-weighted scale）
             // 每个 epoch 重新开始累积
@@ -985,9 +1021,7 @@ impl LLM {
                     continue;
                 };
 
-                total_nll += step.loss_mean * (step.n_targets as f32);
-                total_tokens += step.n_targets;
-                total_grad_norm += Self::compute_grad_norm(&step.grads_output);
+                epoch_accumulator.record_step(&step, Self::compute_grad_norm(&step.grads_output));
                 Self::clip_gradients(&mut step.grads_output, 1.0);
 
                 // ==========================
@@ -1016,8 +1050,6 @@ impl LLM {
                     accum_counter = 0;
                     accum_tokens = 0;
                 }
-
-                sample_count += 1;
             }
 
             // 处理最后一个“不满 accumulation_steps”的尾批次
@@ -1025,7 +1057,7 @@ impl LLM {
                 self.step_accumulated(current_lr, Self::token_weighted_accum_scale(accum_tokens));
             }
 
-            if sample_count == 0 || total_tokens == 0 {
+            if !epoch_accumulator.has_valid_samples() {
                 log::error!(
                     "train_monitored: 没有有效训练样本（所有序列长度 < 2 或全部被跳过），无法继续训练。epoch={}",
                     epoch
@@ -1036,15 +1068,11 @@ impl LLM {
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
-            let avg_loss = total_nll / total_tokens as f32;
-            let avg_grad_norm = if sample_count > 0 {
-                total_grad_norm / sample_count as f32
-            } else {
-                0.0
-            };
+            let avg_loss = epoch_accumulator.avg_loss().unwrap_or(0.0);
+            let avg_grad_norm = epoch_accumulator.avg_grad_norm().unwrap_or(0.0);
             let perplexity = avg_loss.exp();
             let samples_per_sec = if epoch_time > 0.0 {
-                sample_count as f32 / epoch_time
+                epoch_accumulator.sample_count as f32 / epoch_time
             } else {
                 0.0
             };
@@ -1160,10 +1188,7 @@ impl LLM {
                 Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
             // 训练指标口径：统一使用 token-weighted mean，避免短序列被隐式加权。
-            let mut total_nll = 0.0;
-            let mut total_tokens = 0usize;
-            let mut total_grad_norm = 0.0;
-            let mut sample_count = 0usize;
+            let mut epoch_accumulator = EpochAccumulator::default();
 
             // 创建训练批次
             let training_batches = create_training_batches(&batch_loader, &tokenized_data);
@@ -1205,19 +1230,14 @@ impl LLM {
                         continue;
                     };
 
-                    // loss（仅在本步会更新参数时计入，按有效 token 做统一加权）
-                    total_nll += step.loss_mean * (step.n_targets as f32);
-                    total_tokens += step.n_targets;
-
-                    total_grad_norm += Self::compute_grad_norm(&step.grads_output);
+                    epoch_accumulator
+                        .record_step(&step, Self::compute_grad_norm(&step.grads_output));
                     Self::clip_gradients(&mut step.grads_output, 1.0);
                     self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
-
-                    sample_count += 1;
                 }
             }
 
-            if sample_count == 0 || total_tokens == 0 {
+            if !epoch_accumulator.has_valid_samples() {
                 log::error!(
                     "train_bucketed_sequential: 没有有效训练样本（所有序列长度 < 2 或全部被跳过），无法继续训练。epoch={}",
                     epoch
@@ -1228,15 +1248,11 @@ impl LLM {
             }
 
             let epoch_time = epoch_start.elapsed().as_secs_f32();
-            let avg_loss = total_nll / total_tokens as f32;
-            let avg_grad_norm = if sample_count > 0 {
-                total_grad_norm / sample_count as f32
-            } else {
-                0.0
-            };
+            let avg_loss = epoch_accumulator.avg_loss().unwrap_or(0.0);
+            let avg_grad_norm = epoch_accumulator.avg_grad_norm().unwrap_or(0.0);
             let perplexity = avg_loss.exp();
             let samples_per_sec = if epoch_time > 0.0 {
-                sample_count as f32 / epoch_time
+                epoch_accumulator.sample_count as f32 / epoch_time
             } else {
                 0.0
             };
@@ -2269,7 +2285,7 @@ impl LLM {
 
 #[cfg(test)]
 mod tests {
-    use super::LLM;
+    use super::{EpochAccumulator, LLM};
     use crate::{
         embeddings::Embeddings, output_projection::OutputProjection, vocab::Vocab, EMBEDDING_DIM,
     };
@@ -2488,5 +2504,18 @@ mod tests {
         let output = OutputProjection::new(EMBEDDING_DIM, vocab.len());
 
         let _ = LLM::new(vocab, vec![Box::new(output), Box::new(embeddings)]);
+    }
+
+    #[test]
+    fn epoch_accumulator_uses_token_weighted_loss() {
+        let mut tracker = EpochAccumulator::default();
+        tracker.total_nll = 3.0;
+        tracker.total_tokens = 2;
+        tracker.total_grad_norm = 4.0;
+        tracker.sample_count = 2;
+
+        assert_eq!(tracker.avg_loss(), Some(1.5));
+        assert_eq!(tracker.avg_grad_norm(), Some(2.0));
+        assert!(tracker.has_valid_samples());
     }
 }

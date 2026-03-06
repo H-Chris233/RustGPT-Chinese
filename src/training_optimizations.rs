@@ -20,7 +20,7 @@
 //!  其余历史训练变体已删除，以减少教学项目的 API 表面积。
 
 use crate::checkpoint_manager::{CheckpointManager, CheckpointMetadata};
-use crate::llm::LLM;
+use crate::llm::{EpochAccumulator, LLM};
 
 /// 单个 checkpoint 训练 epoch 的汇总指标。
 ///
@@ -73,10 +73,7 @@ impl LLM {
         let current_lr =
             Self::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
 
-        let mut total_nll = 0.0;
-        let mut total_tokens = 0usize;
-        let mut total_grad_norm = 0.0;
-        let mut sample_count = 0usize;
+        let mut epoch_accumulator = EpochAccumulator::default();
 
         for training_row in tokenized_data {
             if training_row.len() < 2 {
@@ -85,41 +82,27 @@ impl LLM {
 
             let input_ids = &training_row[..training_row.len() - 1];
             let target_ids = &training_row[1..];
-
-            let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
-            else {
-                continue;
-            };
-
-            total_nll += step.loss_mean * (step.n_targets as f32);
-            total_tokens += step.n_targets;
-
-            //  记录梯度范数
-            total_grad_norm += Self::compute_grad_norm(&step.grads_output);
-
-            // 与 `train_monitored()` 保持一致：使用更严格的裁剪阈值提升稳定性。
-            Self::clip_gradients(&mut step.grads_output, 1.0);
-            self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
-
-            sample_count += 1;
+            let _ = self.run_standard_training_step(
+                input_ids,
+                target_ids,
+                pad_token_id,
+                current_lr,
+                &mut epoch_accumulator,
+            );
         }
 
-        if sample_count == 0 {
+        if !epoch_accumulator.has_valid_samples() {
             return None;
         }
 
-        let avg_loss = if total_tokens > 0 {
-            total_nll / total_tokens as f32
-        } else {
-            0.0
-        };
+        let avg_loss = epoch_accumulator.avg_loss().unwrap_or(0.0);
 
         Some(CheckpointEpochMetrics {
             avg_loss,
-            avg_grad_norm: total_grad_norm / sample_count as f32,
+            avg_grad_norm: epoch_accumulator.avg_grad_norm().unwrap_or(0.0),
             perplexity: avg_loss.exp(),
             current_lr,
-            sample_count,
+            sample_count: epoch_accumulator.sample_count,
             epoch_time_secs: epoch_start.elapsed().as_secs_f32(),
         })
     }
