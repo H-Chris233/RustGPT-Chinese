@@ -94,7 +94,7 @@ fn test_checkpoint_save_and_load() {
     let result = manager.save_checkpoint(&llm, metadata.clone());
     assert!(result.is_ok(), "应该能成功保存检查点");
 
-    let checkpoint_path = result.unwrap();
+    let checkpoint_path = result.unwrap().expect("应该返回已保存的 checkpoint 路径");
     assert!(checkpoint_path.exists(), "检查点文件应该存在");
 
     // 加载检查点
@@ -612,7 +612,8 @@ fn test_checkpoint_save_failure_does_not_advance_best_state() {
                 phase: "test".to_string(),
             },
         )
-        .expect("baseline checkpoint 应保存成功");
+        .expect("baseline checkpoint 应保存成功")
+        .expect("baseline best 应返回已保存路径");
 
     assert!((manager.get_best_loss() - 3.0).abs() < 1e-6);
     assert_eq!(manager.get_best_epoch(), 10);
@@ -964,7 +965,8 @@ fn test_load_checkpoint_rejects_corrupted_layer_shape() {
     };
     let checkpoint_path = manager
         .save_checkpoint(&llm, metadata)
-        .expect("基线 checkpoint 应保存成功");
+        .expect("基线 checkpoint 应保存成功")
+        .expect("基线 checkpoint 应返回已保存路径");
 
     let bytes = fs::read(&checkpoint_path).expect("应能读取 checkpoint 文件");
     let config = bincode::config::standard();

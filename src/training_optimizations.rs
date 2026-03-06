@@ -113,8 +113,8 @@ impl LLM {
     /// - `true`：至少写入了一个检查点文件；
     /// - `false`：没有管理器、策略判定无需保存，或保存失败。
     ///
-    /// 说明：`CheckpointManager::save_checkpoint()` 在“不需要保存”时会返回空 `PathBuf`，
-    /// 因此这里统一把“空路径”解释为“未写盘”。
+    /// 说明：`CheckpointManager::save_checkpoint()` 现在会显式返回 `Option<PathBuf>`，
+    /// 因此这里不再依赖“空路径”这种哑语义判断是否真的写盘。
     fn maybe_save_checkpoint(
         &self,
         checkpoint_manager: Option<&mut CheckpointManager>,
@@ -138,11 +138,8 @@ impl LLM {
         };
 
         match manager.save_checkpoint(self, metadata) {
-            Ok(path) => {
-                // `save_checkpoint()` 在“本轮不需要保存”时会返回空 PathBuf。
-                // 因此这里要用路径是否为空来判断是否真的发生了写盘。
-                !path.as_os_str().is_empty()
-            }
+            Ok(Some(_path)) => true,
+            Ok(None) => false,
             Err(e) => {
                 log::warn!("保存检查点失败:  {}", e);
                 false

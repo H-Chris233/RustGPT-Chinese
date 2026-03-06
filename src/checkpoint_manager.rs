@@ -199,7 +199,7 @@ impl CheckpointManager {
         &mut self,
         llm: &LLM,
         metadata: CheckpointMetadata,
-    ) -> Result<PathBuf, String> {
+    ) -> Result<Option<PathBuf>, String> {
         let is_best = metadata.loss < self.best_loss;
 
         // 构建需要写入的检查点列表。
@@ -217,7 +217,7 @@ impl CheckpointManager {
                         metadata.epoch, metadata.loss
                     ));
                 } else {
-                    return Ok(PathBuf::new());
+                    return Ok(None);
                 }
             }
             CheckpointStrategy::Last => {
@@ -227,7 +227,7 @@ impl CheckpointManager {
                 if *n > 0 && metadata.epoch % n == 0 {
                     checkpoint_names.push(format!("checkpoint_epoch_{}.bin", metadata.epoch));
                 } else {
-                    return Ok(PathBuf::new());
+                    return Ok(None);
                 }
             }
             CheckpointStrategy::BestAndLast => {
@@ -251,7 +251,7 @@ impl CheckpointManager {
                     checkpoint_names.push(format!("checkpoint_epoch_{}.bin", metadata.epoch));
                 }
                 if checkpoint_names.is_empty() {
-                    return Ok(PathBuf::new());
+                    return Ok(None);
                 }
             }
         }
@@ -377,9 +377,9 @@ impl CheckpointManager {
         // 注意：不能用 `last_path.exists()` 判断，因为目录里可能有历史遗留的 last 文件，
         // 但本轮策略未必写入 last；这种情况下返回旧 last 会误导调用方。
         if saved_last_this_call {
-            Ok(last_path)
+            Ok(Some(last_path))
         } else {
-            Ok(saved_paths.into_iter().next().unwrap_or_default())
+            Ok(saved_paths.into_iter().next())
         }
     }
 
