@@ -4,8 +4,9 @@
 
 use llm::{
     CheckpointManager, CheckpointMetadata, CheckpointStrategy, Embeddings, LLM, OutputProjection,
-    TransformerBlock, Vocab, EMBEDDING_DIM, HIDDEN_DIM,
+    TransformerBlock, Vocab, EMBEDDING_DIM, HIDDEN_DIM, Layer, LayerContext,
 };
+use ndarray::Array2;
 use std::fs;
 
 /// 创建一个小型测试模型
@@ -714,8 +715,8 @@ fn test_checkpoint_manager_restores_best_state_from_existing_dir() {
 fn compute_loss(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
     llm.set_training_mode(true);
     let pad_token_id = llm.vocab.pad_token_id();
-    let mut total_loss = 0.0;
-    let mut count = 0;
+    let mut total_nll = 0.0;
+    let mut total_tokens = 0usize;
 
     for training_row in tokenized_data {
         if training_row.len() < 2 {
@@ -735,20 +736,26 @@ fn compute_loss(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
         }
 
         let probs = llm::utils::softmax(&output);
-        total_loss += LLM::cross_entropy_loss_step(&probs, target_ids, pad_token_id);
-        count += 1;
+        let n_targets = target_ids.iter().filter(|&&t| t != pad_token_id).count();
+        total_nll +=
+            LLM::cross_entropy_loss_step(&probs, target_ids, pad_token_id) * (n_targets as f32);
+        total_tokens += n_targets;
     }
 
     llm.set_training_mode(false);
-    total_loss / count as f32
+    if total_tokens > 0 {
+        total_nll / total_tokens as f32
+    } else {
+        0.0
+    }
 }
 
 /// 辅助函数：计算给定模型在数据上的平均loss（评估模式，关闭dropout）
 fn compute_loss_eval(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
     llm.set_training_mode(false);
     let pad_token_id = llm.vocab.pad_token_id();
-    let mut total_loss = 0.0;
-    let mut count = 0;
+    let mut total_nll = 0.0;
+    let mut total_tokens = 0usize;
 
     for training_row in tokenized_data {
         if training_row.len() < 2 {
@@ -768,11 +775,107 @@ fn compute_loss_eval(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
         }
 
         let probs = llm::utils::softmax(&output);
-        total_loss += LLM::cross_entropy_loss_step(&probs, target_ids, pad_token_id);
-        count += 1;
+        let n_targets = target_ids.iter().filter(|&&t| t != pad_token_id).count();
+        total_nll +=
+            LLM::cross_entropy_loss_step(&probs, target_ids, pad_token_id) * (n_targets as f32);
+        total_tokens += n_targets;
     }
 
-    total_loss / count as f32
+    if total_tokens > 0 {
+        total_nll / total_tokens as f32
+    } else {
+        0.0
+    }
+}
+
+struct SeqLenAwareProbeLayer {
+    logits_len1: Array2<f32>,
+    logits_len2: Array2<f32>,
+}
+
+impl Layer for SeqLenAwareProbeLayer {
+    fn layer_type(&self) -> &str {
+        "SeqLenAwareProbeLayer"
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+
+    fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
+        let out = match input.shape()[1] {
+            1 => self.logits_len1.clone(),
+            2 => self.logits_len2.clone(),
+            other => panic!("unexpected seq len: {}", other),
+        };
+        (out, Box::new(()))
+    }
+
+    fn backward(&mut self, _ctx: &LayerContext, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
+        Array2::zeros((1, grads.nrows()))
+    }
+
+    fn parameters(&self) -> usize {
+        0
+    }
+
+    fn set_training_mode(&mut self, _training: bool) {}
+}
+
+fn logits_row_for_target_loss(vocab_size: usize, target_idx: usize, loss: f32) -> Vec<f32> {
+    let prob = (-loss).exp();
+    let distractor_prob = (1.0 - prob).max(1e-6);
+    let distractor_idx = if target_idx == 0 { 1 } else { 0 };
+
+    let mut row = vec![-1000.0f32; vocab_size];
+    row[target_idx] = prob.ln();
+    row[distractor_idx] = distractor_prob.ln();
+    row
+}
+
+#[test]
+fn test_compute_loss_eval_uses_token_weighted_mean() {
+    let vocab = Vocab::new(vec!["a", "b", "c"]);
+    let vocab_size = vocab.len();
+    let a_id = vocab.encode("a").unwrap();
+    let b_id = vocab.encode("b").unwrap();
+    let c_id = vocab.encode("c").unwrap();
+
+    // 样本1：1 个 target，loss = 3.0
+    let logits_len1 = Array2::from_shape_vec(
+        (1, vocab_size),
+        logits_row_for_target_loss(vocab_size, b_id, 3.0),
+    )
+    .unwrap();
+
+    // 样本2：2 个 target，每个 token 的 loss = 1.0
+    let mut logits_len2_data = logits_row_for_target_loss(vocab_size, b_id, 1.0);
+    logits_len2_data.extend(logits_row_for_target_loss(vocab_size, c_id, 1.0));
+    let logits_len2 = Array2::from_shape_vec((2, vocab_size), logits_len2_data).unwrap();
+
+    let mut llm = LLM::new(
+        vocab,
+        vec![Box::new(SeqLenAwareProbeLayer {
+            logits_len1,
+            logits_len2,
+        })],
+    );
+
+    let tokenized_data = vec![vec![a_id, b_id], vec![a_id, b_id, c_id]];
+    let loss = compute_loss_eval(&mut llm, &tokenized_data);
+
+    // token-weighted: (3.0 * 1 + 1.0 * 2) / 3 = 5/3
+    let expected = 5.0 / 3.0;
+    assert!(
+        (loss - expected).abs() < 1e-4,
+        "expected token-weighted mean {}, got {}",
+        expected,
+        loss
+    );
 }
 
 #[test]
