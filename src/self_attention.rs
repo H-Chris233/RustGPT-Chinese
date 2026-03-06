@@ -383,6 +383,9 @@ impl SelfAttention {
         }
     }
 
+    // ==========================
+    // 训练路径：梯度累积与参数更新
+    // ==========================
     pub fn zero_grad_accum(&mut self) {
         self.grad_w_q_accum.fill(0.0);
         self.grad_w_k_accum.fill(0.0);
@@ -551,6 +554,9 @@ impl SelfAttention {
         self.zero_grad_accum();
     }
 
+    // ==========================
+    // 基础工具：掩码 / QKV / 单头注意力
+    // ==========================
     /// **获取或创建因果掩码**
     ///
     /// 预生成并缓存下三角因果掩码，避免每次forward时逐元素填充。
@@ -570,6 +576,22 @@ impl SelfAttention {
             }
             mask
         })
+    }
+
+    /// 把 key padding mask 叠加到因果掩码上。
+    ///
+    /// 约定：`1.0` 表示真实 token，`0.0` 表示 PAD。
+    /// 对于 PAD 对应的 key 列，我们把整列置为 `-∞`，这样所有 query 都不会 attend 到它。
+    fn apply_key_padding_mask(mask: &mut Array2<f32>, key_padding_mask: Option<&Array1<f32>>) {
+        let Some(pad_mask) = key_padding_mask else {
+            return;
+        };
+
+        for (key_idx, &mask_value) in pad_mask.iter().enumerate() {
+            if mask_value < 0.5 {
+                mask.slice_mut(s![.., key_idx]).fill(f32::NEG_INFINITY);
+            }
+        }
     }
 
     /// **计算 Q、K、V 矩阵**
@@ -665,51 +687,6 @@ impl SelfAttention {
         (output, weights)
     }
 
-    /// **旧版单头注意力计算（教学/对照用，当前实现未直接调用）**
-    ///
-    /// 这是注意力机制的核心：通过 Q 和 K 的相似度，对 V 进行加权求和。
-    ///
-    /// # 参数
-    /// - `q`: Query 矩阵 `(seq_len, head_dim)`
-    /// - `k`: Key 矩阵 `(seq_len, head_dim)`
-    /// - `v`: Value 矩阵 `(seq_len, head_dim)`
-    ///
-    /// # 返回值
-    /// - `output`: 注意力输出 (seq_len, head_dim)
-    /// - `weights`: 注意力权重 (seq_len, seq_len)，用于反向传播
-    ///
-    /// 说明：
-    /// - 当前 SelfAttention 的 forward 实现走的是“多头 +（可选）分块/更稳定的实现路径”，
-    ///   因此这里暂时不会被调用；
-    /// - 之所以保留，是为了方便读者对照最朴素的“缩放点积注意力（single-head）”公式实现。
-    #[allow(dead_code)]
-    fn attention(q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
-        // 步骤 1: 计算缩放点积注意力分数
-        let dk = (q.ncols() as f32).sqrt(); // √d_k，按当前 head_dim 动态计算。
-        let k_t = k.t();
-        let mut scores = q.dot(&k_t) / dk; // (seq_len, seq_len)
-
-        // 步骤 2: 应用因果掩码（Causal Mask）
-        // 将未来位置设为 -∞，确保模型只能看到过去和当前的信息
-        let seq_len = scores.shape()[0];
-        for i in 0..seq_len {
-            if i + 1 < seq_len {
-                // 使用切片操作一次性设置整行的后续位置为负无穷
-                // 例如：位置0只能看自己，位置1可以看0和1，位置2可以看0、1、2
-                scores.slice_mut(s![i, i + 1..]).fill(f32::NEG_INFINITY);
-            }
-        }
-
-        // 步骤 3: Softmax 归一化
-        // softmax 将 -∞ 转换为 0，其他值转换为 0-1 之间的概率
-        let weights = stable_softmax(&scores);
-
-        // 步骤 4: 使用注意力权重加权 V
-        let output = weights.dot(v);
-
-        (output, weights)
-    }
-
     /// **将矩阵重塑为多头格式**
     ///
     /// 这个函数将 `(seq_len, embedding_dim)` 的矩阵重排为多头格式。
@@ -799,6 +776,25 @@ impl SelfAttention {
         result
     }
 
+    /// 把各个头的输出按 `(位置, 头)` 顺序拼回统一矩阵。
+    ///
+    /// 这个 helper 同时服务于：
+    /// - 训练/普通前向：query_len = key_len = 当前序列长度
+    /// - KV cache 推理：query_len = 新输入长度，key/value 长度可以更长
+    fn combine_head_outputs(&self, head_outputs: &[Array2<f32>], query_len: usize) -> Array2<f32> {
+        let mut result = Array2::zeros((query_len * self.num_heads, self.head_dim));
+        for (head_idx, head_output) in head_outputs.iter().enumerate() {
+            for seq_idx in 0..query_len {
+                let row_idx = seq_idx * self.num_heads + head_idx;
+                result.row_mut(row_idx).assign(&head_output.row(seq_idx));
+            }
+        }
+        result
+    }
+
+    // ==========================
+    // 前向路径：训练 / batch / 带 padding mask
+    // ==========================
     /// 多头自注意力的前向传播（优化版：使用缓存掩码与优化矩阵运算）
     ///
     /// # 算法流程
@@ -870,15 +866,7 @@ impl SelfAttention {
 
         // 2. 构造掩码：causal mask + (可选) padding mask
         let mut mask = self.get_or_create_causal_mask(seq_len).clone();
-        if let Some(pad_mask) = key_padding_mask {
-            // pad_mask: 1.0=真实token，0.0=PAD
-            for (j, &m) in pad_mask.iter().enumerate() {
-                if m < 0.5 {
-                    // 将该列全部置为 -∞：任何 query 都不能 attend 到这个 key（PAD）
-                    mask.slice_mut(s![.., j]).fill(f32::NEG_INFINITY);
-                }
-            }
-        }
+        Self::apply_key_padding_mask(&mut mask, key_padding_mask);
         let num_heads = self.num_heads;
 
         // 3. 分割为多个头
@@ -904,15 +892,8 @@ impl SelfAttention {
         }
 
         // 5. 合并所有头
-        let mut result = Array2::zeros((seq_len * num_heads, self.head_dim));
-        for (head_idx, head_output) in head_outputs.iter().enumerate() {
-            for seq_idx in 0..seq_len {
-                let row_idx = seq_idx * num_heads + head_idx;
-                result.row_mut(row_idx).assign(&head_output.row(seq_idx));
-            }
-        }
-
-        let combined = self.reverse_reshape_from_heads(&result);
+        let combined_heads = self.combine_head_outputs(&head_outputs, seq_len);
+        let combined = self.reverse_reshape_from_heads(&combined_heads);
         (q, k, v, combined, all_weights)
     }
 
@@ -952,6 +933,9 @@ impl SelfAttention {
         (out, ctx)
     }
 
+    // ==========================
+    // 推理路径：KV cache
+    // ==========================
     /// 启用KV缓存模式
     pub fn enable_kv_cache(&mut self) {
         self.use_kv_cache = true;
@@ -1012,19 +996,15 @@ impl SelfAttention {
             head_outputs.push(head_output);
         }
 
-        let mut result = Array2::zeros((seq_len_new * num_heads, self.head_dim));
-        for (head_idx, head_output) in head_outputs.iter().enumerate() {
-            for seq_idx in 0..seq_len_new {
-                let row_idx = seq_idx * num_heads + head_idx;
-                result.row_mut(row_idx).assign(&head_output.row(seq_idx));
-            }
-        }
-
-        let combined = self.reverse_reshape_from_heads(&result);
+        let combined_heads = self.combine_head_outputs(&head_outputs, seq_len_new);
+        let combined = self.reverse_reshape_from_heads(&combined_heads);
         combined.dot(&self.w_o)
     }
 }
 
+// ==========================
+// Layer trait 桥接：把教学/显式 ctx 路径接到统一层接口
+// ==========================
 impl Layer for SelfAttention {
     fn layer_type(&self) -> &str {
         "SelfAttention"
