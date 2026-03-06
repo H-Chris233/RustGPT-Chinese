@@ -31,6 +31,12 @@
 
 ## 🆕 最近更新
 
+### 训练接口收敛与教学化整理 (2026-03-06)
+- ✅ **训练公开入口收缩**：当前推荐公开入口仅保留 `train(...)`、`train_monitored(...)`、`train_bucketed_sequential(...)`、`train_with_checkpointing(...)`
+- ✅ **共享训练单步**：训练主线围绕 `PreparedTrainingStep`、`prepare_training_step(...)`、`backward_with_ctx(...)` 组织，避免重复复制单样本训练逻辑
+- ✅ **Loss 口径统一**：公开训练 API 统一使用 **token-weighted mean loss**，不同入口输出的 `Loss` / `PPL` 现在语义一致
+- ✅ **批次语义校准**：`train_bucketed_sequential(...)` 表示“按批次组织样本 + 批内逐样本顺序更新”，不是严格的 batch 梯度平均更新
+
 ### 训练正确性修复：PAD/mask/非法 target (2026-03-05)
 - ✅ **Batch/PAD mask 接线**：`SelfAttention` / `TransformerBlock` 的 `forward_batch(...)` 会消费 `attention_mask`（Key padding mask），为后续真正的 batch 向量化训练提供正确性门槛
 - ✅ **消除 `PAD_ID==0` 硬编码**：padding/loss/grad 以 `vocab.pad_token_id()` 为单一事实源；`BatchLoader` 支持注入 `pad_token_id`
@@ -46,12 +52,12 @@
 - ✅ **集成测试** - 验证保存/恢复后loss连续性（loss差异 < 0.1%），确保优化器状态正确恢复
 
 ### v0.3.1 - 训练性能优化 (2025-10-16)
-- 🚀 **阶段1训练优化** - 训练时间减少40%，收敛质量提升30%
-- ✅ **数据预处理缓存** - 避免重复tokenization，优化20-30%
-- ✅ **余弦退火学习率** - 带重启的调度策略，收敛更快更稳定
-- ✅ **早停机制** - 自动检测收敛，节省10-40%训练时间
-- ✅ **增强训练监控** - Loss, PPL, LR, Grad, Speed, ETA完整监控
-- ✅ **梯度累积** - 4步累积，训练稳定性提升40%
+- 🚀 **阶段1训练优化** - 引入训练监控、学习率调度与缓存策略
+- ✅ **数据预处理缓存** - 避免重复 tokenization
+- ✅ **余弦退火学习率** - 后续主训练入口已收敛为 warmup + cosine（默认无重启）
+- ✅ **早停机制** - 自动检测收敛
+- ✅ **增强训练监控** - Loss, PPL, LR, Grad, Speed, ETA 监控
+- ✅ **梯度累积** - 支持 micro-batch 累积，当前由 `train_monitored(...)` 控制
 
 ### v0.2.0 - 架构重构 (2025-10-12)
 - ✅ **Pre-LN Transformer 架构** - 从 Post-LN 升级到 Pre-LN (GPT-2 标准) 以获得更好的训练稳定性
@@ -250,6 +256,17 @@ checkpoints/
 模型输出：降雨是由云中的水蒸气凝结成水滴，当水滴变得太重而无法悬浮在空气中时形成的
 ```
 
+## 🧭 当前推荐训练入口
+
+| API | 输入 | 适用场景 | 说明 |
+|---|---|---|---|
+| `train(...)` | 原始文本 | 最基础教学入口 | 展示最小训练闭环，适合入门阅读 |
+| `train_monitored(...)` | 原始文本 | 推荐主训练入口 | 带学习率调度、早停、监控与梯度累积 |
+| `train_bucketed_sequential(...)` | 原始文本 | 进阶训练入口 | 使用 bucketing / padding mask 组织批次，但参数更新仍按批内逐样本顺序执行 |
+| `train_with_checkpointing(...)` | 预 tokenized 数据 | 可恢复训练 / 长训练任务 | 组合检查点保存、恢复、早停与训练连续性保障 |
+
+> 说明：当前项目把公开训练指标统一为 **token-weighted mean loss**，以避免不同训练入口之间出现不可比的 `Loss` / `PPL`。
+
 ## 🧮 技术实现
 
 ### 模型配置
@@ -367,7 +384,7 @@ cargo build --release
 欢迎贡献！这个项目非常适合学习和实验。
 
 ### 高优先级功能需求
-- **🧮 真正的 batch 向量化训练** - 基于 `forward_batch/backward_batch` 做批量矩阵运算，并实现“累积/平均梯度后一次 optimizer step”（当前 `train_monitored_batch` 仍是 batch 内顺序 SGD）
+- **🧮 真正的 batch 向量化训练** - 基于 `forward_batch/backward_batch` 做批量矩阵运算，并实现“累积/平均梯度后一次 optimizer step”（当前 `train_bucketed_sequential` 仍是 batch 内顺序 SGD）
 - **📊 评估指标** - 困惑度，基准测试，训练可视化
 - **🎯 注意力可视化** - 可视化中文文本的注意力模式
 - **📈 训练曲线** - 损失/准确率绘图

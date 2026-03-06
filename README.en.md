@@ -31,6 +31,12 @@ This is just a toy project that demonstrates how Chinese LLMs work under the hoo
 
 ## 🆕 Recent Updates
 
+### Training API Cleanup & Teaching-Focused Simplification (2026-03-06)
+- ✅ **Reduced public training surface**: the recommended public entrypoints are now `train(...)`, `train_monitored(...)`, `train_bucketed_sequential(...)`, and `train_with_checkpointing(...)`
+- ✅ **Shared single-step training path**: the teaching-oriented training flow now centers on `PreparedTrainingStep`, `prepare_training_step(...)`, and `backward_with_ctx(...)`
+- ✅ **Unified loss accounting**: public training APIs now report **token-weighted mean loss**, so `Loss` / `PPL` are semantically consistent across entrypoints
+- ✅ **Honest batch naming**: `train_bucketed_sequential(...)` means “batch-organized data with per-sample sequential updates”, not strict batch-gradient averaging
+
 ### Training Correctness: PAD/mask/illegal targets (2026-03-05)
 - ✅ **Batch/PAD mask wiring**: `SelfAttention` / `TransformerBlock` consume `attention_mask` in `forward_batch(...)` (key padding mask)
 - ✅ **Remove `PAD_ID==0` assumptions**: padding/loss/grads use `vocab.pad_token_id()` as the single source of truth; `BatchLoader` supports injecting `pad_token_id`
@@ -46,12 +52,12 @@ This is just a toy project that demonstrates how Chinese LLMs work under the hoo
 - ✅ **Integration Tests** - Verifies loss continuity after save/restore (< 0.1% difference)
 
 ### v0.3.1 - Training Performance Optimization (2025-10-16)
-- 🚀 **Phase 1 Training Optimizations** - 40% faster training, 30% better convergence
-- ✅ **Data Preprocessing Cache** - Avoid repeated tokenization, 20-30% speedup
-- ✅ **Cosine Annealing LR** - Learning rate scheduling with restarts, faster convergence
-- ✅ **Early Stopping** - Auto-detect convergence, save 10-40% training time
-- ✅ **Enhanced Training Monitor** - Loss, PPL, LR, Grad, Speed, ETA full monitoring
-- ✅ **Gradient Accumulation** - 4-step accumulation, 40% improved stability
+- 🚀 **Phase 1 Training Optimizations** - Introduced monitoring, scheduling, and caching support for training
+- ✅ **Data Preprocessing Cache** - Avoid repeated tokenization
+- ✅ **Cosine LR Scheduling** - The current main training path has since converged to warmup + cosine decay (no restarts by default)
+- ✅ **Early Stopping** - Auto-detect convergence
+- ✅ **Enhanced Training Monitor** - Loss, PPL, LR, Grad, Speed, ETA monitoring
+- ✅ **Gradient Accumulation** - Supported through the monitored training path when enabled
 
 ### v0.3.0 - Model Optimization for Small Datasets (2025-10-15)
 - ✅ **Reduced Model Size** - Optimized for limited training data: 2 layers (was 4), 256 embedding dim (was 512)
@@ -167,18 +173,12 @@ git clone https://github.com/H-Chris233/RustGPT-Chinese.git
 cd RustGPT-Chinese
 cargo run
 
-# The model will (v0.3.1 with performance optimizations):
-# 1. Build vocabulary from Chinese training data (with jieba-rs tokenization support)
-# 2. Pre-train on Chinese factual statements (with early stopping, cosine annealing LR)
-# 3. Instruction-tune on Chinese conversational data (with gradient accumulation)
-# 4. Enter interactive mode for Chinese testing
-#
-# 🚀 v0.3.1 训练优化特性:
-# - 数据预处理缓存 (减少20-30%训练时间)
-# - 余弦退火学习率调度 (提升15-25%收敛速度)
-# - 早停机制 (节省10-40%训练时间)
-# - 完整训练监控 (Loss, PPL, LR, Grad, Speed, ETA)
-# - 梯度累积 (提升40%训练稳定性)
+# The model will:
+# 1. Build a vocabulary from Chinese training data (with jieba-rs tokenization support)
+# 2. Pre-train on Chinese factual statements
+# 3. Instruction-tune on Chinese conversational data
+# 4. Auto-save checkpoints (best + last)
+# 5. Enter interactive mode for testing
 ```
 
 ### Performance Tips
@@ -207,30 +207,40 @@ Enter prompt: 降雨的原因是什么?
 Model output: 降雨是由云中的水蒸气凝结成水滴，当水滴变得太重而无法悬浮在空气中时形成的
 ```
 
+## 🧭 Recommended Training Entrypoints
+
+| API | Input | Best For | Notes |
+|---|---|---|---|
+| `train(...)` | Raw text | Minimal teaching path | Shows the smallest complete training loop |
+| `train_monitored(...)` | Raw text | Recommended main training path | Includes scheduling, early stopping, monitoring, and gradient accumulation |
+| `train_bucketed_sequential(...)` | Raw text | Advanced training path | Uses bucketing and padding masks, but still updates parameters sequentially per sample inside each batch |
+| `train_with_checkpointing(...)` | Pre-tokenized data | Resume / long-running training | Adds checkpoint save/load, rollback, and continuity guarantees |
+
+> Note: the public training APIs now use a shared **token-weighted mean loss** convention, so reported `Loss` / `PPL` values are comparable across entrypoints.
+
 ## 🧮 Technical Implementation
 
-### Model Configuration (v0.3.1)
+### Model Configuration
 - **Vocabulary Size**: Dynamic (built from training data with jieba-rs integration for Chinese support)
 - **Embedding Dimension**: 256 (optimized for small datasets)
 - **Hidden Dimension**: 512 (optimized for small datasets)
 - **Max Sequence Length**: 128 tokens (optimized for small datasets)
 - **Architecture**: 2 Pre-LN Transformer blocks + embeddings + output projection
 - **Total Parameters**: ~10M (optimized for limited training data)
-- **Training Strategy**: 500 epochs with advanced optimizations (v0.3.1)
+- **Training Strategy**: multi-stage training with monitored training, checkpointing, and resume support
 
-### Training Details (v0.3.1)
+### Training Details
 - **Optimizer**: Adam (β₁=0.9, β₂=0.999, ε=1e-8) with gradient clipping
 - **LR Schedule**: Cosine decay + warmup (no restarts by default)
 - **Default LR (main training entry)**: 0.0001
 - **Loss Function**: `log_softmax` + NLL (cross entropy from log-probs); PAD (`vocab.pad_token_id()`) is excluded from loss/grads
 - **Gradient Clipping**: L2 norm capped at 1.0 on the main training path
 - **Regularization**: Dropout layers with 10% rate (inverted dropout)
-- **🚀 v0.3.1 训练优化**:
-  - 数据预处理缓存 (避免重复tokenization)
-  - 余弦退火学习率调度 (带重启机制)
-  - 早停机制 (自动检测训练收敛)
-  - 梯度累积 (4步，等价batch_size=4)
-  - 完整训练监控 (Loss, PPL, LR, Grad, Speed, ETA)
+- **Current training semantics**:
+  - Monitored training uses warmup + cosine decay (no restarts by default)
+  - Public training APIs report token-weighted mean loss
+  - Gradient accumulation is optional and controlled by `train_monitored(...)`
+  - Checkpointed training adds save/load, rollback, and resume support
 
 ### Key Features
 - **Modern Pre-LN Transformer** - GPT-2/3 standard architecture for stable training
@@ -327,14 +337,13 @@ No PyTorch, TensorFlow, or Candle - just pure Rust and linear algebra!
 - **[CLAUDE.md](CLAUDE.md)** - Development guidelines for Claude Code assistant
 - **[批量训练与动态掩码](docs/批量训练与动态掩码.md)** - Batch training & dynamic masking notes (CN)
 - **[检查点管理与早停机制实现](docs/检查点管理与早停机制实现.md)** - Checkpointing & early stopping (CN)
-- **[性能优化文档](docs/性能优化文档.md)** - Performance optimizations (CN)
 
 ## 🤝 Contributing
 
 Contributions are welcome! This project is perfect for learning and experimentation.
 
 ### High Priority Features Needed
-- **🧮 True vectorized batch training** - Batch GEMMs + “accumulate/average grads then one optimizer step” (current `train_monitored_batch` is still per-sample SGD inside a batch)
+- **🧮 True vectorized batch training** - Batch GEMMs + “accumulate/average grads then one optimizer step” (current `train_bucketed_sequential` is still per-sample SGD inside a batch)
 - **📊 Evaluation metrics** - Perplexity, benchmarks, training visualizations
 - **🎯 Attention visualization** - Visualize attention patterns for Chinese text
 - **📈 Training curves** - Loss/accuracy plotting
