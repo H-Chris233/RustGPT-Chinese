@@ -2518,4 +2518,60 @@ mod tests {
         assert_eq!(tracker.avg_grad_norm(), Some(2.0));
         assert!(tracker.has_valid_samples());
     }
+
+    #[test]
+    fn train_monitored_tail_accumulation_matches_manual_epoch_replay() {
+        let texts = vec!["a".to_string(), "a b".to_string(), "b".to_string()];
+        let vocab = Vocab::build_from_texts(&texts);
+
+        let mut monitored = make_two_layer_training_model(vocab.clone());
+        let mut manual = make_two_layer_training_model(vocab.clone());
+
+        let epochs = monitored.train_monitored(vec!["a", "a b", "b"], 1, 0.05, 10, 2);
+        assert_eq!(epochs, 1);
+
+        let tokenized_data: Vec<Vec<usize>> = ["a", "a b", "b"]
+            .iter()
+            .map(|input| LLM::tokenize_training_with_vocab(&manual.vocab, input))
+            .collect();
+        let pad_token_id = manual.vocab.pad_token_id();
+        let warmup_epochs = LLM::recommend_warmup_epochs(1);
+        let current_lr = LLM::cosine_with_warmup_lr(0.05, 0, 1, 0, warmup_epochs);
+
+        manual.set_training_mode(true);
+        manual.zero_grad_accum();
+        let mut accum_counter = 0usize;
+        let mut accum_tokens = 0usize;
+
+        for training_row in &tokenized_data {
+            let input_ids = &training_row[..training_row.len() - 1];
+            let target_ids = &training_row[1..];
+            let Some(mut step) = manual.prepare_training_step(input_ids, target_ids, pad_token_id)
+            else {
+                continue;
+            };
+
+            LLM::clip_gradients(&mut step.grads_output, 1.0);
+            LLM::rescale_logits_grads_for_accumulation(&mut step.grads_output, step.n_targets);
+            manual.backward_accumulate_with_ctx(&step.layer_ctxs, &step.grads_output);
+            accum_counter += 1;
+            accum_tokens += step.n_targets;
+
+            if accum_counter >= 2 {
+                manual.step_accumulated(current_lr, LLM::token_weighted_accum_scale(accum_tokens));
+                accum_counter = 0;
+                accum_tokens = 0;
+            }
+        }
+
+        if accum_counter > 0 {
+            manual.step_accumulated(current_lr, LLM::token_weighted_accum_scale(accum_tokens));
+        }
+        manual.set_training_mode(false);
+
+        let tol = 1e-6_f32;
+        assert!(max_diff(&embedding_weights(&monitored), &embedding_weights(&manual)) < tol);
+        assert!(max_diff(&output_weights(&monitored), &output_weights(&manual)) < tol);
+        assert!(max_diff(&output_bias(&monitored), &output_bias(&manual)) < tol);
+    }
 }
