@@ -65,17 +65,13 @@ pub struct FeedForward {
     /// **第二层偏置** b₂: (1, embedding_dim) = (1, 512)
     pub b2: Array2<f32>,
 
-    // ========== 缓存变量（用于反向传播） ==========
-    /// **缓存的输入** x: (seq_len, embedding_dim)
-    pub input: Option<Array2<f32>>,
-
-    /// **ReLU 激活前的隐藏层** (seq_len, 1024)
-    /// 保存 W₁·x + b₁ 的结果，反向传播时需要计算 ReLU 梯度
-    pub hidden_pre_activation: Option<Array2<f32>>,
-
-    /// **ReLU 激活后的隐藏层** (seq_len, 1024)
-    /// 保存 ReLU(W₁·x + b₁) 的结果，反向传播时需要计算 W₂ 的梯度
-    pub hidden_post_activation: Option<Array2<f32>>,
+    // ========== 反向传播所需中间量（ctx 驱动） ==========
+    //
+    // 教学说明：
+    // - 旧实现会把 input / hidden_pre_activation / hidden_post_activation 缓存在 self 里；
+    // - 这会在 batch 场景出现“缓存覆盖”问题（同一层实例 forward 多个样本后，只剩最后一个样本的缓存）；
+    // - 新版改为：在 `Layer::forward()` 返回的 `FeedForwardContext` 中保存这些中间量，
+    //   backward/accumulate 时由调用方显式传回。
 
     // ========== Adam 优化器（每个参数一个） ==========
     /// W₁ 的优化器
@@ -143,9 +139,6 @@ impl FeedForward {
             b1: Array2::zeros((1, hidden_dim)), // 偏置初始化为0
             w2,
             b2: Array2::zeros((1, embedding_dim)), // 偏置初始化为0
-            input: None,
-            hidden_pre_activation: None,
-            hidden_post_activation: None,
             optimizer_w1: Adam::new((embedding_dim, hidden_dim)),
             optimizer_b1: Adam::new((1, hidden_dim)),
             optimizer_w2: Adam::new((hidden_dim, embedding_dim)),
@@ -164,24 +157,15 @@ impl FeedForward {
         self.grad_b2_accum.fill(0.0);
     }
 
+    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        // 注意：这里不能直接持有 `self.input.as_ref()` 的借用再调用 `&mut self` 方法，
-        // 否则会触发 Rust 的借用冲突（E0502）。因此我们把需要的值 clone 出来再计算。
-        let (Some(input), Some(hidden_pre_activation), Some(hidden_post_activation)) = (
-            self.input.as_ref().cloned(),
-            self.hidden_pre_activation.as_ref().cloned(),
-            self.hidden_post_activation.as_ref().cloned(),
-        ) else {
-            log::warn!("FeedForward.backward_accumulate 在未执行 forward 的情况下被调用，跳过累积");
-            return grads.clone();
-        };
-
-        self.backward_accumulate_from_values(
-            &input,
-            &hidden_pre_activation,
-            &hidden_post_activation,
-            grads,
-        )
+        let _ = grads;
+        // 历史接口依赖层内缓存字段；本轮重构已移除这些字段，因此直接 fail-fast。
+        //
+        // 正确姿势：
+        // - forward 时保留 ctx：`let (_out, ctx) = ffn.forward(&input);`
+        // - 累积反传：`ffn.backward_accumulate_with_ctx(&ctx, &grads);`
+        panic!("FeedForward.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
     }
 
     /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
@@ -372,11 +356,6 @@ impl Layer for FeedForward {
 
         // 第二层：线性变换到输出
         let output = hidden_post_activation.dot(&self.w2) + &self.b2;
-
-        // 兼容旧实现：仍把中间量写入 self 缓存，以支持 backward_accumulate 等历史接口。
-        self.input = Some(input.clone());
-        self.hidden_pre_activation = Some(hidden_pre_activation.clone());
-        self.hidden_post_activation = Some(hidden_post_activation.clone());
 
         (
             output,

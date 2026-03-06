@@ -91,19 +91,12 @@ pub struct LayerNorm {
     /// 控制标准化后特征的中心位置
     pub beta: Array2<f32>,
 
-    // ========== 前向传播缓存（用于反向传播） ==========
-    /// **缓存输入**: 原始输入值
-    pub cached_input: Option<Array2<f32>>,
-
-    /// **缓存均值**: 每个样本在特征维度上的均值
-    pub cached_mean: Option<Array2<f32>>,
-
-    /// **缓存 inv_std**: 每个样本在特征维度上的 `1 / sqrt(var + ε)`
-    ///
-    /// 说明：
-    /// - 早期版本缓存的是 `std`，并采用 `(std + ε)` 的非标准归一化；
-    /// - 为保证前向/反向数学一致性（标准 LayerNorm），这里缓存 `inv_std`。
-    pub cached_inv_std: Option<Array2<f32>>,
+    // ========== 反向传播所需中间量（ctx 驱动） ==========
+    //
+    // 教学说明：
+    // - LayerNorm 的 backward 需要 input / mean / inv_std；
+    // - 旧实现会把它们缓存在 self.cached_*，但这会在 batch 场景发生缓存覆盖；
+    // - 新版把这些量放入 `LayerNormContext`（forward 的返回 ctx）中，并在 backward 时显式传回。
 
     // ========== Adam 优化器 ==========
     pub optimizer_gamma: Adam,
@@ -138,9 +131,6 @@ impl LayerNorm {
             epsilon: EPSILON,                        // 使用统一的 EPSILON 常量
             gamma: Array2::ones((1, embedding_dim)), // γ 初始化为 1
             beta: Array2::zeros((1, embedding_dim)), // β 初始化为 0
-            cached_input: None,
-            cached_mean: None,
-            cached_inv_std: None,
             optimizer_gamma: Adam::new((1, embedding_dim)),
             optimizer_beta: Adam::new((1, embedding_dim)),
             grad_gamma_accum: Array2::zeros((1, embedding_dim)),
@@ -155,19 +145,15 @@ impl LayerNorm {
     }
 
     /// 仅计算并累积参数梯度，不更新参数（用于梯度累积）。
+    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        // 注意：这里不能在持有 `self.cached_*` 的不可变借用时再调用 `&mut self` 方法，
-        // 否则会触发 Rust 的借用冲突（E0502）。因此我们把需要的值 clone 出来再计算。
-        let (Some(input), Some(mean), Some(inv_std)) = (
-            self.cached_input.as_ref().cloned(),
-            self.cached_mean.as_ref().cloned(),
-            self.cached_inv_std.as_ref().cloned(),
-        ) else {
-            log::warn!("LayerNorm.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
-            return grads.clone();
-        };
-
-        self.backward_accumulate_from_values(&input, &mean, &inv_std, grads)
+        let _ = grads;
+        // 历史接口依赖层内 cached_*；本轮重构已移除这些字段，因此直接 fail-fast。
+        //
+        // 正确姿势：
+        // - forward 时保留 ctx：`let (_y, ctx) = ln.forward(&input);`
+        // - 累积反传：`ln.backward_accumulate_with_ctx(&ctx, &grads);`
+        panic!("LayerNorm.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
     }
 
     /// 仅计算并累积参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
@@ -359,11 +345,6 @@ impl Layer for LayerNorm {
 
         let normalized = centered * &inv_std;
         let out = &self.gamma * &normalized + &self.beta;
-
-        // 兼容旧实现：把中间量写回 self.cached_*，供 backward_accumulate 等历史接口使用。
-        self.cached_input = Some(input.clone());
-        self.cached_mean = Some(mean.clone());
-        self.cached_inv_std = Some(inv_std.clone());
 
         (
             out,

@@ -32,14 +32,14 @@ fn layer_norm_gradients_match_numerical() {
     let gamma = Array2::from_shape_vec((1, dim), vec![1.2, -0.7, 0.3]).unwrap();
     let beta = Array2::from_shape_vec((1, dim), vec![0.1, 0.2, -0.1]).unwrap();
 
-    // 解析梯度（来自 backward_accumulate，不更新参数）
+    // 解析梯度（来自 backward_accumulate_with_ctx，不更新参数）
     let mut ln = LayerNorm::new(dim);
     ln.gamma = gamma.clone();
     ln.beta = beta.clone();
 
-    let (_y, _ctx) = ln.forward(&input);
+    let (_y, ctx) = ln.forward(&input);
     ln.zero_grad_accum();
-    let grad_input = ln.backward_accumulate(&grad_out);
+    let grad_input = ln.backward_accumulate_with_ctx(&ctx, &grad_out);
     let grad_gamma = ln.grad_gamma_accum.clone();
     let grad_beta = ln.grad_beta_accum.clone();
 

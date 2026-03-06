@@ -990,8 +990,11 @@ impl LLM {
     // 设计说明（教育项目优先）：
     // - 本项目的 `Layer::backward()` 设计为“反向传播 + 立刻更新参数（Adam step）”。
     // - 为了实现正确的梯度累积，我们不能简单把多个样本的 logits 梯度攒起来再 backward 一次，
-    //   因为各层 backward 依赖 forward 缓存（cached_input 等），缓存会被覆盖，导致数学错误。
-    // - 正确做法是：每个 micro-batch 立即 backward（保证缓存对应），但把 *参数梯度* 累积，
+    //   因为**旧版**各层 backward 会从 `self.cached_*` 读取 forward 的中间量；如果在同一层实例上
+    //   对多个样本 forward 而不保存每个样本的中间量，就会发生“缓存覆盖”，导致数学错误。
+    // - 本轮重构已将中间量改为 **ctx 驱动**（forward 返回 ctx，反传显式消费 ctx），但正确的
+    //   梯度累积仍然需要“每个 micro-batch 对应一份 ctx”。
+    // - 正确做法是：每个 micro-batch 立即 backward（保证 ctx 对应），但把 *参数梯度* 累积，
     //   最终对平均梯度做一次参数更新。
     //
     // 由于网络里使用 `Box<dyn Layer>`（动态分发），我们在这里对已知层类型做 downcast，
@@ -1023,9 +1026,11 @@ impl LLM {
         layer_ctxs: &[LayerContext],
         grads_output: &Array2<f32>,
     ) -> Array2<f32> {
+        // 这是结构性错误：ctx 与层必须一一对应，否则 zip 会截断并导致“部分层不反传/层与 ctx 错配”，
+        // 训练会静默算错。因此这里直接 fail-fast。
         if layer_ctxs.len() != self.network.len() {
-            log::warn!(
-                "LLM.backward_accumulate_with_ctx: layer_ctxs.len()={} 与 network.len()={} 不一致，可能导致梯度错配",
+            panic!(
+                "LLM.backward_accumulate_with_ctx: layer_ctxs.len()={} 与 network.len()={} 不一致，无法保证梯度正确性",
                 layer_ctxs.len(),
                 self.network.len()
             );
@@ -1185,9 +1190,11 @@ impl LLM {
                 // 前向传播：必须显式收集每层 ctx，供梯度累积路径使用。
                 //
                 // 教学说明：
-                // - 虽然我们“每个 micro-batch 都立刻 backward”，理论上 cached_* 不会被后续样本覆盖；
-                // - 但如果累积接口仍依赖 cached_*，就意味着 cached_* 字段永远删不掉；
-                // - 因此这里直接使用 ctx 驱动的累积反传，作为第二轮重构的起点。
+                // - 在**旧版**实现中，各层会把中间量写入 `self.cached_*`，若不立刻 backward 就可能被覆盖；
+                // - 本轮重构已将中间量改为 **ctx 驱动**（forward 返回 ctx，反传显式消费 ctx），从而可以逐步
+                //   删除 `cached_*` 字段并避免“层内缓存污染”；
+                // - 但梯度累积仍然有一个不变的约束：必须为每个 micro-batch 保留其对应的 `layer_ctxs`，
+                //   并在累积反传时把 ctx 逐层归还（否则中间量会丢失/错配）。
                 let mut layer_ctxs: Vec<LayerContext> = Vec::with_capacity(self.network.len());
                 for layer in &mut self.network {
                     let (out, ctx) = layer.forward(&input);
@@ -1227,7 +1234,7 @@ impl LLM {
                 // ==========================
                 //
                 // 关键点：
-                // - 必须对每个 micro-batch 立即执行 backward（否则层内 cached_* 会被后续样本覆盖）；
+                // - 必须对每个 micro-batch 保留并及时消费其对应的 ctx（常见做法：forward 后立刻累积反传）；
                 // - 但不立刻更新参数，而是把参数梯度累加到各层的累积 buffer；
                 // - 当累积步数到达阈值时，再统一对“平均梯度”执行一次参数更新（scale=1/steps）。
                 //
@@ -1392,9 +1399,13 @@ impl LLM {
                     continue;
                 }
 
-                // 重要：本项目的各层 backward 依赖 forward 缓存（cached_input 等）。
-                // 因此在“同一模型实例”上做多个样本的 forward 后再统一 backward，会导致缓存被覆盖，
-                // 从而出现梯度与激活不匹配的严重错误。
+                // 重要（历史背景 + 设计约束）：
+                // - **旧版**各层 backward 会从 `self.cached_*` 读取 forward 的中间量，因此如果你在
+                //   “同一模型实例/同一层实例”上先对多个样本 forward、再统一 backward，就会发生
+                //   “缓存覆盖”，从而出现梯度与激活不匹配的严重错误。
+                // - 本轮重构已将中间量改为 **ctx 驱动**（forward 返回 ctx，反传显式消费 ctx），因此
+                //   不再依赖 `cached_*` 字段；但如果想实现“先对整个 batch forward、再统一 backward”，
+                //   仍然必须为 batch 内每个样本保存其对应的 `layer_ctxs`，否则中间量会丢失/错配。
                 //
                 // 为了保证正确性，这里采用最清晰的做法：
                 // - 对 batch 内每个样本执行：forward -> loss -> backward（立刻更新参数）。
@@ -1541,11 +1552,20 @@ impl LLM {
     }
 
     /// 计算 3D 梯度张量的 L2 范数
+    ///
+    /// 教学/备用说明：
+    /// - 当前训练主链路主要使用 1D/2D 的梯度（例如线性层权重与偏置）；
+    /// - 这里保留 3D 版本，便于以后加入“Embedding/卷积等 3D 张量”时复用；
+    /// - 为避免 `dead_code` 警告影响阅读，这里显式允许未使用。
+    #[allow(dead_code)]
     fn compute_grad_norm_3d(grads: &Array3<f32>) -> f32 {
         grads.iter().map(|&x| x * x).sum::<f32>().sqrt()
     }
 
     /// 3D 梯度裁剪
+    ///
+    /// 见 `compute_grad_norm_3d` 的教学/备用说明。
+    #[allow(dead_code)]
     fn clip_gradients_3d(grads: &mut Array3<f32>, max_norm: f32) {
         let norm = Self::compute_grad_norm_3d(grads);
         if norm > max_norm {

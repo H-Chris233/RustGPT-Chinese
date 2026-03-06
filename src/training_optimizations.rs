@@ -532,6 +532,8 @@ impl LLM {
 
         for epoch in resume_epoch..max_epochs {
             let epoch_start = std::time::Instant::now();
+            // 避免同一轮中“最佳保存 + 周期保存”重复写盘（BestAndLast 策略下尤为明显）。
+            let mut saved_checkpoint_this_epoch = false;
             // 与 `train_monitored()` 保持一致：余弦退火 + warmup（禁用重启）。
             let warmup_epochs = Self::recommend_warmup_epochs(max_epochs);
             let current_lr =
@@ -659,8 +661,6 @@ impl LLM {
 
                 //  保存最佳检查点
                 if let Some(ref mut manager) = checkpoint_manager {
-                    manager.update_best_loss(avg_loss, epoch);
-
                     let metadata = crate::checkpoint_manager::CheckpointMetadata {
                         epoch,
                         loss: avg_loss,
@@ -671,8 +671,17 @@ impl LLM {
                         phase: phase.to_string(),
                     };
 
-                    if let Err(e) = manager.save_checkpoint(self, metadata) {
-                        log::warn!("保存检查点失败:  {}", e);
+                    match manager.save_checkpoint(self, metadata) {
+                        Ok(path) => {
+                            // `save_checkpoint()` 在“本轮不需要保存”时会返回空 PathBuf。
+                            // 因此这里要用路径是否为空来判断是否真的发生了写盘。
+                            if !path.as_os_str().is_empty() {
+                                saved_checkpoint_this_epoch = true;
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!("保存检查点失败:  {}", e);
+                        }
                     }
                 }
             } else {
@@ -711,7 +720,7 @@ impl LLM {
             //  周期性保存检查点（如果配置了）
             //  注意：对于BestAndLast策略，即使loss不是best也要保存last checkpoint
             if let Some(ref mut manager) = checkpoint_manager {
-                if manager.should_save(epoch, avg_loss) {
+                if !saved_checkpoint_this_epoch && manager.should_save(epoch, avg_loss) {
                     let metadata = crate::checkpoint_manager::CheckpointMetadata {
                         epoch,
                         loss: avg_loss,

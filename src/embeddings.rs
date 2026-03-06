@@ -64,7 +64,7 @@ struct EmbeddingsContext {
 
 /// **嵌入层结构体**
 ///
-/// 包含词嵌入矩阵、位置编码器和用于反向传播的缓存。
+/// 包含词嵌入矩阵、位置编码器，以及训练所需的优化器/梯度累积 buffer。
 pub struct Embeddings {
     /// **词嵌入矩阵** (vocab_size × embedding_dim)
     ///
@@ -82,19 +82,6 @@ pub struct Embeddings {
     /// **注意**：位置编码是固定的，不参与训练（不需要梯度）。
     pub position_encoder: PositionEncoding,
 
-    /// **缓存的输入** (用于反向传播)
-    ///
-    /// 保存前向传播时的 token ID，反向传播时需要知道更新哪些行的嵌入。
-    pub cached_input: Option<Array2<f32>>,
-
-    /// **批量前向的缓存输入**（用于 backward_batch）
-    ///
-    /// 说明：
-    /// - 之前版本的 `forward_batch/backward_batch` 是“演示性”的：forward 能输出，
-    ///   但 backward 没有更新嵌入矩阵，属于教学项目中会误导读者的错误实现。
-    /// - 这里我们显式缓存 batch 的 token IDs，并在 `backward_batch` 中按 mask 累积梯度。
-    pub cached_input_batch: Option<Array2<usize>>,
-
     /// **Adam 优化器**
     ///
     /// 用于更新词嵌入矩阵的参数。每个词的嵌入向量独立更新。
@@ -105,7 +92,8 @@ pub struct Embeddings {
     // =====================================================================
     //
     // 与 OutputProjection 同理：为了实现“正确的梯度累积”，我们需要在每个 micro-batch
-    // 立刻执行 backward（保证缓存正确），但把参数梯度累加起来，等到累积步结束再更新一次。
+    // 立刻执行 backward（保证“本次 forward 的 ctx/输入”与 grads 一一对应），但把参数梯度累加起来，
+    // 等到累积步结束再更新一次。
     pub token_grads_accum: Array2<f32>,
 
     /// **位置编码缓存** (性能优化)
@@ -120,8 +108,6 @@ impl Default for Embeddings {
         Self {
             token_embeddings: Self::init_embeddings(vocab.words.len(), EMBEDDING_DIM),
             position_encoder: PositionEncoding::new(),
-            cached_input: None,
-            cached_input_batch: None,
             token_optimizer: Adam::new((vocab.words.len(), EMBEDDING_DIM)),
             token_grads_accum: Array2::<f32>::zeros((vocab.words.len(), EMBEDDING_DIM)),
             position_cache: Array2::<f32>::zeros((crate::MAX_SEQ_LEN, EMBEDDING_DIM)),
@@ -142,8 +128,6 @@ impl Embeddings {
         Self {
             token_embeddings: Self::init_embeddings(vocab_size, EMBEDDING_DIM),
             position_encoder: PositionEncoding::new(),
-            cached_input: None,
-            cached_input_batch: None,
             token_optimizer: Adam::new((vocab_size, EMBEDDING_DIM)),
             token_grads_accum: Array2::<f32>::zeros((vocab_size, EMBEDDING_DIM)),
             position_cache: Array2::<f32>::zeros((crate::MAX_SEQ_LEN, EMBEDDING_DIM)),
@@ -161,7 +145,7 @@ impl Embeddings {
     /// - Embeddings 的参数是一个大矩阵：`token_embeddings[vocab_size, d_model]`；
     /// - backward 时我们只更新“本次序列里出现过的 token 对应的行”；
     /// - 因此只要我们能拿到 token_id 序列，就能完成累积；
-    /// - 新版推荐从 `ctx` 取 token_ids，避免依赖 `self.cached_input`（批量/并发时会被覆盖）。
+    /// - 新版推荐从 `ctx` 取 token_ids，避免依赖层内 `cached_*` 字段（批量/并发时会被覆盖）。
     fn accumulate_token_grads(&mut self, token_ids: &[usize], grads: &Array2<f32>) {
         let grads = grads.view(); // (seq_len, embedding_dim)
 
@@ -187,20 +171,17 @@ impl Embeddings {
         }
     }
 
-    /// 用于梯度累积：只累加梯度，不更新参数（legacy：依赖 self.cached_input）。
+    /// 用于梯度累积：旧接口（**已废弃**）。
     ///
-    /// 说明：
-    /// - 该方法保留是为了兼容仓库里尚未完全迁移到 ctx 的旧代码；
-    /// - 新的调用方请优先使用 `backward_accumulate_with_ctx()`。
-    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let Some(input) = self.cached_input.as_ref() else {
-            log::warn!("Embeddings.backward_accumulate 在未执行 forward 的情况下被调用，跳过累积");
-            return grads.clone();
-        };
-
-        let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
-        self.accumulate_token_grads(&token_ids, grads);
-        grads.to_owned()
+    /// 历史原因：
+    /// - 旧版 accumulate 依赖 `self.cached_input` 从层内部取回 token_id；
+    /// - 这会让“正确性”绑定到 `cached_*`，从而阻碍我们删除缓存字段，也会在 batch 场景埋雷。
+    ///
+    /// 本轮重构已经删除了 `cached_input` 字段，因此该接口将 fail-fast，避免静默错误。
+    /// 新代码请使用：`backward_accumulate_with_ctx(ctx, grads)`。
+    #[deprecated(note = "已迁移到 ctx：请改用 backward_accumulate_with_ctx(ctx, grads)")]
+    pub fn backward_accumulate(&mut self, _grads: &Array2<f32>) -> Array2<f32> {
+        panic!("Embeddings.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
     }
 
     /// 用于梯度累积：只累加梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
@@ -402,7 +383,7 @@ impl Layer for Embeddings {
     /// 返回 (seq_len, embedding_dim) 的嵌入矩阵，每一行是一个512维的向量。
     ///
     /// # 关于“显式上下文（ctx）”
-    /// 在旧实现中，Embedding 层依赖 `self.cached_input` 在 backward 时取回 token_id。
+    /// 在旧实现中，Embedding 层曾依赖 `self.cached_input` 在 backward 时取回 token_id。
     /// 这种“缓存写在 self 里”的设计在 batch 场景会踩坑：同一个层实例连续 forward 多个样本，
     /// 缓存会被覆盖，导致 backward 用错样本的 token_id。
     ///
@@ -412,11 +393,6 @@ impl Layer for Embeddings {
     ///
     /// 这样 batch 时每个样本都有自己的 ctx，不会互相覆盖。
     fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, crate::llm::LayerContext) {
-        // 说明：这里仍然写入 self.cached_input，主要为了兼容仓库里“梯度累积/序列化”等旧接口；
-        // 主训练链路将优先使用 ctx（避免缓存覆盖问题）。
-        self.cached_input = Some(input.clone());
-        self.cached_input_batch = None; // 单样本路径下，清理 batch 缓存，避免误用
-
         // 将浮点数转换为整数 token ID
         let token_ids: Vec<usize> = input.iter().map(|&x| x as usize).collect();
 
@@ -456,7 +432,7 @@ impl Layer for Embeddings {
     ///
     /// # ctx 的使用
     /// Embedding 的 backward 只需要 token_id 来把梯度累积到对应的词向量行。
-    /// 因此我们从 `ctx` 里取回 token_ids，而不是依赖 `self.cached_input`。
+    /// 因此我们从 `ctx` 里取回 token_ids，而不是依赖层内 `cached_*` 字段。
     fn backward(
         &mut self,
         ctx: &crate::llm::LayerContext,
@@ -549,8 +525,6 @@ impl Layer for Embeddings {
         let token_ids_mat: Array2<usize> = Array2::from_shape_fn((batch_size, seq_len), |(b, s)| {
             input[[b, s, 0.min(token_dim.saturating_sub(1))]] as usize
         });
-        self.cached_input_batch = Some(token_ids_mat.clone());
-        self.cached_input = None;
 
         // 为每个批次样本生成嵌入
         let mut output = Array3::zeros((batch_size, seq_len, EMBEDDING_DIM));

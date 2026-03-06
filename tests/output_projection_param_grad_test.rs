@@ -47,9 +47,9 @@ fn output_projection_parameter_gradients_match_numerical() {
     let b_out = make_b_out(vocab_size);
 
     let mut op = make_op_with_params(embedding_dim, vocab_size, &w_out, &b_out);
-    let (_out, _ctx) = op.forward(&input);
+    let (_out, ctx) = op.forward(&input);
     op.zero_grad_accum();
-    let _ = op.backward_accumulate(&grad_out);
+    let _ = op.backward_accumulate_with_ctx(&ctx, &grad_out);
 
     let grad_w = op.grad_w_out_accum.clone();
     let grad_b = op.grad_b_out_accum.clone();

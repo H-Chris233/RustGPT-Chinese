@@ -52,11 +52,11 @@ fn self_attention_parameter_gradients_match_numerical() {
     let w_v = make_weight(dim, 0.001, 0.03);
     let w_o = make_weight(dim, 0.001, -0.04);
 
-    // 解析梯度：通过 backward_accumulate 计算并写入 grad_w_*_accum
+    // 解析梯度：通过 backward_accumulate_with_ctx(ctx, grads) 计算并写入 grad_w_*_accum
     let mut attn = make_attn_with_weights(dim, &w_q, &w_k, &w_v, &w_o);
-    let (_out, _ctx) = attn.forward(&input);
+    let (_out, ctx) = attn.forward(&input);
     attn.zero_grad_accum();
-    let _ = attn.backward_accumulate(&grad_out);
+    let _ = attn.backward_accumulate_with_ctx(&ctx, &grad_out);
     let grad_w_q = attn.grad_w_q_accum.clone();
     let grad_w_k = attn.grad_w_k_accum.clone();
     let grad_w_v = attn.grad_w_v_accum.clone();

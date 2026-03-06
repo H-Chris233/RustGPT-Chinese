@@ -512,6 +512,7 @@ fn test_checkpoint_loss_continuity_after_resume() {
 }
 
 /// 辅助函数：计算给定模型在数据上的平均loss（训练模式）
+#[allow(dead_code)]
 fn compute_loss(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
     llm.set_training_mode(true);
     let pad_token_id = llm.vocab.pad_token_id();

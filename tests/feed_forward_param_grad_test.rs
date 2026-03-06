@@ -63,11 +63,16 @@ fn feed_forward_parameter_gradients_match_numerical() {
     let b2 = Array2::from_shape_vec((1, embedding_dim), vec![0.1, -0.2, 0.05, 0.0]).unwrap();
 
     let mut ffn = make_ffn_with_params(embedding_dim, hidden_dim, &w1, &b1, &w2, &b2);
-    let (_out, _ctx) = ffn.forward(&input);
+    let (_out, ctx) = ffn.forward(&input);
+
     // 确保 ReLU 的输入远离 0（不可导点），避免有限差分在边界附近波动。
-    let Some(h_pre) = ffn.hidden_pre_activation.as_ref() else {
-        panic!("hidden_pre_activation should be cached after forward()");
-    };
+    //
+    // 注意：这里不要依赖 `ffn.hidden_pre_activation` 等旧式缓存字段。
+    // 因为本轮重构的目标之一，就是让梯度/累积链路可以逐步摆脱 `cached_*` 字段。
+    //
+    // 由于本测试已经固定了 (input, w1, b1)，我们直接按定义计算 pre-activation：
+    //   h_pre = input · W1 + b1
+    let h_pre = input.dot(&w1) + &b1;
     let min_abs = h_pre
         .iter()
         .fold(f32::INFINITY, |m, &v| m.min(v.abs()));
@@ -77,7 +82,7 @@ fn feed_forward_parameter_gradients_match_numerical() {
         min_abs
     );
     ffn.zero_grad_accum();
-    let _ = ffn.backward_accumulate(&grad_out);
+    let _ = ffn.backward_accumulate_with_ctx(&ctx, &grad_out);
 
     let grad_w1 = ffn.grad_w1_accum.clone();
     let grad_b1 = ffn.grad_b1_accum.clone();

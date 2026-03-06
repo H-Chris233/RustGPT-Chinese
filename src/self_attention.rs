@@ -249,25 +249,6 @@ pub struct SelfAttention {
     /// 将多头拼接后的结果投影回原始维度
     pub w_o: Array2<f32>,
 
-    // ========== 前向传播缓存（用于反向传播） ==========
-    /// **缓存输入**: (seq_len, 512) - 原始输入，用于计算梯度
-    pub cached_input: Option<Array2<f32>>,
-
-    /// **缓存Q矩阵**: (seq_len, 512) - 查询矩阵
-    pub cached_q: Option<Array2<f32>>,
-
-    /// **缓存K矩阵**: (seq_len, 512) - 键矩阵
-    pub cached_k: Option<Array2<f32>>,
-
-    /// **缓存V矩阵**: (seq_len, 512) - 值矩阵
-    pub cached_v: Option<Array2<f32>>,
-
-    /// **缓存注意力权重**: Vec of (seq_len, seq_len) - 每个头softmax后的概率分布
-    pub cached_attention_weights: Option<Vec<Array2<f32>>>,
-
-    /// **缓存注意力输出**: (seq_len, 512) - 多头拼接后、投影前的结果
-    pub cached_attention_output: Option<Array2<f32>>,
-
     // ========== KV缓存优化（推理加速） ==========
     /// **KV缓存**: (K_cache, V_cache)
     ///
@@ -303,7 +284,7 @@ pub struct SelfAttention {
     // =====================================================================
     //
     // 注意力层的参数比较多（Q/K/V/O 四个矩阵）。为了支持“正确的梯度累积”，我们需要：
-    // - micro-batch 级别立即 backward（保证 cached_* 对应当前样本，避免缓存覆盖错误）；
+    // - micro-batch 级别立即 backward（由 ctx 携带中间量，避免缓存覆盖错误）；
     // - 但把 grad_W_* 累加到 buffer；累积结束再统一做一次 Adam step。
     pub grad_w_q_accum: Array2<f32>,
     pub grad_w_k_accum: Array2<f32>,
@@ -387,12 +368,6 @@ impl SelfAttention {
             w_k,
             w_v,
             w_o,
-            cached_input: None,
-            cached_q: None,
-            cached_k: None,
-            cached_v: None,
-            cached_attention_weights: None,
-            cached_attention_output: None,
             kv_cache: None,      // 默认不使用 KV 缓存
             use_kv_cache: false, // 默认训练模式
             freeze_updates: false,
@@ -524,46 +499,16 @@ impl SelfAttention {
         Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v))
     }
 
-    fn compute_grads(
-        &self,
-        grads: &Array2<f32>,
-    ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>)> {
-        // 兼容旧接口（用于 backward_accumulate/step_accumulated）：从 self.cached_* 构造 ctx。
-        let (Some(input), Some(q), Some(k), Some(v), Some(attention_output)) = (
-            self.cached_input.as_ref(),
-            self.cached_q.as_ref(),
-            self.cached_k.as_ref(),
-            self.cached_v.as_ref(),
-            self.cached_attention_output.as_ref(),
-        ) else {
-            return None;
-        };
-
-        let ctx = SelfAttentionContext {
-            input: input.clone(),
-            q: q.clone(),
-            k: k.clone(),
-            v: v.clone(),
-            attention_output: attention_output.clone(),
-            attention_weights: self.cached_attention_weights.clone(),
-        };
-        self.compute_grads_from_ctx(&ctx, grads)
-    }
-
     /// 用于梯度累积：只累加参数梯度，不更新参数。
+    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) = self.compute_grads(grads)
-        else {
-            log::warn!("SelfAttention.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
-            return grads.clone();
-        };
-
-        self.grad_w_o_accum += &grad_w_o;
-        self.grad_w_q_accum += &grad_w_q;
-        self.grad_w_k_accum += &grad_w_k;
-        self.grad_w_v_accum += &grad_w_v;
-
-        grad_input
+        let _ = grads;
+        // 历史接口依赖 `self.cached_*` 保存前向中间量；本轮重构已移除这些缓存字段。
+        //
+        // 正确姿势：
+        // - forward 时保留 ctx：`let (_out, ctx) = attn.forward(&input);`
+        // - 累积反传：`attn.backward_accumulate_with_ctx(&ctx, &grads);`
+        panic!("SelfAttention.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
     }
 
     /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
@@ -702,8 +647,24 @@ impl SelfAttention {
         let mut scores = Array2::zeros((q.nrows(), k.nrows()));
         general_mat_mul(1.0 / dk, &q, &k.t(), 0.0, &mut scores);
 
-        // 应用掩码
-        let masked_scores = &scores + &mask;
+        // 应用掩码（数值稳定版）
+        //
+        // 为什么不直接做 `scores + mask`？
+        // - mask 通常用 `0` 表示“可见”，用 `-∞` 表示“不可见”（因果/Pad 屏蔽）；
+        // - 若某些 score 因点积溢出成为 `+∞`，那么 `(+∞) + (-∞)` 会得到 `NaN`，
+        //   进而导致 softmax 权重整行被置 0（训练会静默退化）。
+        //
+        // 因此这里采用“覆盖式掩码”：
+        // - mask 为 `-∞` 的位置直接写成 `-∞`；
+        // - 其它位置按需叠加（保留将来 mask 不是 0/-∞ 的扩展空间）。
+        let mut masked_scores = scores;
+        for (ms, &m) in masked_scores.iter_mut().zip(mask.iter()) {
+            if m.is_infinite() && m.is_sign_negative() {
+                *ms = f32::NEG_INFINITY;
+            } else if m != 0.0 {
+                *ms += m;
+            }
+        }
 
         // 稳定的 softmax
         let weights = stable_softmax(&masked_scores);
@@ -715,7 +676,7 @@ impl SelfAttention {
         (output, weights)
     }
 
-    /// **旧版单头注意力计算（保持向后兼容）**
+    /// **旧版单头注意力计算（教学/对照用，当前实现未直接调用）**
     ///
     /// 这是注意力机制的核心：通过 Q 和 K 的相似度，对 V 进行加权求和。
     ///
@@ -727,6 +688,12 @@ impl SelfAttention {
     /// # 返回值
     /// - `output`: 注意力输出 (seq_len, head_dim)
     /// - `weights`: 注意力权重 (seq_len, seq_len)，用于反向传播
+    ///
+    /// 说明：
+    /// - 当前 SelfAttention 的 forward 实现走的是“多头 +（可选）分块/更稳定的实现路径”，
+    ///   因此这里暂时不会被调用；
+    /// - 之所以保留，是为了方便读者对照最朴素的“缩放点积注意力（single-head）”公式实现。
+    #[allow(dead_code)]
     fn attention(q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
         // 步骤 1: 计算缩放点积注意力分数
         let dk = (q.ncols() as f32).sqrt(); // √d_k = √64 = 8
@@ -889,6 +856,32 @@ impl SelfAttention {
         input: &Array2<f32>,
         key_padding_mask: Option<&Array1<f32>>,
     ) -> Array2<f32> {
+        let (_q, _k, _v, attention_output, _weights) =
+            self.multi_head_attention_with_padding_mask_core(input, key_padding_mask);
+        attention_output.dot(&self.w_o)
+    }
+
+    /// 多头注意力前向传播的核心计算：返回 backward 所需的中间量。
+    ///
+    /// 返回值：
+    /// - q/k/v: (seq_len, embedding_dim)
+    /// - attention_output: (seq_len, embedding_dim)（拼接多个头之后、输出投影之前）
+    /// - attention_weights: 每个 head 的 softmax 权重 (seq_len, seq_len)
+    ///
+    /// 教学说明：
+    /// - 旧实现会把这些中间量写入 `self.cached_*`；
+    /// - 本轮重构改为“由调用方持有 ctx”，因此这里直接把值返回给上层组装 ctx。
+    fn multi_head_attention_with_padding_mask_core(
+        &mut self,
+        input: &Array2<f32>,
+        key_padding_mask: Option<&Array1<f32>>,
+    ) -> (
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Vec<Array2<f32>>,
+    ) {
         let (seq_len, _embedding_dim) = input.dim();
 
         // 1. 计算Q, K, V（使用优化的矩阵乘法）
@@ -939,22 +932,7 @@ impl SelfAttention {
         }
 
         let combined = self.reverse_reshape_from_heads(&result);
-
-        // 缓存中间结果用于反向传播
-        self.cached_q = Some(q);
-        self.cached_k = Some(k);
-        self.cached_v = Some(v);
-        self.cached_attention_output = Some(combined.clone());
-
-        // 缓存所有头的weights用于反向传播
-        if !all_weights.is_empty() {
-            self.cached_attention_weights = Some(all_weights);
-        } else {
-            self.cached_attention_weights = None;
-        }
-
-        // 6. 输出投影
-        combined.dot(&self.w_o)
+        (q, k, v, combined, all_weights)
     }
 
     /// 显式暴露“带 padding mask 的前向”，供 batch/教学代码调用。
@@ -963,8 +941,34 @@ impl SelfAttention {
         input: &Array2<f32>,
         key_padding_mask: Option<&Array1<f32>>,
     ) -> Array2<f32> {
-        self.cached_input = Some(input.clone());
         self.multi_head_attention_with_padding_mask(input, key_padding_mask)
+    }
+
+    /// 训练路径：前向传播并返回显式 ctx（owned 输入版本）。
+    ///
+    /// 为什么要一个 “owned 输入” 的版本？
+    /// - SelfAttention 的 ctx 需要保存 `input`，以便 backward 计算 W_q/W_k/W_v 的梯度；
+    /// - `Layer::forward(&Array2)` 只能借用输入，因此我们必须在某处 clone 一份输入；
+    /// - 在 `forward_batch` 里我们本来就会 `to_owned()` 得到 sample，因此用该接口可以避免二次 clone。
+    fn forward_with_padding_mask_owned_and_ctx(
+        &mut self,
+        input: Array2<f32>,
+        key_padding_mask: Option<&Array1<f32>>,
+    ) -> (Array2<f32>, SelfAttentionContext) {
+        let (q, k, v, attention_output, weights) =
+            self.multi_head_attention_with_padding_mask_core(&input, key_padding_mask);
+        let out = attention_output.dot(&self.w_o);
+
+        let ctx = SelfAttentionContext {
+            input,
+            q,
+            k,
+            v,
+            attention_output,
+            attention_weights: Some(weights),
+        };
+
+        (out, ctx)
     }
 
     /// 启用KV缓存模式
@@ -1059,24 +1063,10 @@ impl Layer for SelfAttention {
         // ==========================
         //
         // 教学说明：
-        // - multi_head_attention 内部会计算 Q/K/V、注意力权重、attention_output 等，并填充 self.cached_*；
-        // - 旧版 backward 直接读取 self.cached_*，在 batch 场景会被覆盖；
-        // - 新版将这些中间量打包成 ctx 返回，由调用方在 backward 时传回。
-        self.cached_input = Some(input.clone());
-        let out = self.multi_head_attention(input);
-
-        let ctx = SelfAttentionContext {
-            input: input.clone(),
-            q: self.cached_q.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
-            k: self.cached_k.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
-            v: self.cached_v.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
-            attention_output: self
-                .cached_attention_output
-                .clone()
-                .unwrap_or_else(|| Array2::zeros((0, 0))),
-            attention_weights: self.cached_attention_weights.clone(),
-        };
-
+        // - multi_head_attention 内部会计算 Q/K/V、注意力权重、attention_output 等；
+        // - 旧版把这些中间量缓存在 self.cached_*，在 batch 场景会被覆盖；
+        // - 新版把中间量打包进 ctx 返回，由调用方在 backward 时显式传回。
+        let (out, ctx) = self.forward_with_padding_mask_owned_and_ctx(input.to_owned(), None);
         (out, Box::new(ctx))
     }
 
@@ -1095,22 +1085,9 @@ impl Layer for SelfAttention {
         for b in 0..batch_size {
             let sample = input.slice(s![b, .., ..]).to_owned();
             let key_padding_mask = attention_mask.map(|m| m.row(b).to_owned());
-            // forward_with_padding_mask 会更新 self.cached_*，因此每个样本都要立即捕获 ctx。
-            let sample_out =
-                self.forward_with_padding_mask(&sample, key_padding_mask.as_ref());
+            let (sample_out, ctx) =
+                self.forward_with_padding_mask_owned_and_ctx(sample, key_padding_mask.as_ref());
             output.slice_mut(s![b, .., ..]).assign(&sample_out);
-
-            let ctx = SelfAttentionContext {
-                input: sample,
-                q: self.cached_q.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
-                k: self.cached_k.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
-                v: self.cached_v.clone().unwrap_or_else(|| Array2::zeros((0, 0))),
-                attention_output: self
-                    .cached_attention_output
-                    .clone()
-                    .unwrap_or_else(|| Array2::zeros((0, 0))),
-                attention_weights: self.cached_attention_weights.clone(),
-            };
             ctxs.push(Box::new(ctx));
         }
 

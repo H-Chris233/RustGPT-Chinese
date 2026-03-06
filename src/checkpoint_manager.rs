@@ -112,10 +112,12 @@ impl CheckpointManager {
         match &self.strategy {
             CheckpointStrategy::Best => current_loss < self.best_loss,
             CheckpointStrategy::Last => true,
-            CheckpointStrategy::Periodic(n) => epoch % n == 0,
+            // 说明：n==0 会导致 `% 0` panic，因此这里显式防御。
+            // 与 `save_checkpoint()` 的语义对齐：n==0 视为“永不按周期保存”。
+            CheckpointStrategy::Periodic(n) => *n > 0 && epoch % n == 0,
             CheckpointStrategy::BestAndLast => true,
             CheckpointStrategy::BestAndPeriodic(n) => {
-                current_loss < self.best_loss || epoch % n == 0
+                current_loss < self.best_loss || (*n > 0 && epoch % n == 0)
             }
         }
     }
@@ -137,47 +139,59 @@ impl CheckpointManager {
             self.best_epoch = metadata.epoch;
         }
 
-        // 构建检查点文件名
-        let checkpoint_name = match &self.strategy {
+        // 构建需要写入的检查点列表。
+        //
+        // 教学说明（重要）：
+        // - 旧实现的 BestAndLast/BestAndPeriodic 采用 “二选一” 策略：如果本轮是 best，就不写 last；
+        // - 这会让 `checkpoint_last.bin` 不是“最新状态”，从而导致恢复训练/测试出现不一致甚至 flaky；
+        // - 正确语义应当是：组合策略要同时写入多个目标（例如 best + last）。
+        let mut checkpoint_names: Vec<String> = Vec::new();
+        match &self.strategy {
             CheckpointStrategy::Best => {
                 if is_best {
-                    format!(
+                    checkpoint_names.push(format!(
                         "checkpoint_best_epoch_{}_loss_{:.4}.bin",
                         metadata.epoch, metadata.loss
-                    )
+                    ));
                 } else {
-                    return Ok(PathBuf::new()); // 不保存
+                    return Ok(PathBuf::new());
                 }
             }
-            CheckpointStrategy::Last => "checkpoint_last.bin".to_string(),
-            CheckpointStrategy::Periodic(_) => {
-                format!("checkpoint_epoch_{}.bin", metadata.epoch)
+            CheckpointStrategy::Last => {
+                checkpoint_names.push("checkpoint_last.bin".to_string());
+            }
+            CheckpointStrategy::Periodic(n) => {
+                if *n > 0 && metadata.epoch % n == 0 {
+                    checkpoint_names.push(format!("checkpoint_epoch_{}.bin", metadata.epoch));
+                } else {
+                    return Ok(PathBuf::new());
+                }
             }
             CheckpointStrategy::BestAndLast => {
+                // 永远写 last，若本轮是 best 也额外写 best。
+                checkpoint_names.push("checkpoint_last.bin".to_string());
                 if is_best {
-                    format!(
+                    checkpoint_names.push(format!(
                         "checkpoint_best_epoch_{}_loss_{:.4}.bin",
                         metadata.epoch, metadata.loss
-                    )
-                } else {
-                    "checkpoint_last.bin".to_string()
+                    ));
                 }
             }
             CheckpointStrategy::BestAndPeriodic(n) => {
                 if is_best {
-                    format!(
+                    checkpoint_names.push(format!(
                         "checkpoint_best_epoch_{}_loss_{:.4}.bin",
                         metadata.epoch, metadata.loss
-                    )
-                } else if metadata.epoch % n == 0 {
-                    format!("checkpoint_epoch_{}.bin", metadata.epoch)
-                } else {
-                    return Ok(PathBuf::new()); // 不保存
+                    ));
+                }
+                if *n > 0 && metadata.epoch % n == 0 {
+                    checkpoint_names.push(format!("checkpoint_epoch_{}.bin", metadata.epoch));
+                }
+                if checkpoint_names.is_empty() {
+                    return Ok(PathBuf::new());
                 }
             }
-        };
-
-        let checkpoint_path = self.checkpoint_dir.join(&checkpoint_name);
+        }
 
         // 序列化模型层
         let mut serializable_layers = Vec::new();
@@ -216,71 +230,91 @@ impl CheckpointManager {
             metadata: metadata.clone(),
         };
 
-        // 保存为二进制格式（原子写入：tmp -> rename）
+        // 保存为二进制格式（原子写入：tmp -> rename），并同时写入 JSON 元数据。
         //
         // 说明：
         // - 避免进程中断/并发覆盖导致生成截断文件（常见症状：UnexpectedEof）
         // - rename 在类 Unix 上原子；Windows 上若目标已存在则先删除
-        let tmp_checkpoint_path = checkpoint_path.with_extension("bin.tmp");
-        let file = fs::File::create(&tmp_checkpoint_path)
-            .map_err(|e| format!("创建检查点临时文件失败: {}", e))?;
-        let mut writer = std::io::BufWriter::new(file);
+        let mut saved_last_this_call = false;
+        let mut saved_paths: Vec<PathBuf> = Vec::new();
+        for checkpoint_name in checkpoint_names {
+            if checkpoint_name == "checkpoint_last.bin" {
+                saved_last_this_call = true;
+            }
+            let checkpoint_path = self.checkpoint_dir.join(&checkpoint_name);
+            let tmp_checkpoint_path = checkpoint_path.with_extension("bin.tmp");
+            let file = fs::File::create(&tmp_checkpoint_path)
+                .map_err(|e| format!("创建检查点临时文件失败: {}", e))?;
+            let mut writer = std::io::BufWriter::new(file);
 
-        bincode::encode_into_std_write(&checkpoint, &mut writer, bincode::config::standard())
-            .map_err(|e| format!("序列化检查点失败: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("写入检查点失败(Flush): {}", e))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|e| format!("写入检查点失败(Sync): {}", e))?;
-        drop(writer);
+            bincode::encode_into_std_write(&checkpoint, &mut writer, bincode::config::standard())
+                .map_err(|e| format!("序列化检查点失败: {}", e))?;
+            writer
+                .flush()
+                .map_err(|e| format!("写入检查点失败(Flush): {}", e))?;
+            writer
+                .get_ref()
+                .sync_all()
+                .map_err(|e| format!("写入检查点失败(Sync): {}", e))?;
+            drop(writer);
 
-        if checkpoint_path.exists() {
-            fs::remove_file(&checkpoint_path)
-                .map_err(|e| format!("覆盖旧检查点失败: {}", e))?;
+            if checkpoint_path.exists() {
+                fs::remove_file(&checkpoint_path)
+                    .map_err(|e| format!("覆盖旧检查点失败: {}", e))?;
+            }
+            fs::rename(&tmp_checkpoint_path, &checkpoint_path)
+                .map_err(|e| format!("提交检查点文件失败(Rename): {}", e))?;
+
+            // 同时保存JSON格式的元数据（方便查看，同样使用原子写入）
+            let metadata_path = checkpoint_path.with_extension("json");
+            let tmp_metadata_path = metadata_path.with_extension("json.tmp");
+            let file = fs::File::create(&tmp_metadata_path)
+                .map_err(|e| format!("创建元数据临时文件失败: {}", e))?;
+            let mut writer = std::io::BufWriter::new(file);
+            serde_json::to_writer_pretty(&mut writer, &metadata)
+                .map_err(|e| format!("序列化元数据失败: {}", e))?;
+            writer
+                .flush()
+                .map_err(|e| format!("写入元数据失败(Flush): {}", e))?;
+            writer
+                .get_ref()
+                .sync_all()
+                .map_err(|e| format!("写入元数据失败(Sync): {}", e))?;
+            drop(writer);
+
+            if metadata_path.exists() {
+                fs::remove_file(&metadata_path).map_err(|e| format!("覆盖旧元数据失败: {}", e))?;
+            }
+            fs::rename(&tmp_metadata_path, &metadata_path)
+                .map_err(|e| format!("提交元数据文件失败(Rename): {}", e))?;
+
+            log::info!(
+                "📦 检查点已保存: {} (epoch={}, loss={:.4}{})",
+                checkpoint_path.display(),
+                metadata.epoch,
+                metadata.loss,
+                if is_best { ", 🏆 NEW BEST!" } else { "" }
+            );
+
+            saved_paths.push(checkpoint_path);
         }
-        fs::rename(&tmp_checkpoint_path, &checkpoint_path)
-            .map_err(|e| format!("提交检查点文件失败(Rename): {}", e))?;
-
-        // 同时保存JSON格式的元数据（方便查看，同样使用原子写入）
-        let metadata_path = checkpoint_path.with_extension("json");
-        let tmp_metadata_path = metadata_path.with_extension("json.tmp");
-        let file = fs::File::create(&tmp_metadata_path)
-            .map_err(|e| format!("创建元数据临时文件失败: {}", e))?;
-        let mut writer = std::io::BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, &metadata)
-            .map_err(|e| format!("序列化元数据失败: {}", e))?;
-        writer
-            .flush()
-            .map_err(|e| format!("写入元数据失败(Flush): {}", e))?;
-        writer
-            .get_ref()
-            .sync_all()
-            .map_err(|e| format!("写入元数据失败(Sync): {}", e))?;
-        drop(writer);
-
-        if metadata_path.exists() {
-            fs::remove_file(&metadata_path).map_err(|e| format!("覆盖旧元数据失败: {}", e))?;
-        }
-        fs::rename(&tmp_metadata_path, &metadata_path)
-            .map_err(|e| format!("提交元数据文件失败(Rename): {}", e))?;
-
-        log::info!(
-            "📦 检查点已保存: {} (epoch={}, loss={:.4}{})",
-            checkpoint_path.display(),
-            metadata.epoch,
-            metadata.loss,
-            if is_best { ", 🏆 NEW BEST!" } else { "" }
-        );
 
         // 清理旧的检查点
         if is_best {
             self.cleanup_old_checkpoints()?;
         }
 
-        Ok(checkpoint_path)
+        // 返回“最可能被调用方使用”的路径：
+        // - 如果保存了 last，优先返回 last；
+        // - 否则返回第一个写入的路径。
+        let last_path = self.checkpoint_dir.join("checkpoint_last.bin");
+        // 注意：不能用 `last_path.exists()` 判断，因为目录里可能有历史遗留的 last 文件，
+        // 但本轮策略未必写入 last；这种情况下返回旧 last 会误导调用方。
+        if saved_last_this_call {
+            Ok(last_path)
+        } else {
+            Ok(saved_paths.into_iter().next().unwrap_or_default())
+        }
     }
 
     /// 加载检查点

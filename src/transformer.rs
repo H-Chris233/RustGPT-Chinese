@@ -160,32 +160,20 @@ impl TransformerBlock {
         self.norm2.zero_grad_accum();
     }
 
+    #[deprecated(note = "旧接口依赖子层内部缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        // 逻辑与 `backward()` 完全一致，但子层调用的是 backward_accumulate（不更新参数）。
+        let _ = grads;
+        // 历史接口（无 ctx）依赖子层内部 `cached_*`（以及旧版 Dropout 的 self.mask）。
+        // 本轮重构已经把“正确的梯度累积”升级为 ctx 驱动（见 `backward_accumulate_with_ctx`），
+        // 并移除了 Dropout 的内部 mask 缓存，因此这里选择 fail-fast，避免静默算错。
         //
-        // 关键点：
-        // - Dropout 没有参数，backward 只依赖 mask，因此可以直接复用；
-        // - LayerNorm/Attention/FFN 都会把参数梯度累加到各自的 buffer 中。
-
-        // ========== 反向传播第二个残差连接 ==========
-        let grad_dropout2 = grads;
-        let grad_x_from_residual2 = grads;
-
-        let grad_dropout2_out = self.dropout2.backward_cached(grad_dropout2);
-        let grad_ffn = self.feed_forward.backward_accumulate(&grad_dropout2_out);
-        let grad_norm2 = self.norm2.backward_accumulate(&grad_ffn);
-
-        let grad_x = &grad_norm2 + grad_x_from_residual2;
-
-        // ========== 反向传播第一个残差连接 ==========
-        let grad_dropout1 = &grad_x;
-        let grad_input_from_residual1 = &grad_x;
-
-        let grad_dropout1_out = self.dropout1.backward_cached(grad_dropout1);
-        let grad_attention = self.attention.backward_accumulate(&grad_dropout1_out);
-        let grad_norm1 = self.norm1.backward_accumulate(&grad_attention);
-
-        &grad_norm1 + grad_input_from_residual1
+        // 迁移方式：
+        // 1) forward 时保存 `TransformerBlockContext`；
+        // 2) 调用 `backward_accumulate_with_ctx(&ctx, grads)`；
+        // 3) 最终由 `step_accumulated(lr, scale)` 统一更新参数。
+        panic!(
+            "TransformerBlock.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)"
+        )
     }
 
     /// 梯度累积（ctx 驱动版本）：只累加子层参数梯度，不更新参数。
@@ -252,6 +240,9 @@ impl TransformerBlock {
             self.attention.forward_with_kv_cache(&norm1_out)
         } else {
             // 推理路径只需要输出，不需要 ctx。
+            //
+            // 说明：当前为了复用 `Layer::forward()`（训练/推理共用接口），这里仍会构造 ctx 并丢弃。
+            // 这在性能上不是最优，但实现最直观；若要进一步优化，可为推理提供“无 ctx 的 forward”专用接口。
             let (out, _ctx) = self.attention.forward(&norm1_out);
             out
         };

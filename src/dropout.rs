@@ -55,7 +55,19 @@ use crate::llm::{Layer, LayerContext};
 
 #[derive(Clone)]
 struct DropoutContext {
+    /// Dropout 掩码（0/1 矩阵）。
+    ///
+    /// 教学说明：
+    /// - mask 是“一次 forward 的随机上下文”，必须随 ctx 回传给 backward；
+    /// - 它不应缓存在 `self`（否则 batch/并发时会被覆盖，导致梯度与激活错配）。
     mask: Option<Array2<f32>>,
+
+    /// Inverted Dropout 的缩放因子：`1 / (1 - p)`。
+    ///
+    /// 说明：
+    /// - forward 与 backward 必须使用同一份 scale_factor；
+    /// - 因此它也属于 ctx（而不是在 backward 时重新用 `self.dropout_rate` 计算）。
+    scale_factor: f32,
 }
 
 /// **Dropout 正则化层**
@@ -63,10 +75,6 @@ pub struct Dropout {
     /// **丢弃率**: 0.0-1.0，表示神经元被丢弃的概率
     /// 常见值：0.1 (10%), 0.2 (20%), 0.5 (50%)
     pub dropout_rate: f32,
-
-    /// **掩码矩阵**: 0/1 矩阵，1表示保留，0表示丢弃
-    /// 在前向传播时生成，反向传播时复用
-    mask: Option<Array2<f32>>,
 
     /// **训练模式标志**
     /// - true: 训练模式，应用 dropout
@@ -85,9 +93,16 @@ impl Dropout {
     /// - **0.2**: 本项目使用的配置，平衡性能和正则化
     /// - **0.5**: 强正则化，适用于容易过拟合的大模型
     pub fn new(dropout_rate: f32) -> Self {
+        // Inverted Dropout 要求：0.0 <= p < 1.0
+        //
+        // p==1.0 时缩放因子是 `1/(1-p)=∞`，会立刻产生 Inf/NaN。
+        assert!(
+            (0.0..1.0).contains(&dropout_rate),
+            "dropout_rate 必须满足 0.0 <= p < 1.0，当前={}",
+            dropout_rate
+        );
         Self {
             dropout_rate,
-            mask: None,
             training: true, // 默认训练模式
         }
     }
@@ -144,27 +159,8 @@ impl Dropout {
         mask
     }
 
-    /// 使用 **self 内部缓存的 mask** 做反向传播（兼容旧的“无 ctx”调用路径）。
-    ///
-    /// 教学说明：
-    /// - 新版推荐使用 `Layer::backward(ctx, grads, lr)`，其中 ctx 自带 mask；
-    /// - 但仓库里仍存在一些旧接口（例如梯度累积的某些实现）会直接依赖 self.mask；
-    /// - 为了让重构可以分阶段推进，这里保留一个显式方法用于兼容。
-    pub fn backward_cached(&self, grads: &Array2<f32>) -> Array2<f32> {
-        if self.training && self.dropout_rate > 0.0 {
-            if let Some(mask) = self.mask.as_ref() {
-                let scale_factor = 1.0 / (1.0 - self.dropout_rate);
-                let mut result = grads.clone();
-                result *= mask;
-                result *= scale_factor;
-                result
-            } else {
-                grads.clone()
-            }
-        } else {
-            grads.clone()
-        }
-    }
+    // 注意：历史版本曾提供 `backward_cached()` 并把 mask 缓存在 `self` 里。
+    // 本轮重构已经移除该路径：mask 必须通过 ctx 显式传递（见 `Layer::forward/backward`）。
 }
 
 impl Layer for Dropout {
@@ -183,8 +179,6 @@ impl Layer for Dropout {
     fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         if self.training && self.dropout_rate > 0.0 {
             let mask = self.create_mask(input.dim());
-            // 兼容旧实现：仍把 mask 缓存在 self 中，供旧的“非 ctx 路径”（例如某些累积接口）使用。
-            self.mask = Some(mask.clone());
             let scale_factor = 1.0 / (1.0 - self.dropout_rate);
             let mut result = input.clone();
             result *= &mask;
@@ -193,36 +187,37 @@ impl Layer for Dropout {
                 result,
                 Box::new(DropoutContext {
                     mask: Some(mask),
+                    scale_factor,
                 }),
             )
         } else {
             (
                 input.clone(),
-                Box::new(DropoutContext { mask: None }),
+                Box::new(DropoutContext {
+                    mask: None,
+                    scale_factor: 1.0,
+                }),
             )
         }
     }
 
     fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
-        let mask = ctx
-            .downcast_ref::<DropoutContext>()
-            .map(|c| c.mask.as_ref())
-            .unwrap_or(None);
+        // 数学一致性原则：
+        // - 是否应用 dropout，取决于 forward 是否生成了 mask；
+        // - backward 不应依赖 `self.training`（forward/backward 之间切换 training flag 会导致错梯度）。
+        let Some(ctx) = ctx.downcast_ref::<DropoutContext>() else {
+            log::warn!("Dropout.backward 收到未知 ctx，直接传递梯度");
+            return grads.clone();
+        };
 
-        if self.training && self.dropout_rate > 0.0 {
-            if let Some(mask) = mask {
-                let scale_factor = 1.0 / (1.0 - self.dropout_rate);
-                let mut result = grads.clone();
-                result *= mask;
-                result *= scale_factor;
-                result
-            } else {
-                log::warn!("Dropout.backward 未找到mask，直接传递梯度");
-                grads.clone()
-            }
-        } else {
-            grads.clone()
-        }
+        let Some(mask) = ctx.mask.as_ref() else {
+            return grads.clone();
+        };
+
+        let mut result = grads.clone();
+        result *= mask;
+        result *= ctx.scale_factor;
+        result
     }
 
     fn parameters(&self) -> usize {

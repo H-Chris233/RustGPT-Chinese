@@ -65,9 +65,6 @@ pub struct OutputProjection {
     /// **Adam 优化器**: 用于更新权重
     pub optimizer: Adam,
 
-    /// **缓存输入**: 用于反向传播计算梯度
-    pub cached_input: Option<Array2<f32>>,
-
     // =====================================================================
     // 梯度累积支持（Gradient Accumulation）
     // =====================================================================
@@ -75,12 +72,15 @@ pub struct OutputProjection {
     // 背景：
     // - 本项目的训练代码支持 `accumulation_steps`（梯度累积），用于在显存/内存有限时
     //   “用多个 micro-batch 模拟一个大 batch”。
-    // - 早期实现曾经尝试“只累积 logits 梯度，最后统一 backward 一次”，但由于各层的
-    //   backward 依赖 forward 缓存（cached_input 等），会导致缓存被覆盖，从而使梯度
-    //   与激活不匹配（数学错误）。
+    // - 早期实现曾经尝试“只累积 logits 梯度，最后统一 backward 一次”，但**旧版**各层
+    //   backward 会从 `self.cached_*` 读取前向中间量；如果在同一层实例上对多个样本做
+    //   forward 而不保存各自的中间量，就会发生“缓存覆盖”，从而使梯度与激活不匹配
+    //   （数学错误）。
+    // - 本轮重构已将中间量改为 **ctx 驱动**（forward 返回 ctx，backward/accumulate 消费 ctx），
+    //   但“每个样本必须保留自己对应的 ctx”这一约束依然成立。
     //
     // 解决方案：
-    // - 每个 micro-batch 都立刻执行一次完整 backward（保证缓存正确）；
+    // - 每个 micro-batch 都立刻执行一次完整 backward（保证 ctx/中间量对应）；
     // - 但不立刻更新参数，而是把参数梯度累加到下面的 buffer 中；
     // - 当累积步数到达阈值时，再把累加梯度做平均（scale=1/steps）并执行一次 Adam 更新。
     //
@@ -122,7 +122,6 @@ impl OutputProjection {
             w_out,
             b_out: Array2::zeros((1, vocab_size)),
             optimizer: Adam::new((embedding_dim, vocab_size)),
-            cached_input: None,
             grad_w_out_accum: Array2::zeros((embedding_dim, vocab_size)),
             grad_b_out_accum: Array2::zeros((1, vocab_size)),
         }
@@ -141,15 +140,17 @@ impl OutputProjection {
     /// 仅做“梯度计算 + 累加”，不更新参数（用于梯度累积）。
     ///
     /// 返回值：传递给前一层的梯度（dL/dInput）。
+    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
     pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        // 注意：这里不能直接拿着 `self.cached_input.as_ref()` 的借用再调用 `&mut self` 方法，
-        // 否则会触发 Rust 的借用冲突（E0502）。因此我们把 input clone 出来再计算。
-        let Some(input) = self.cached_input.as_ref().cloned() else {
-            log::warn!("OutputProjection.backward_accumulate 在未执行 forward 的情况下被调用，直接传递梯度");
-            return grads.clone();
-        };
-
-        self.backward_accumulate_from_input(&input, grads)
+        let _ = grads;
+        // 历史接口依赖 `self.cached_input`，本轮重构已删除该字段，因此直接 fail-fast。
+        //
+        // 教学要点：
+        // - 如果在没有 ctx 的情况下做梯度累积，我们无法保证“参数梯度”对应的前向激活来自同一个样本；
+        // - 这会在 batch/并发/延迟反传场景产生静默错误，因此宁可 panic 也不要悄悄算错。
+        panic!(
+            "OutputProjection.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)"
+        )
     }
 
     /// 仅做“梯度计算 + 累加”，不更新参数（ctx 驱动，不依赖 cached_*）。
@@ -262,10 +263,6 @@ impl Layer for OutputProjection {
     ///   [0.45, 0.01, 0.15, ...]  // 总和为1
     /// ```
     fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
-        // 兼容旧逻辑：保留 cached_input（梯度累积路径仍在使用它）。
-        // 主链路 backward 将优先使用 ctx。
-        self.cached_input = Some(input.clone());
-
         let out = input.dot(&self.w_out) + &self.b_out;
         (out, Box::new(OutputProjectionContext { input: input.clone() }))
     }
@@ -278,9 +275,13 @@ impl Layer for OutputProjection {
     ///
     /// 反向:
     ///   grad_W = input^T · grads
-    ///   grad_b = mean(grads, axis=0)
+    ///   grad_b = sum(grads, axis=0)
     ///   grad_input = grads · W^T
     /// ```
+    ///
+    /// 教学说明（为什么这里用 sum 而不是 mean）：
+    /// - 本项目的 `grads` 通常已经对应“token-mean loss”或在上游做过归一化/缩放；
+    /// - 因此在参数梯度处再做一次 mean，往往会重复缩放，导致学习率与梯度量纲错配。
     fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32> {
         let Some(ctx) = ctx.downcast_ref::<OutputProjectionContext>() else {
             log::warn!("OutputProjection.backward 收到未知 ctx，直接传递梯度");
