@@ -409,6 +409,9 @@ impl CheckpointManager {
             network.push(layer);
         }
 
+        LLM::validate_network_topology(&network)
+            .map_err(|e| format!("checkpoint 网络拓扑不受支持: {}", e))?;
+
         let llm = LLM {
             vocab: checkpoint.model.vocab,
             network,

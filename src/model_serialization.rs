@@ -576,6 +576,9 @@ fn build_llm_from_serializable(
         println!(" ✓");
     }
 
+    LLM::validate_network_topology(&network)
+        .map_err(|error| std::io::Error::other(format!("Invalid model topology: {}", error)))?;
+
     Ok(LLM {
         vocab,
         network,

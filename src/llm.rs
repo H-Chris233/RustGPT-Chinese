@@ -403,7 +403,51 @@ impl Default for LLM {
 }
 
 impl LLM {
+    pub(crate) fn validate_network_topology(network: &[Box<dyn Layer>]) -> Result<(), String> {
+        if network.len() < 2 {
+            return Err(
+                "当前教学主路径要求网络至少包含 Embeddings 和 OutputProjection 两层".to_string(),
+            );
+        }
+
+        if !network
+            .first()
+            .and_then(|layer| layer.as_any().downcast_ref::<Embeddings>())
+            .is_some()
+        {
+            return Err("第 0 层必须是 Embeddings".to_string());
+        }
+
+        if !network
+            .last()
+            .and_then(|layer| layer.as_any().downcast_ref::<OutputProjection>())
+            .is_some()
+        {
+            return Err("最后一层必须是 OutputProjection".to_string());
+        }
+
+        for (idx, layer) in network
+            .iter()
+            .enumerate()
+            .skip(1)
+            .take(network.len().saturating_sub(2))
+        {
+            if !layer.as_any().is::<TransformerBlock>() {
+                return Err(format!(
+                    "当前教学主路径仅支持 Embeddings -> TransformerBlock* -> OutputProjection；第 {} 层实际为 {}",
+                    idx,
+                    layer.layer_type()
+                ));
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn new(vocab: Vocab, network: Vec<Box<dyn Layer>>) -> Self {
+        Self::validate_network_topology(&network)
+            .unwrap_or_else(|error| panic!("LLM::new 收到不受支持的网络拓扑: {}", error));
+
         let vocab_size = vocab.words.len();
         Self {
             vocab,
@@ -2612,5 +2656,15 @@ mod tests {
 
         let epochs = model.train_bucketed_sequential(Vec::new(), 3, 0.01, 2, 2);
         assert_eq!(epochs, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "LLM::new 收到不受支持的网络拓扑")]
+    fn llm_new_rejects_non_teaching_topology() {
+        let vocab = Vocab::build_from_texts(&["a".to_string(), "b".to_string()]);
+        let embeddings = Embeddings::new(vocab.clone());
+        let output = OutputProjection::new(EMBEDDING_DIM, vocab.len());
+
+        let _ = LLM::new(vocab, vec![Box::new(output), Box::new(embeddings)]);
     }
 }
