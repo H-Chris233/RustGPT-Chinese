@@ -752,65 +752,6 @@ impl LLM {
         self.set_training_mode(false);
     }
 
-    /// 使用预tokenize的数据进行训练（性能优化版本）
-    ///
-    /// 这个方法接受已经tokenize的数据，避免重复tokenization
-    pub fn train_with_cached_tokens(
-        &mut self,
-        tokenized_data: Vec<Vec<usize>>,
-        epochs: usize,
-        initial_lr: f32,
-    ) {
-        self.set_training_mode(true);
-
-        let pad_token_id = self.vocab.pad_token_id();
-
-        for epoch in 0..epochs {
-            let decay_rate: f32 = 0.95;
-            let decay_steps = 10.0;
-            let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
-
-            let mut total_loss = 0.0;
-            let mut sample_count = 0;
-
-            // 直接使用缓存的tokenized数据，无需重复tokenize
-            for training_row in &tokenized_data {
-                if training_row.len() < 2 {
-                    continue;
-                }
-
-                let input_ids = &training_row[..training_row.len() - 1];
-                let target_ids = &training_row[1..];
-
-                let Some(mut step) = self.prepare_training_step(input_ids, target_ids, pad_token_id)
-                else {
-                    continue;
-                };
-
-                total_loss += step.loss_mean;
-
-                // 更强的梯度裁剪提升稳定性
-                Self::clip_gradients(&mut step.grads_output, 1.0);
-                self.backward_with_ctx(&step.layer_ctxs, &step.grads_output, current_lr);
-
-                sample_count += 1;
-            }
-
-            println!(
-                "Epoch {}: Loss = {:.4}, LR = {:.6}",
-                epoch,
-                if sample_count > 0 {
-                    total_loss / sample_count as f32
-                } else {
-                    0.0
-                },
-                current_lr
-            );
-        }
-
-        self.set_training_mode(false);
-    }
-
     // ═════════════════════════════════════════════════════════════════════════════
     // 🚀 阶段1训练优化 - 性能优化方法
     // ═════════════════════════════════════════════════════════════════════════════
