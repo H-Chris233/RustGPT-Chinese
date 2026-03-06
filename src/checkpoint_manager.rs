@@ -98,13 +98,81 @@ impl CheckpointManager {
                 .map_err(|e| format!("创建检查点目录失败: {}", e))?;
         }
 
+        // 关键语义：resume 训练时，新的 manager 必须能从同一目录恢复历史 best 状态。
+        // 否则进程重启后 `best_loss` 会退回 +∞，破坏 early stopping / best checkpoint 选择。
+        let (best_loss, best_epoch) =
+            Self::restore_best_state_from_dir(&checkpoint_dir)?.unwrap_or((f32::INFINITY, 0));
+
         Ok(Self {
             checkpoint_dir,
             strategy,
-            best_loss: f32::INFINITY,
-            best_epoch: 0,
+            best_loss,
+            best_epoch,
             keep_best_n,
         })
+    }
+
+    /// 从已有 checkpoint 目录恢复历史最佳状态。
+    ///
+    /// 返回值：
+    /// - `Some((best_loss, best_epoch))`：目录中存在可解析的 best 元数据；
+    /// - `None`：目录为空，或尚未保存过 best checkpoint。
+    fn restore_best_state_from_dir(checkpoint_dir: &Path) -> Result<Option<(f32, usize)>, String> {
+        let entries =
+            fs::read_dir(checkpoint_dir).map_err(|e| format!("读取检查点目录失败: {}", e))?;
+
+        let mut best: Option<(f32, usize)> = None;
+
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("读取目录项失败: {}", e))?;
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+
+            if !(name.starts_with("checkpoint_best") && name.ends_with(".json")) {
+                continue;
+            }
+
+            let metadata_json = match fs::read_to_string(&path) {
+                Ok(json) => json,
+                Err(e) => {
+                    log::warn!(
+                        "读取 best checkpoint 元数据失败: {} ({})",
+                        path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let metadata: CheckpointMetadata = match serde_json::from_str(&metadata_json) {
+                Ok(metadata) => metadata,
+                Err(e) => {
+                    log::warn!(
+                        "解析 best checkpoint 元数据失败: {} ({})",
+                        path.display(),
+                        e
+                    );
+                    continue;
+                }
+            };
+
+            let should_replace = match best {
+                None => true,
+                Some((best_loss, best_epoch)) => {
+                    metadata.loss < best_loss
+                        || ((metadata.loss - best_loss).abs() <= f32::EPSILON
+                            && metadata.epoch > best_epoch)
+                }
+            };
+
+            if should_replace {
+                best = Some((metadata.loss, metadata.epoch));
+            }
+        }
+
+        Ok(best)
     }
 
     /// 检查是否应该保存检查点

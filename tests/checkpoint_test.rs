@@ -511,6 +511,70 @@ fn test_checkpoint_loss_continuity_after_resume() {
     fs::remove_dir_all(format!("{}_resume", checkpoint_dir)).ok();
 }
 
+#[test]
+fn test_checkpoint_manager_restores_best_state_from_existing_dir() {
+    let checkpoint_dir = "test_checkpoints_restore_best_state";
+
+    // 清理之前的测试数据
+    if std::path::Path::new(checkpoint_dir).exists() {
+        fs::remove_dir_all(checkpoint_dir).ok();
+    }
+
+    let (llm, _test_data) = create_test_model();
+
+    {
+        let mut manager = CheckpointManager::new(checkpoint_dir, CheckpointStrategy::Best, 3)
+            .expect("应该能创建检查点管理器");
+
+        let metadata1 = CheckpointMetadata {
+            epoch: 10,
+            loss: 3.0,
+            learning_rate: 0.001,
+            timestamp: "2026-03-06 10:00:00".to_string(),
+            phase: "test".to_string(),
+        };
+        manager.save_checkpoint(&llm, metadata1).ok();
+
+        let metadata2 = CheckpointMetadata {
+            epoch: 20,
+            loss: 2.5,
+            learning_rate: 0.001,
+            timestamp: "2026-03-06 11:00:00".to_string(),
+            phase: "test".to_string(),
+        };
+        manager.save_checkpoint(&llm, metadata2).ok();
+
+        assert!((manager.get_best_loss() - 2.5).abs() < 1e-6);
+        assert_eq!(manager.get_best_epoch(), 20);
+    }
+
+    // 模拟进程重启：重新创建同目录 manager，必须恢复历史 best 状态。
+    let restored_manager = CheckpointManager::new(checkpoint_dir, CheckpointStrategy::Best, 3)
+        .expect("应该能从已有目录恢复检查点管理器状态");
+
+    assert!(
+        (restored_manager.get_best_loss() - 2.5).abs() < 1e-6,
+        "应从目录恢复最佳 loss"
+    );
+    assert_eq!(
+        restored_manager.get_best_epoch(),
+        20,
+        "应从目录恢复最佳 epoch"
+    );
+
+    // 验证后续保存判定确实基于恢复后的 best_loss，而不是 +∞。
+    assert!(
+        !restored_manager.should_save(21, 2.6),
+        "比历史 best 更差的 loss 不应被视为新的 best"
+    );
+    assert!(
+        restored_manager.should_save(21, 2.4),
+        "比历史 best 更优的 loss 应被视为新的 best"
+    );
+
+    fs::remove_dir_all(checkpoint_dir).ok();
+}
+
 /// 辅助函数：计算给定模型在数据上的平均loss（训练模式）
 #[allow(dead_code)]
 fn compute_loss(llm: &mut LLM, tokenized_data: &[Vec<usize>]) -> f32 {
