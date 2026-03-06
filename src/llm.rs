@@ -262,7 +262,6 @@ pub struct LLM {
     pub context_window: Vec<usize>,
     pub max_context_length: usize,
     pub training: bool,
-    pub parallel_training: bool,
     // 性能优化：可重用的采样缓冲区（public以便序列化）
     pub sampling_prob_buffer: Vec<f32>,
     pub sampling_idx_buffer: Vec<(f32, usize)>,
@@ -382,7 +381,6 @@ impl Default for LLM {
             context_window: Vec::new(),
             max_context_length: MAX_SEQ_LEN,
             training: true,
-            parallel_training: true,
             sampling_prob_buffer: Vec::with_capacity(vocab_size),
             sampling_idx_buffer: Vec::with_capacity(vocab_size),
             beam_candidates_buffer: Vec::with_capacity(50),
@@ -399,7 +397,6 @@ impl LLM {
             context_window: Vec::new(),
             max_context_length: MAX_SEQ_LEN,
             training: true,
-            parallel_training: true,
             sampling_prob_buffer: Vec::with_capacity(vocab_size),
             sampling_idx_buffer: Vec::with_capacity(vocab_size),
             beam_candidates_buffer: Vec::with_capacity(50),
@@ -510,6 +507,11 @@ impl LLM {
         top_slice.iter().map(|&(prob, idx)| (idx, prob)).collect()
     }
 
+    /// 当前增量推理的最低要求：首层必须是 Embeddings。
+    ///
+    /// 说明：
+    /// - 当前默认网络满足该条件，因此正常会走增量 / KV cache 主路径；
+    /// - 保留该判断，是为了让教学实验中的“非常规网络拼装”仍能退回完整前向路径。
     fn supports_incremental(&self) -> bool {
         self.network
             .first()
@@ -537,14 +539,6 @@ impl LLM {
         for layer in &mut self.network {
             layer.set_training_mode(training);
         }
-    }
-
-    pub fn set_parallel_training(&mut self, enabled: bool) {
-        self.parallel_training = enabled;
-    }
-
-    pub fn parallel_training_enabled(&self) -> bool {
-        self.parallel_training
     }
 
     #[allow(dead_code)]
@@ -615,88 +609,6 @@ impl LLM {
         max_length: usize,
     ) -> String {
         self.beam_search(text, beam_width, max_length)
-    }
-
-    #[allow(dead_code)]
-    fn forward_with_sampling(
-        &mut self,
-        text: &str,
-        temperature: f32,
-        top_p: f32,
-        top_k: usize,
-    ) -> String {
-        let prompt_tokens = self.tokenize(text);
-        let max_new_tokens = MAX_SEQ_LEN.saturating_sub(prompt_tokens.len());
-        let generated_tokens = self.generate_tokens_incremental(
-            &prompt_tokens,
-            max_new_tokens,
-            temperature,
-            top_p,
-            top_k,
-        );
-
-        self.tokens_to_text(&generated_tokens)
-    }
-
-    #[allow(dead_code)]
-    fn forward(&mut self, text: &str) -> Vec<usize> {
-        let mut tokenized = self.tokenize(text);
-        let mut output_tokens: Vec<usize> = Vec::new();
-
-        if tokenized.is_empty() {
-            return output_tokens;
-        }
-
-        let input_len = tokenized.len();
-
-        if input_len >= MAX_SEQ_LEN {
-            return output_tokens;
-        }
-
-        for _ in 0..(MAX_SEQ_LEN - input_len) {
-            if output_tokens.len() >= MAX_SEQ_LEN - 1 {
-                break;
-            }
-
-            let token_input = Array2::from_shape_vec(
-                (1, tokenized.len()),
-                tokenized.iter().map(|&x| x as f32).collect(),
-            )
-            .unwrap();
-            let mut input = token_input;
-
-            for layer in &mut self.network {
-                // 生成阶段只做前向推理，不需要 ctx。
-                let (out, _ctx) = layer.forward(&input);
-                input = out;
-            }
-
-            let logits = input;
-
-            if logits.shape()[0] == 0 {
-                break;
-            }
-
-            let last_logit = logits
-                .row(logits.shape()[0] - 1)
-                .to_owned()
-                .insert_axis(Axis(0));
-
-            let probs = softmax(&last_logit);
-
-            let tokens = Self::greedy_decode(&probs);
-
-            let next_token = tokens[tokens.len() - 1];
-
-            output_tokens.push(next_token);
-            tokenized.push(next_token);
-
-            if next_token == self.vocab.eos_token_id() {
-                break;
-            }
-        }
-
-        output_tokens
     }
 
     /// 最基础的教学训练入口。
@@ -1645,18 +1557,6 @@ impl LLM {
         adjusted
     }
 
-    fn greedy_decode(probs: &Array2<f32>) -> Vec<usize> {
-        probs
-            .map_axis(Axis(1), |row| {
-                row.iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(Ordering::Equal))
-                    .map(|(index, _)| index)
-                    .unwrap_or(0)
-            })
-            .to_vec()
-    }
-
     /// Top-k sampling: only consider the k most probable tokens
     /// 优化版本：复用内部缓冲区减少分配
     fn top_k_sampling(&mut self, probs: &Array2<f32>, k: usize) -> Vec<usize> {
@@ -1953,6 +1853,10 @@ impl LLM {
         generated_tokens
     }
 
+    /// 旧式 beam search 回退路径。
+    ///
+    /// 只有在网络不满足增量推理前提时才会进入这里；
+    /// 当前默认模型一般不会走这条路径，因此暂时保留为教学/回退用途。
     fn beam_search_legacy(&mut self, text: &str, beam_width: usize, max_length: usize) -> String {
         if beam_width == 0 {
             return String::new();

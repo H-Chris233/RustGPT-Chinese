@@ -347,7 +347,6 @@ impl CheckpointManager {
             context_window: checkpoint.model.context_window,
             max_context_length: checkpoint.model.metadata.max_seq_len,
             training: false,
-            parallel_training: false,
             sampling_prob_buffer: Vec::new(),
             sampling_idx_buffer: Vec::new(),
             beam_candidates_buffer: Vec::new(),
