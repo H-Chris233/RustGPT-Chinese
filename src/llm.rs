@@ -289,7 +289,7 @@ pub enum TrainingSignalError {
 /// 单样本训练步的中间结果。
 ///
 /// 说明：
-/// - `layer_ctxs`：逐层保存的前向上下文，供 backward/accumulate 使用；
+/// - `layer_ctxs`：逐层保存前向传播上下文，供 `backward_with_ctx()` 或梯度累积流程复用；
 /// - `grads_output`：loss 对 logits 的梯度；
 /// - `loss_mean`：按有效 token 平均后的交叉熵；
 /// - `n_targets`：有效 target（非 PAD）数量。
@@ -1017,11 +1017,10 @@ impl LLM {
         grads
     }
 
-    /// 完整优化的训练方法（集成并行预处理与监控）
+    /// 监控型训练方法（集成预处理、学习率调度、早停与梯度累积）
     ///
     /// # 特性
-    /// - ✅ 数据预处理缓存（避免重复 tokenization）
-    /// - ✅ Rayon 并行 tokenization（可根据数据量自动回退）
+    /// - ✅ 单线程 tokenization 与预处理计时
     /// - ✅ 余弦退火学习率调度
     /// - ✅ 早停机制
     /// - ✅ 增强训练监控（困惑度、梯度范数、训练速度）
@@ -1217,10 +1216,14 @@ impl LLM {
         max_epochs
     }
 
-    /// 批量训练方法（支持动态掩码）
+    /// 分桶批次训练方法（支持动态掩码）
+    ///
+    /// # 语义说明
+    /// - 该方法使用 batch 组织样本、padding mask 与 bucketing 来减少填充开销；
+    /// - 但参数更新仍按“批内逐样本顺序执行”，不是严格的 batch 梯度平均后统一更新。
     ///
     /// # 特性
-    /// - ✅ 批量处理：显著提升训练速度
+    /// - ✅ 批次组织：按小批次分组样本并减少无效填充
     /// - ✅ 动态填充：每个批次填充到该批次的最大长度
     /// - ✅ 注意力掩码：确保 PAD 不参与梯度计算
     /// - ✅ 前向裁剪：每个样本只前向真实 token，避免 PAD 干扰注意力
@@ -1404,7 +1407,7 @@ impl LLM {
     ///
     /// 教学/备用说明：
     /// - 当前训练主链路主要使用 1D/2D 的梯度（例如线性层权重与偏置）；
-    /// - 这里保留 3D 版本，便于以后加入“Embedding/卷积等 3D 张量”时复用；
+    /// - 这里保留 3D 版本，便于以后处理真正的 3D 激活或梯度张量时复用；
     /// - 为避免 `dead_code` 警告影响阅读，这里显式允许未使用。
     #[allow(dead_code)]
     fn compute_grad_norm_3d(grads: &Array3<f32>) -> f32 {
@@ -1442,7 +1445,7 @@ impl LLM {
 
     /// 启用所有transformer层的KV缓存
     ///
-    /// KV缓存可以显著加速推理速度（10-100倍），但不能用于训练。
+    /// KV 缓存在逐 token 推理中通常能明显减少重复计算，但不能用于训练。
     /// 适用场景：交互式对话生成、逐token生成等
     pub fn enable_kv_cache(&mut self) {
         self.for_each_transformer_block_mut(|block| block.attention.enable_kv_cache());
