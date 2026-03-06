@@ -998,7 +998,7 @@ impl LLM {
     //   最终对平均梯度做一次参数更新。
     //
     // 由于网络里使用 `Box<dyn Layer>`（动态分发），我们在这里对已知层类型做 downcast，
-    // 并调用其 `*_accumulate / step_accumulated` 教学实现。
+    // 并调用其 ctx 驱动的梯度累积实现与 `step_accumulated()`。
     //
     // 当前网络结构（src/main.rs）固定为：
     // Embeddings -> TransformerBlock* -> OutputProjection
@@ -1017,10 +1017,8 @@ impl LLM {
     /// 梯度累积（网络级别调度，ctx 驱动）。
     ///
     /// 说明：
-    /// - 旧版实现会在 forward 时把中间量写入各层 `cached_*` 字段，然后 `backward_accumulate()`
-    ///   再从 self 中读取这些缓存；
-    /// - 这会阻碍我们删除 cached 字段，也会在 batch/并发场景造成“缓存覆盖”风险；
-    /// - 新版改为：forward 收集每层 ctx，反传（累积）时按层把 ctx 逐一归还。
+    /// - 梯度累积阶段不能依赖层内隐式缓存，否则 batch/并发下容易发生样本错配；
+    /// - 这里统一要求：forward 收集每层 ctx，反传（累积）时按层把 ctx 逐一归还。
     fn backward_accumulate_with_ctx(
         &mut self,
         layer_ctxs: &[LayerContext],
@@ -1057,7 +1055,7 @@ impl LLM {
                 //
                 // 因此这里选择 fail-fast：发现不支持累积的层就直接终止，避免静默错误。
                 panic!(
-                    "Layer {} 未实现梯度累积接口（backward_accumulate/step_accumulated），无法启用 accumulation_steps。",
+                    "Layer {} 未实现 ctx 驱动的梯度累积接口，无法启用 accumulation_steps。",
                     layer.layer_type()
                 );
             };

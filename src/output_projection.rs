@@ -137,28 +137,12 @@ impl OutputProjection {
         self.grad_b_out_accum.fill(0.0);
     }
 
-    /// 仅做“梯度计算 + 累加”，不更新参数（用于梯度累积）。
-    ///
-    /// 返回值：传递给前一层的梯度（dL/dInput）。
-    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
-    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let _ = grads;
-        // 历史接口依赖 `self.cached_input`，本轮重构已删除该字段，因此直接 fail-fast。
-        //
-        // 教学要点：
-        // - 如果在没有 ctx 的情况下做梯度累积，我们无法保证“参数梯度”对应的前向激活来自同一个样本；
-        // - 这会在 batch/并发/延迟反传场景产生静默错误，因此宁可 panic 也不要悄悄算错。
-        panic!(
-            "OutputProjection.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)"
-        )
-    }
 
-    /// 仅做“梯度计算 + 累加”，不更新参数（ctx 驱动，不依赖 cached_*）。
+    /// 仅做“梯度计算 + 累加”，不更新参数（ctx 驱动）。
     ///
     /// 说明：
-    /// - 旧版梯度累积接口 `backward_accumulate()` 依赖 `self.cached_input`；
-    /// - 当我们把 forward/backward 迁移到“显式 ctx”后，累积接口也必须跟上，否则
-    ///   `cached_*` 字段永远无法删除（并且 batch 场景仍然潜藏覆盖风险）。
+    /// - OutputProjection 的参数梯度依赖输入激活；
+    /// - 当训练循环做梯度累积时，必须把对应样本的 ctx 显式传回，才能避免样本错配。
     pub fn backward_accumulate_with_ctx(
         &mut self,
         ctx: &LayerContext,

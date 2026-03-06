@@ -157,23 +157,13 @@ impl FeedForward {
         self.grad_b2_accum.fill(0.0);
     }
 
-    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
-    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let _ = grads;
-        // 历史接口依赖层内缓存字段；本轮重构已移除这些字段，因此直接 fail-fast。
-        //
-        // 正确姿势：
-        // - forward 时保留 ctx：`let (_out, ctx) = ffn.forward(&input);`
-        // - 累积反传：`ffn.backward_accumulate_with_ctx(&ctx, &grads);`
-        panic!("FeedForward.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
-    }
 
-    /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动）。
     ///
     /// 教学说明：
     /// - FFN 的 backward 依赖 3 个中间量：input、hidden_pre_activation、hidden_post_activation；
     /// - 在新版 `Layer` trait 中，这些量已经被打包进 `FeedForwardContext`；
-    /// - 因此梯度累积也应当从 ctx 中取回它们，而不是从 `self.input` 等缓存字段读取。
+    /// - 因此梯度累积也应当从 ctx 中取回它们，避免样本间上下文错配。
     pub fn backward_accumulate_with_ctx(
         &mut self,
         ctx: &LayerContext,

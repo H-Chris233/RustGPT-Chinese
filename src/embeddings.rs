@@ -171,20 +171,8 @@ impl Embeddings {
         }
     }
 
-    /// 用于梯度累积：旧接口（**已废弃**）。
-    ///
-    /// 历史原因：
-    /// - 旧版 accumulate 依赖 `self.cached_input` 从层内部取回 token_id；
-    /// - 这会让“正确性”绑定到 `cached_*`，从而阻碍我们删除缓存字段，也会在 batch 场景埋雷。
-    ///
-    /// 本轮重构已经删除了 `cached_input` 字段，因此该接口将 fail-fast，避免静默错误。
-    /// 新代码请使用：`backward_accumulate_with_ctx(ctx, grads)`。
-    #[deprecated(note = "已迁移到 ctx：请改用 backward_accumulate_with_ctx(ctx, grads)")]
-    pub fn backward_accumulate(&mut self, _grads: &Array2<f32>) -> Array2<f32> {
-        panic!("Embeddings.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
-    }
 
-    /// 用于梯度累积：只累加梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    /// 用于梯度累积：只累加梯度，不更新参数（ctx 驱动）。
     ///
     /// 教学说明：
     /// - 这就是“第二轮重构”的关键：让 accumulate 接口也显式接收 ctx；

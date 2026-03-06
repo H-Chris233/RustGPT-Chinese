@@ -144,24 +144,13 @@ impl LayerNorm {
         self.grad_beta_accum.fill(0.0);
     }
 
-    /// 仅计算并累积参数梯度，不更新参数（用于梯度累积）。
-    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
-    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let _ = grads;
-        // 历史接口依赖层内 cached_*；本轮重构已移除这些字段，因此直接 fail-fast。
-        //
-        // 正确姿势：
-        // - forward 时保留 ctx：`let (_y, ctx) = ln.forward(&input);`
-        // - 累积反传：`ln.backward_accumulate_with_ctx(&ctx, &grads);`
-        panic!("LayerNorm.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
-    }
 
-    /// 仅计算并累积参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    /// 仅计算并累积参数梯度，不更新参数（ctx 驱动）。
     ///
     /// 教学说明：
     /// - LayerNorm 的 backward 需要 input、mean、inv_std；
     /// - 新版 `Layer::forward()` 已经把它们打包进 `LayerNormContext`；
-    /// - 因此累积接口也应当显式接收 ctx，才能逐步删除 `cached_*` 字段。
+    /// - 因此累积接口也应当显式接收 ctx，才能保证每次反传都对应正确样本。
     pub fn backward_accumulate_with_ctx(
         &mut self,
         ctx: &LayerContext,

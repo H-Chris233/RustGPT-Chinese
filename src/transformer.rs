@@ -160,21 +160,6 @@ impl TransformerBlock {
         self.norm2.zero_grad_accum();
     }
 
-    #[deprecated(note = "旧接口依赖子层内部缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
-    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let _ = grads;
-        // 历史接口（无 ctx）依赖子层内部 `cached_*`（以及旧版 Dropout 的 self.mask）。
-        // 本轮重构已经把“正确的梯度累积”升级为 ctx 驱动（见 `backward_accumulate_with_ctx`），
-        // 并移除了 Dropout 的内部 mask 缓存，因此这里选择 fail-fast，避免静默算错。
-        //
-        // 迁移方式：
-        // 1) forward 时保存 `TransformerBlockContext`；
-        // 2) 调用 `backward_accumulate_with_ctx(&ctx, grads)`；
-        // 3) 最终由 `step_accumulated(lr, scale)` 统一更新参数。
-        panic!(
-            "TransformerBlock.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)"
-        )
-    }
 
     /// 梯度累积（ctx 驱动版本）：只累加子层参数梯度，不更新参数。
     ///
@@ -185,7 +170,7 @@ impl TransformerBlock {
     /// 为什么这个版本必须接收 ctx？
     /// - TransformerBlock 内部包含 6 次子层调用（含两次 Dropout）；
     /// - 每个子层的 backward 都依赖“本次 forward 的中间量”；
-    /// - 如果仍从 `self.cached_*` 读取，这些缓存会阻碍后续删除 cached 字段，并在 batch 场景埋雷。
+    /// - 如果不显式传入 ctx，子层反传就无法与对应样本一一匹配。
     pub fn backward_accumulate_with_ctx(
         &mut self,
         ctx: &LayerContext,

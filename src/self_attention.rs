@@ -499,24 +499,13 @@ impl SelfAttention {
         Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v))
     }
 
-    /// 用于梯度累积：只累加参数梯度，不更新参数。
-    #[deprecated(note = "旧接口依赖层内缓存字段，已废弃；请改用 backward_accumulate_with_ctx(ctx, grads)")]
-    pub fn backward_accumulate(&mut self, grads: &Array2<f32>) -> Array2<f32> {
-        let _ = grads;
-        // 历史接口依赖 `self.cached_*` 保存前向中间量；本轮重构已移除这些缓存字段。
-        //
-        // 正确姿势：
-        // - forward 时保留 ctx：`let (_out, ctx) = attn.forward(&input);`
-        // - 累积反传：`attn.backward_accumulate_with_ctx(&ctx, &grads);`
-        panic!("SelfAttention.backward_accumulate 已废弃：请改用 backward_accumulate_with_ctx(ctx, grads)")
-    }
 
-    /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动，不依赖 cached_*）。
+    /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动）。
     ///
     /// 教学说明：
     /// - SelfAttention 的 backward 依赖大量中间量（Q/K/V、权重、attention_output 等）；
     /// - 新版 `Layer::forward()` 已经把这些量打包进 `SelfAttentionContext`；
-    /// - 因此累积接口也应当接收 ctx，才能避免 cached_* 覆盖并逐步删掉缓存字段。
+    /// - 因此累积接口也应当接收 ctx，才能避免样本错配并稳定支持 micro-batch。
     pub fn backward_accumulate_with_ctx(
         &mut self,
         ctx: &LayerContext,
