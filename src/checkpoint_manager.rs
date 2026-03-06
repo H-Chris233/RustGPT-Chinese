@@ -434,28 +434,39 @@ impl CheckpointManager {
     ///
     /// 说明：
     /// - 这里依赖管理器内部记录的 `best_loss` 判断当前是否存在 best checkpoint；
-    /// - 真正选中的文件来自磁盘扫描结果，并按文件修改时间取最新一个。
+    /// - 真正选中的文件来自磁盘扫描结果，并按 metadata 中的最小 `loss` 选择；
+    /// - 若多个文件 loss 相同，则优先选择 epoch 更大的那个（更晚的真正 best）。
     pub fn get_best_checkpoint(&self) -> Option<PathBuf> {
         if self.best_loss == f32::INFINITY {
             return None;
         }
 
-        // 查找所有best检查点文件
-        let mut best_checkpoints: Vec<_> = fs::read_dir(&self.checkpoint_dir)
+        let best_checkpoints: Vec<_> = fs::read_dir(&self.checkpoint_dir)
             .ok()?
             .filter_map(|entry| entry.ok())
-            .filter(|entry| {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                name_str.starts_with("checkpoint_best") && name_str.ends_with(".bin")
+            .filter_map(|entry| {
+                let path = entry.path();
+                let name = path.file_name()?.to_string_lossy();
+                if !(name.starts_with("checkpoint_best") && name.ends_with(".bin")) {
+                    return None;
+                }
+
+                let metadata_path = path.with_extension("json");
+                let metadata_json = fs::read_to_string(&metadata_path).ok()?;
+                let metadata: CheckpointMetadata = serde_json::from_str(&metadata_json).ok()?;
+                Some((path, metadata))
             })
             .collect();
 
-        // 按修改时间排序，最新的在前
-        best_checkpoints.sort_by_key(|entry| entry.metadata().and_then(|m| m.modified()).ok());
-        best_checkpoints.reverse();
-
-        best_checkpoints.first().map(|entry| entry.path())
+        best_checkpoints
+            .into_iter()
+            .min_by(|(_, a), (_, b)| {
+                a.loss
+                    .partial_cmp(&b.loss)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| b.epoch.cmp(&a.epoch))
+            })
+            .map(|(path, _)| path)
     }
 
     /// 获取 `checkpoint_last.bin` 的路径。

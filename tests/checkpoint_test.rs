@@ -512,6 +512,80 @@ fn test_checkpoint_loss_continuity_after_resume() {
 }
 
 #[test]
+fn test_get_best_checkpoint_prefers_lowest_loss_over_latest_mtime() {
+    let checkpoint_dir = "test_checkpoints_best_selection";
+
+    if std::path::Path::new(checkpoint_dir).exists() {
+        fs::remove_dir_all(checkpoint_dir).ok();
+    }
+    fs::create_dir_all(checkpoint_dir).expect("应该能创建测试目录");
+
+    // 先写入 loss 更低但时间更早的 best checkpoint。
+    let low_loss_bin = format!(
+        "{}/checkpoint_best_epoch_20_loss_2.5000.bin",
+        checkpoint_dir
+    );
+    let low_loss_json = format!(
+        "{}/checkpoint_best_epoch_20_loss_2.5000.json",
+        checkpoint_dir
+    );
+    fs::write(&low_loss_bin, b"low-loss").expect("应该能写入低 loss bin");
+    fs::write(
+        &low_loss_json,
+        serde_json::to_string_pretty(&CheckpointMetadata {
+            epoch: 20,
+            loss: 2.5,
+            learning_rate: 0.001,
+            timestamp: "2026-03-06 10:00:00".to_string(),
+            phase: "test".to_string(),
+        })
+        .expect("应该能序列化低 loss 元数据"),
+    )
+    .expect("应该能写入低 loss json");
+
+    // 确保第二个文件有更晚的修改时间。
+    std::thread::sleep(std::time::Duration::from_millis(20));
+
+    // 再写入 loss 更高但时间更晚的 best checkpoint。
+    let high_loss_bin = format!(
+        "{}/checkpoint_best_epoch_30_loss_2.7000.bin",
+        checkpoint_dir
+    );
+    let high_loss_json = format!(
+        "{}/checkpoint_best_epoch_30_loss_2.7000.json",
+        checkpoint_dir
+    );
+    fs::write(&high_loss_bin, b"high-loss").expect("应该能写入高 loss bin");
+    fs::write(
+        &high_loss_json,
+        serde_json::to_string_pretty(&CheckpointMetadata {
+            epoch: 30,
+            loss: 2.7,
+            learning_rate: 0.001,
+            timestamp: "2026-03-06 11:00:00".to_string(),
+            phase: "test".to_string(),
+        })
+        .expect("应该能序列化高 loss 元数据"),
+    )
+    .expect("应该能写入高 loss json");
+
+    let manager = CheckpointManager::new(checkpoint_dir, CheckpointStrategy::Best, 3)
+        .expect("应该能从已有目录恢复检查点管理器状态");
+
+    let best_path = manager
+        .get_best_checkpoint()
+        .expect("应该能找到最佳 checkpoint");
+
+    assert_eq!(
+        best_path.file_name().and_then(|s| s.to_str()),
+        Some("checkpoint_best_epoch_20_loss_2.5000.bin"),
+        "应优先选择 loss 最低的 best checkpoint，而不是修改时间最新的文件"
+    );
+
+    fs::remove_dir_all(checkpoint_dir).ok();
+}
+
+#[test]
 fn test_checkpoint_manager_restores_best_state_from_existing_dir() {
     let checkpoint_dir = "test_checkpoints_restore_best_state";
 
