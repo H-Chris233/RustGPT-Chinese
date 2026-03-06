@@ -62,6 +62,11 @@ impl<'a> InferenceSession<'a> {
         last_logits
     }
 
+    /// 推进一步增量推理。
+    ///
+    /// 教学边界说明：
+    /// - 当前实现到达 `max_context_length` 后会**整段清空 KV cache 并从当前位置重新计数**；
+    /// - 这不是滑动窗口推理，只是一个保持实现简单的 hard reset 策略。
     pub fn advance_with_token(&mut self, token_id: usize) -> Array2<f32> {
         if self.processed_tokens >= self.max_context_length {
             log::warn!(

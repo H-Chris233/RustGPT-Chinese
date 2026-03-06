@@ -2285,9 +2285,10 @@ impl LLM {
 
 #[cfg(test)]
 mod tests {
-    use super::{EpochAccumulator, LLM};
+    use super::{EpochAccumulator, InferenceSession, LLM};
     use crate::{
-        embeddings::Embeddings, output_projection::OutputProjection, vocab::Vocab, EMBEDDING_DIM,
+        embeddings::Embeddings, output_projection::OutputProjection, transformer::TransformerBlock,
+        vocab::Vocab, EMBEDDING_DIM, HIDDEN_DIM,
     };
     use ndarray::{arr2, Array2};
 
@@ -2573,5 +2574,64 @@ mod tests {
         assert!(max_diff(&embedding_weights(&monitored), &embedding_weights(&manual)) < tol);
         assert!(max_diff(&output_weights(&monitored), &output_weights(&manual)) < tol);
         assert!(max_diff(&output_bias(&monitored), &output_bias(&manual)) < tol);
+    }
+
+    fn make_incremental_test_model(vocab: Vocab) -> LLM {
+        let embeddings = Embeddings::new(vocab.clone());
+        let transformer = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
+        let output = OutputProjection::new(EMBEDDING_DIM, vocab.len());
+        LLM::new(
+            vocab,
+            vec![
+                Box::new(embeddings),
+                Box::new(transformer),
+                Box::new(output),
+            ],
+        )
+    }
+
+    #[test]
+    fn inference_session_snapshot_restore_replays_same_logits() {
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let vocab = Vocab::build_from_texts(&texts);
+        let a = vocab.encode("a").unwrap();
+        let b = vocab.encode("b").unwrap();
+
+        let mut model = make_incremental_test_model(vocab);
+        let mut session = InferenceSession::new(&mut model, 1.0, 1.0, 0);
+
+        let _ = session.advance_with_token(a);
+        let snapshot = session.snapshot();
+        let logits_after_b = session.advance_with_token(b);
+
+        session.restore(&snapshot);
+        assert_eq!(session.processed_tokens(), 1);
+        let replayed_logits_after_b = session.advance_with_token(b);
+
+        assert!(max_diff(&logits_after_b, &replayed_logits_after_b) < 1e-6);
+    }
+
+    #[test]
+    fn inference_session_overflow_uses_hard_reset_not_sliding_window() {
+        let texts = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let vocab = Vocab::build_from_texts(&texts);
+        let a = vocab.encode("a").unwrap();
+        let b = vocab.encode("b").unwrap();
+        let c = vocab.encode("c").unwrap();
+
+        let mut model = make_incremental_test_model(vocab);
+        model.max_context_length = 2;
+        let mut session = InferenceSession::new(&mut model, 1.0, 1.0, 0);
+
+        let _ = session.advance_with_token(a);
+        assert_eq!(session.processed_tokens(), 1);
+        let _ = session.advance_with_token(b);
+        assert_eq!(session.processed_tokens(), 2);
+        let _ = session.advance_with_token(c);
+        assert_eq!(
+            session.processed_tokens(),
+            1,
+            "超过上下文上限后当前实现应执行 hard reset，而不是滑窗继续累计"
+        );
     }
 }
