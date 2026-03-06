@@ -2326,7 +2326,61 @@ impl LLM {
 #[cfg(test)]
 mod tests {
     use super::LLM;
-    use ndarray::arr2;
+    use crate::{
+        embeddings::Embeddings, output_projection::OutputProjection, vocab::Vocab, EMBEDDING_DIM,
+    };
+    use ndarray::{arr2, Array2};
+
+    fn make_two_layer_training_model(vocab: Vocab) -> LLM {
+        let vocab_size = vocab.len();
+
+        let mut embeddings = Embeddings::new(vocab.clone());
+        embeddings.token_embeddings =
+            Array2::from_shape_fn((vocab_size, EMBEDDING_DIM), |(r, c)| {
+                0.002 * (r as f32) - 0.0001 * (c as f32)
+            });
+
+        let mut output = OutputProjection::new(EMBEDDING_DIM, vocab_size);
+        output.w_out = Array2::from_shape_fn((EMBEDDING_DIM, vocab_size), |(r, c)| {
+            0.0003 * (r as f32 + 1.0) - 0.0004 * (c as f32)
+        });
+        output.b_out = Array2::from_shape_fn((1, vocab_size), |(_, c)| -0.01 * (c as f32));
+
+        LLM::new(vocab, vec![Box::new(embeddings), Box::new(output)])
+    }
+
+    fn max_diff(a: &Array2<f32>, b: &Array2<f32>) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .fold(0.0_f32, |m, (&x, &y)| m.max((x - y).abs()))
+    }
+
+    fn embedding_weights(model: &LLM) -> Array2<f32> {
+        model.network[0]
+            .as_any()
+            .downcast_ref::<Embeddings>()
+            .expect("expected Embeddings layer")
+            .token_embeddings
+            .clone()
+    }
+
+    fn output_weights(model: &LLM) -> Array2<f32> {
+        model.network[1]
+            .as_any()
+            .downcast_ref::<OutputProjection>()
+            .expect("expected OutputProjection layer")
+            .w_out
+            .clone()
+    }
+
+    fn output_bias(model: &LLM) -> Array2<f32> {
+        model.network[1]
+            .as_any()
+            .downcast_ref::<OutputProjection>()
+            .expect("expected OutputProjection layer")
+            .b_out
+            .clone()
+    }
 
     #[test]
     fn accumulation_single_step_keeps_full_weight() {
@@ -2364,5 +2418,61 @@ mod tests {
 
         let expected = arr2(&[[0.5_f32, -0.5_f32], [1.5_f32, -1.5_f32]]);
         assert_eq!(grads, expected);
+    }
+
+    #[test]
+    fn train_monitored_accumulation_matches_manual_epoch_replay() {
+        let texts = vec!["a".to_string(), "a b".to_string()];
+        let vocab = Vocab::build_from_texts(&texts);
+
+        let mut monitored = make_two_layer_training_model(vocab.clone());
+        let mut manual = make_two_layer_training_model(vocab.clone());
+
+        let epochs = monitored.train_monitored(vec!["a", "a b"], 1, 0.05, 10, 2);
+        assert_eq!(epochs, 1);
+
+        let tokenized_data: Vec<Vec<usize>> = ["a", "a b"]
+            .iter()
+            .map(|input| LLM::tokenize_training_with_vocab(&manual.vocab, input))
+            .collect();
+        let pad_token_id = manual.vocab.pad_token_id();
+        let warmup_epochs = LLM::recommend_warmup_epochs(1);
+        let current_lr = LLM::cosine_with_warmup_lr(0.05, 0, 1, 0, warmup_epochs);
+
+        manual.set_training_mode(true);
+        manual.zero_grad_accum();
+        let mut accum_counter = 0usize;
+        let mut accum_tokens = 0usize;
+
+        for training_row in &tokenized_data {
+            let input_ids = &training_row[..training_row.len() - 1];
+            let target_ids = &training_row[1..];
+            let Some(mut step) = manual.prepare_training_step(input_ids, target_ids, pad_token_id)
+            else {
+                continue;
+            };
+
+            LLM::clip_gradients(&mut step.grads_output, 1.0);
+            LLM::rescale_logits_grads_for_accumulation(&mut step.grads_output, step.n_targets);
+            manual.backward_accumulate_with_ctx(&step.layer_ctxs, &step.grads_output);
+            accum_counter += 1;
+            accum_tokens += step.n_targets;
+
+            if accum_counter >= 2 {
+                manual.step_accumulated(current_lr, LLM::token_weighted_accum_scale(accum_tokens));
+                accum_counter = 0;
+                accum_tokens = 0;
+            }
+        }
+
+        if accum_counter > 0 {
+            manual.step_accumulated(current_lr, LLM::token_weighted_accum_scale(accum_tokens));
+        }
+        manual.set_training_mode(false);
+
+        let tol = 1e-6_f32;
+        assert!(max_diff(&embedding_weights(&monitored), &embedding_weights(&manual)) < tol);
+        assert!(max_diff(&output_weights(&monitored), &output_weights(&manual)) < tol);
+        assert!(max_diff(&output_bias(&monitored), &output_bias(&manual)) < tol);
     }
 }
