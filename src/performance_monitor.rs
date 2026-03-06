@@ -24,7 +24,7 @@ impl PerformanceMonitor {
     /// 开始计时
     pub fn start(&mut self, name: &str) {
         self.current_timers.insert(name.to_string(), Instant::now());
-        println!("⏱️  开始: {}", name);
+        log::info!("⏱️  开始: {}", name);
     }
 
     /// 结束计时并记录
@@ -36,7 +36,7 @@ impl PerformanceMonitor {
                 .or_insert_with(Vec::new)
                 .push(elapsed);
 
-            println!("✓ 完成: {} (耗时: {:.2}秒)", name, elapsed.as_secs_f32());
+            log::info!("✓ 完成: {} (耗时: {:.2}秒)", name, elapsed.as_secs_f32());
         }
     }
 
@@ -59,9 +59,9 @@ impl PerformanceMonitor {
 
     /// 打印性能报告
     pub fn print_report(&self) {
-        println!("\n╔══════════════════════════════════════════════════════════╗");
-        println!("║              📊 性能监控报告                              ║");
-        println!("╠══════════════════════════════════════════════════════════╣");
+        log::info!("\n╔══════════════════════════════════════════════════════════╗");
+        log::info!("║              📊 性能监控报告                              ║");
+        log::info!("╠══════════════════════════════════════════════════════════╣");
 
         let mut items: Vec<_> = self.timers.iter().collect();
         items.sort_by_key(|(name, _)| *name);
@@ -71,20 +71,20 @@ impl PerformanceMonitor {
             let total: Duration = durations.iter().sum();
             let average = total / count as u32;
 
-            println!("║ {:40} ║", name);
-            println!("║   调用次数: {:6}                               ║", count);
-            println!(
+            log::info!("║ {:40} ║", name);
+            log::info!("║   调用次数: {:6}                               ║", count);
+            log::info!(
                 "║   总耗时:   {:8.2}秒                          ║",
                 total.as_secs_f32()
             );
-            println!(
+            log::info!(
                 "║   平均耗时: {:8.2}秒                          ║",
                 average.as_secs_f32()
             );
-            println!("╠──────────────────────────────────────────────────────────╣");
+            log::info!("╠──────────────────────────────────────────────────────────╣");
         }
 
-        println!("╚══════════════════════════════════════════════════════════╝\n");
+        log::info!("╚══════════════════════════════════════════════════════════╝\n");
     }
 
     /// 清空所有统计数据

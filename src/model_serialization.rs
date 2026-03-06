@@ -520,14 +520,14 @@ pub struct TrainingInfo {
 fn build_serializable_model(model: &LLM) -> Result<SerializableModel, std::io::Error> {
     let mut serializable_layers = Vec::with_capacity(model.network.len());
     for (i, layer) in model.network.iter().enumerate() {
-        print!("   [{}] 序列化 {} 层...", i + 1, layer.layer_type());
+        log::info!("   [{}] 序列化 {} 层...", i + 1, layer.layer_type());
         match SerializableLayer::from_layer(layer) {
             Ok(serialized_layer) => {
                 serializable_layers.push(serialized_layer);
-                println!(" ✓");
+                log::info!(" ✓");
             }
             Err(error) => {
-                println!(" ✗");
+                log::info!(" ✗");
                 return Err(std::io::Error::other(format!(
                     "Failed to serialize layer {}: {}",
                     i, error
@@ -568,12 +568,12 @@ fn build_llm_from_serializable(
     let vocab_len = vocab.len();
     let mut network: Vec<Box<dyn Layer>> = Vec::with_capacity(layers.len());
     for (i, serializable_layer) in layers.iter().enumerate() {
-        print!("   [{}] 重建层...", i + 1);
+        log::info!("   [{}] 重建层...", i + 1);
         let layer = serializable_layer.to_layer(vocab_len).map_err(|error| {
             std::io::Error::other(format!("Failed to rebuild layer {}: {}", i, error))
         })?;
         network.push(layer);
-        println!(" ✓");
+        log::info!(" ✓");
     }
 
     LLM::validate_network_topology(&network)
@@ -596,31 +596,31 @@ pub fn save_model_binary<P: AsRef<Path>>(
     model: &LLM,
     path: P,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("💾 开始保存模型到二进制文件...");
-    println!("   路径: {:?}", path.as_ref());
+    log::info!("💾 开始保存模型到二进制文件...");
+    log::info!("   路径: {:?}", path.as_ref());
 
     let serializable_model = build_serializable_model(model)?;
 
-    print!("   写入文件...");
+    log::info!("   写入文件...");
     let file = File::create(path.as_ref())?;
     let mut writer = BufWriter::new(file);
 
     let config = bincode::config::standard();
     bincode::encode_into_std_write(&serializable_model, &mut writer, config)?;
     writer.flush()?;
-    println!(" ✓");
+    log::info!(" ✓");
 
     let file_size = std::fs::metadata(path.as_ref())?.len();
-    println!("   文件大小: {:.2} MB", file_size as f64 / 1_048_576.0);
-    println!("✅ 模型保存成功!");
+    log::info!("   文件大小: {:.2} MB", file_size as f64 / 1_048_576.0);
+    log::info!("✅ 模型保存成功!");
 
     Ok(())
 }
 
 /// 从二进制文件加载模型
 pub fn load_model_binary<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::error::Error>> {
-    println!("📂 开始从二进制文件加载模型...");
-    println!("   路径: {:?}", path.as_ref());
+    log::info!("📂 开始从二进制文件加载模型...");
+    log::info!("   路径: {:?}", path.as_ref());
 
     let file = File::open(path.as_ref())?;
     let mut reader = BufReader::new(file).take(BINCODE_DECODE_LIMIT_BYTES as u64);
@@ -628,15 +628,15 @@ pub fn load_model_binary<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::er
     let config = bincode::config::standard().with_limit::<BINCODE_DECODE_LIMIT_BYTES>();
     let serializable_model: SerializableModel = bincode::decode_from_std_read(&mut reader, config)?;
 
-    println!("   ✓ 文件读取成功");
-    println!("   模型版本: {}", serializable_model.version);
-    println!("   词汇量: {}", serializable_model.vocab.len());
-    println!("   网络层数: {}", serializable_model.layers.len());
+    log::info!("   ✓ 文件读取成功");
+    log::info!("   模型版本: {}", serializable_model.version);
+    log::info!("   词汇量: {}", serializable_model.vocab.len());
+    log::info!("   网络层数: {}", serializable_model.layers.len());
 
     let llm = build_llm_from_serializable(serializable_model)?;
 
-    println!("✅ 模型加载成功!");
-    println!("   总参数量: {}", llm.total_parameters());
+    log::info!("✅ 模型加载成功!");
+    log::info!("   总参数量: {}", llm.total_parameters());
 
     Ok(llm)
 }
@@ -646,21 +646,21 @@ pub fn save_model_json<P: AsRef<Path>>(
     model: &LLM,
     path: P,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!("💾 开始保存模型到 JSON 文件...");
-    println!("   路径: {:?}", path.as_ref());
+    log::info!("💾 开始保存模型到 JSON 文件...");
+    log::info!("   路径: {:?}", path.as_ref());
 
     let serializable_model = build_serializable_model(model)?;
 
-    print!("   写入 JSON 文件...");
+    log::info!("   写入 JSON 文件...");
     let file = File::create(path.as_ref())?;
     let mut writer = BufWriter::new(file);
     serde_json::to_writer_pretty(&mut writer, &serializable_model)?;
     writer.flush()?;
-    println!(" ✓");
+    log::info!(" ✓");
 
     let file_size = std::fs::metadata(path.as_ref())?.len();
-    println!("   文件大小: {:.2} MB", file_size as f64 / 1_048_576.0);
-    println!("✅ 模型保存成功!");
+    log::info!("   文件大小: {:.2} MB", file_size as f64 / 1_048_576.0);
+    log::info!("✅ 模型保存成功!");
 
     Ok(())
 }
@@ -668,22 +668,22 @@ pub fn save_model_json<P: AsRef<Path>>(
 /// 从 JSON 文件加载模型
 #[allow(dead_code)]
 pub fn load_model_json<P: AsRef<Path>>(path: P) -> Result<LLM, Box<dyn std::error::Error>> {
-    println!("📂 开始从 JSON 文件加载模型...");
-    println!("   路径: {:?}", path.as_ref());
+    log::info!("📂 开始从 JSON 文件加载模型...");
+    log::info!("   路径: {:?}", path.as_ref());
 
     let file = File::open(path.as_ref())?;
     let reader = BufReader::new(file).take(JSON_DECODE_LIMIT_BYTES);
     let serializable_model: SerializableModel = serde_json::from_reader(reader)?;
 
-    println!("   ✓ 文件读取成功");
-    println!("   模型版本: {}", serializable_model.version);
-    println!("   词汇量: {}", serializable_model.vocab.len());
-    println!("   网络层数: {}", serializable_model.layers.len());
+    log::info!("   ✓ 文件读取成功");
+    log::info!("   模型版本: {}", serializable_model.version);
+    log::info!("   词汇量: {}", serializable_model.vocab.len());
+    log::info!("   网络层数: {}", serializable_model.layers.len());
 
     let llm = build_llm_from_serializable(serializable_model)?;
 
-    println!("✅ 模型加载成功!");
-    println!("   总参数量: {}", llm.total_parameters());
+    log::info!("✅ 模型加载成功!");
+    log::info!("   总参数量: {}", llm.total_parameters());
 
     Ok(llm)
 }

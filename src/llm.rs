@@ -602,7 +602,7 @@ impl LLM {
                 );
             }
 
-            println!(
+            log::info!(
                 "Epoch {}: Loss = {:.4}, LR = {:.6}",
                 epoch,
                 epoch_accumulator.avg_loss().unwrap_or(0.0),
@@ -955,7 +955,7 @@ impl LLM {
         let mut perf_monitor = PerformanceMonitor::new();
         let effective_accum_steps = accumulation_steps.max(1);
 
-        println!("📝 正在预处理训练数据...");
+        log::info!("📝 正在预处理训练数据...");
         let preprocess_start = std::time::Instant::now();
 
         // 说明：
@@ -969,13 +969,13 @@ impl LLM {
             .collect();
         perf_monitor.stop("tokenization_single_thread");
 
-        println!(
+        log::info!(
             "✅ 数据预处理完成，共 {} 个序列（耗时 {:.2}s）",
             tokenized_data.len(),
             preprocess_start.elapsed().as_secs_f32()
         );
 
-        println!(
+        log::info!(
             "🧮 梯度累积: {} (accumulation_steps={})",
             if effective_accum_steps > 1 {
                 "启用：micro-batch 累积后一次更新"
@@ -1086,7 +1086,7 @@ impl LLM {
                     0
                 };
 
-                println!(
+                log::info!(
                     "[{:3}/{}] {:6.1}% | Loss: {:.4} | PPL: {:6.2} | LR: {:.6} | Grad: {:6.4} | Speed: {:5.1} samples/s | ETA: {}s",
                     epoch + 1,
                     max_epochs,
@@ -1102,11 +1102,11 @@ impl LLM {
 
             if early_stopping.should_stop(avg_loss, epoch) {
                 let (best_loss, best_epoch) = early_stopping.best_state();
-                println!("\n🛑 早停触发:");
-                println!("   • 最佳epoch: {}", best_epoch + 1);
-                println!("   • 最佳loss: {:.4}", best_loss);
-                println!("   • 停止epoch: {}", epoch + 1);
-                println!("   • 节省时间: {} epochs", max_epochs - epoch);
+                log::info!("\n🛑 早停触发:");
+                log::info!("   • 最佳epoch: {}", best_epoch + 1);
+                log::info!("   • 最佳loss: {:.4}", best_loss);
+                log::info!("   • 停止epoch: {}", epoch + 1);
+                log::info!("   • 节省时间: {} epochs", max_epochs - epoch);
 
                 self.set_training_mode(false);
                 perf_monitor.print_report();
@@ -1157,7 +1157,7 @@ impl LLM {
 
         let perf_monitor = PerformanceMonitor::new();
 
-        println!("📝 正在预处理训练数据...");
+        log::info!("📝 正在预处理训练数据...");
         let preprocess_start = std::time::Instant::now();
 
         // 先把所有训练文本转成带 BOS/EOS 的 token 序列。
@@ -1167,7 +1167,7 @@ impl LLM {
             .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
             .collect();
 
-        println!(
+        log::info!(
             "✅ 数据预处理完成，共 {} 个序列（耗时 {:.2}s）",
             tokenized_data.len(),
             preprocess_start.elapsed().as_secs_f32()
@@ -1266,7 +1266,7 @@ impl LLM {
                     0
                 };
 
-                println!(
+                log::info!(
                     "[{:3}/{}] {:6.1}% | Loss: {:.4} | PPL: {:6.2} | LR: {:.6} | Grad: {:6.4} | Speed: {:5.1} samples/s | ETA: {}s | Batch: {}",
                     epoch + 1,
                     max_epochs,
@@ -1283,11 +1283,11 @@ impl LLM {
 
             if early_stopping.should_stop(avg_loss, epoch) {
                 let (best_loss, best_epoch) = early_stopping.best_state();
-                println!("\n🛑 早停触发:");
-                println!("   • 最佳epoch: {}", best_epoch + 1);
-                println!("   • 最佳loss: {:.4}", best_loss);
-                println!("   • 停止epoch: {}", epoch + 1);
-                println!("   • 节省时间: {} epochs", max_epochs - epoch);
+                log::info!("\n🛑 早停触发:");
+                log::info!("   • 最佳epoch: {}", best_epoch + 1);
+                log::info!("   • 最佳loss: {:.4}", best_loss);
+                log::info!("   • 停止epoch: {}", epoch + 1);
+                log::info!("   • 节省时间: {} epochs", max_epochs - epoch);
 
                 self.set_training_mode(false);
                 perf_monitor.print_report();
@@ -1738,7 +1738,7 @@ impl LLM {
         let tokens_generated = output_tokens.len();
         let elapsed = generation_start.elapsed().as_secs_f32();
         if tokens_generated > 0 && elapsed > 0.0 {
-            println!(
+            log::info!(
                 "⚡ 推理吞吐量: {:.2} tokens/s ({} tokens)",
                 tokens_generated as f32 / elapsed,
                 tokens_generated
@@ -1825,7 +1825,7 @@ impl LLM {
         let tokens_generated = generated_tokens.len();
         let elapsed = generation_start.elapsed().as_secs_f32();
         if tokens_generated > 0 && elapsed > 0.0 {
-            println!(
+            log::info!(
                 "⚡ 推理吞吐量: {:.2} tokens/s ({} tokens)",
                 tokens_generated as f32 / elapsed,
                 tokens_generated
@@ -2080,7 +2080,7 @@ impl LLM {
             let generated_tokens = best.tokens.len().saturating_sub(prompt_base_len);
             let elapsed = generation_start.elapsed().as_secs_f32();
             if generated_tokens > 0 && elapsed > 0.0 {
-                println!(
+                log::info!(
                     "⚡ 推理吞吐量: {:.2} tokens/s ({} tokens)",
                     generated_tokens as f32 / elapsed,
                     generated_tokens
