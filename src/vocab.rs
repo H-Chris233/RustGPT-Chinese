@@ -99,7 +99,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
@@ -576,6 +576,146 @@ impl Vocab {
         self.decode.get(&token_id)
     }
 
+    /// 检查一段文本是否包含中文字符。
+    fn text_contains_chinese(text: &str) -> bool {
+        text.chars().any(|c| c.is_chinese())
+    }
+
+    /// 生成用于日志输出的文本预览，避免在 UTF-8 中间截断。
+    fn preview_text(text: &str, max_chars: usize) -> String {
+        if text.len() > max_chars {
+            text.chars().take(max_chars).collect::<String>()
+        } else {
+            text.to_string()
+        }
+    }
+
+    /// 中文文本分词：优先命中全局 LRU 缓存，未命中时再调用 Jieba。
+    fn segment_chinese_with_cache(text: &str) -> Vec<String> {
+        let mut cache = tokenizer_cache().lock().unwrap();
+        if let Some(cached_tokens) = cache.get(text) {
+            let mut stats = cache_stats().lock().unwrap();
+            stats.0 += 1;
+            return cached_tokens.clone();
+        }
+
+        let mut stats = cache_stats().lock().unwrap();
+        stats.1 += 1;
+        drop(stats);
+
+        let result: Vec<String> = jieba_instance()
+            .cut(text, false)
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
+
+        cache.put(text.to_string(), result.clone());
+        result
+    }
+
+    /// 非中文文本退化为按空白切分，保持教学实现直观。
+    fn encode_non_chinese_sequence(&self, text: &str) -> Vec<usize> {
+        text.split_whitespace()
+            .map(|word| self.encode_with_unk(word))
+            .collect()
+    }
+
+    /// 记录一个候选词元，并在首次加入词表时输出日志。
+    fn insert_vocab_candidate(
+        vocab_set: &mut HashSet<String>,
+        vocab_log: &mut String,
+        candidate: String,
+        log_label: &str,
+        print_label: &str,
+    ) {
+        vocab_log.push_str(&format!("{}: {}\n", log_label, candidate));
+        if vocab_set.insert(candidate.clone()) {
+            println!("       + {}: '{}'", print_label, candidate);
+        }
+    }
+
+    /// 额外提取 Jieba 之外可能遗漏的常见成语和短语。
+    fn collect_extra_chinese_phrases(text: &str, vocab_set: &mut HashSet<String>) {
+        println!("     🔍 提取成语和短语...");
+        Self::extract_chinese_phrases(text, vocab_set);
+    }
+
+    /// 从单条文本中抽取词元候选，返回该文本是否被当作中文文本处理。
+    fn collect_vocab_tokens_from_text(
+        text: &str,
+        vocab_set: &mut HashSet<String>,
+        vocab_log: &mut String,
+        jieba: &Jieba,
+    ) -> bool {
+        if Self::text_contains_chinese(text) {
+            println!("     类型: 中文文本");
+            println!("     ⏳ 开始 Jieba 分词...");
+            if let Err(e) = std::io::stdout().flush() {
+                log::warn!("刷新标准输出失败: {}", e);
+            }
+
+            let tokens = jieba.cut(text, false);
+            println!("     ✓ 分词完成，提取了 {} 个词元", tokens.len());
+
+            for token in tokens {
+                let trimmed = token.trim();
+                if !trimmed.is_empty() {
+                    Self::insert_vocab_candidate(
+                        vocab_set,
+                        vocab_log,
+                        trimmed.to_string(),
+                        "Token",
+                        "新词元",
+                    );
+                }
+            }
+
+            Self::collect_extra_chinese_phrases(text, vocab_set);
+            true
+        } else {
+            println!("     类型: 英文/其他文本");
+
+            for word in text.split_whitespace() {
+                let mut current = String::new();
+                for c in word.chars() {
+                    if c.is_ascii_punctuation() {
+                        if !current.is_empty() {
+                            Self::insert_vocab_candidate(
+                                vocab_set,
+                                vocab_log,
+                                current.clone(),
+                                "Word",
+                                "新词元",
+                            );
+                            current.clear();
+                        }
+                        Self::insert_vocab_candidate(
+                            vocab_set,
+                            vocab_log,
+                            c.to_string(),
+                            "Punctuation",
+                            "新标点",
+                        );
+                    } else {
+                        current.push(c);
+                    }
+                }
+
+                if !current.is_empty() {
+                    Self::insert_vocab_candidate(
+                        vocab_set,
+                        vocab_log,
+                        current,
+                        "Word",
+                        "新词元",
+                    );
+                }
+            }
+
+            false
+        }
+    }
+
     /// **编码文本序列（带 LRU 缓存优化）**
     ///
     /// 将整段文本转换为 token ID 序列，这是模型输入的标准格式。
@@ -620,56 +760,21 @@ impl Vocab {
     /// // token_ids: [1234, 5678, 9012, 3456]
     /// ```
     pub fn encode_sequence(&self, text: &str) -> Vec<usize> {
-        let mut tokens = Vec::new();
-
-        // 检查文本中是否包含中文字符。
-        let has_chinese = text
-            .chars()
-            .any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF);
-
-        if has_chinese {
-            // 尝试从缓存获取分词结果
-            let seg_list = {
-                let mut cache = tokenizer_cache().lock().unwrap();
-                if let Some(cached_tokens) = cache.get(text) {
-                    // 缓存命中
-                    let mut stats = cache_stats().lock().unwrap();
-                    stats.0 += 1;
-                    cached_tokens.clone()
-                } else {
-                    // 缓存未命中，执行分词
-                    let mut stats = cache_stats().lock().unwrap();
-                    stats.1 += 1;
-                    drop(stats); // 释放锁
-
-                    let jieba = jieba_instance();
-                    let result: Vec<String> = jieba
-                        .cut(text, false)
-                        .into_iter()
-                        .map(|s| s.to_string())
-                        .collect();
-
-                    // 存入缓存
-                    cache.put(text.to_string(), result.clone());
-                    result
-                }
-            };
-
-            for word in seg_list {
-                if !word.trim().is_empty() {
-                    let token_id = self.encode_with_unk(word.trim());
-                    tokens.push(token_id);
-                }
-            }
+        if Self::text_contains_chinese(text) {
+            Self::segment_chinese_with_cache(text)
+                .into_iter()
+                .filter_map(|word| {
+                    let trimmed = word.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        Some(self.encode_with_unk(trimmed))
+                    }
+                })
+                .collect()
         } else {
-            // 非中文文本退化为按空白切分，保持实现简单直观。
-            for word in text.split_whitespace() {
-                let token_id = self.encode_with_unk(word);
-                tokens.push(token_id);
-            }
+            self.encode_non_chinese_sequence(text)
         }
-
-        tokens
     }
 
     /// **解码 token ID 序列**
@@ -858,8 +963,6 @@ impl Vocab {
     ///   • 最终词汇集大小: 12500 个唯一词元
     /// ```
     pub fn process_text_for_vocab(texts: &[String], vocab_set: &mut HashSet<String>) {
-        use std::io::Write;
-
         println!("\n🔧 开始处理文本数据以构建词汇表...");
         println!("  📊 待处理文本数量: {}", texts.len());
 
@@ -877,106 +980,31 @@ impl Vocab {
         vocab_log.push_str("Initialized special tokens.\n");
         println!("  ✓ 已添加 7 个特殊词元");
 
-        // 使用全局 Jieba 实例（如果未初始化会自动初始化）
         println!("\n📝 开始分词处理...");
         let jieba = jieba_instance();
 
-        // 遍历全部训练文本，逐条抽取词元加入词汇集合。
         let total_texts = texts.len();
         let mut chinese_texts = 0;
         let mut english_texts = 0;
 
         for (idx, text) in texts.iter().enumerate() {
-            // 显示当前处理的文本进度
             println!("\n  📄 处理文本 [{}/{}]", idx + 1, total_texts);
 
-            // 安全地截取文本预览（处理 UTF-8 字符边界）
-            let preview = if text.len() > 50 {
-                // 使用字符迭代器确保不会在字符中间切割
-                text.chars().take(50).collect::<String>()
-            } else {
-                text.clone()
-            };
+            let preview = Self::preview_text(text, 50);
             println!("     内容预览: {}...", preview);
             if let Err(e) = std::io::stdout().flush() {
                 log::warn!("刷新标准输出失败: {}", e);
             }
 
-            // 检查文本中是否包含中文字符。
-            let has_chinese = text
-                .chars()
-                .any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF);
-
-            if has_chinese {
+            if Self::collect_vocab_tokens_from_text(text, vocab_set, &mut vocab_log, jieba) {
                 chinese_texts += 1;
-                println!("     类型: 中文文本");
-
-                // 中文文本使用 Jieba 分词。
-                println!("     ⏳ 开始 Jieba 分词...");
-                if let Err(e) = std::io::stdout().flush() {
-                    log::warn!("刷新标准输出失败: {}", e);
-                }
-
-                let tokens = jieba.cut(text, false);
-                let token_count = tokens.len();
-
-                println!("     ✓ 分词完成，提取了 {} 个词元", token_count);
-
-                for token in tokens {
-                    if !token.trim().is_empty() {
-                        let token_trimmed = token.trim().to_string();
-                        vocab_log.push_str(&format!("Token: {}\n", token_trimmed));
-                        let is_new = vocab_set.insert(token_trimmed.clone());
-                        if is_new {
-                            println!("       + 新词元: '{}'", token_trimmed);
-                        }
-                    }
-                }
-
-                // 额外提取 Jieba 之外可能遗漏的常见成语和短语。
-                println!("     🔍 提取成语和短语...");
-                Self::extract_chinese_phrases(text, vocab_set);
             } else {
                 english_texts += 1;
-                println!("     类型: 英文/其他文本");
-
-                // 非中文文本沿用按空白和标点切分的简单流程。
-                for word in text.split_whitespace() {
-                    // 把标点从单词中拆开，避免与词干粘连。
-                    let mut current = String::new();
-                    for c in word.chars() {
-                        if c.is_ascii_punctuation() {
-                            if !current.is_empty() {
-                                vocab_log.push_str(&format!("Word: {}\n", current));
-                                let is_new = vocab_set.insert(current.clone());
-                                if is_new {
-                                    println!("       + 新词元: '{}'", current);
-                                }
-                                current.clear();
-                            }
-                            vocab_log.push_str(&format!("Punctuation: {}\n", c));
-                            let is_new = vocab_set.insert(c.to_string());
-                            if is_new {
-                                println!("       + 新标点: '{}'", c);
-                            }
-                        } else {
-                            current.push(c);
-                        }
-                    }
-                    if !current.is_empty() {
-                        vocab_log.push_str(&format!("Word: {}\n", current));
-                        let is_new = vocab_set.insert(current.clone());
-                        if is_new {
-                            println!("       + 新词元: '{}'", current);
-                        }
-                    }
-                }
             }
 
             println!("     📊 当前词汇表大小: {} 个唯一词元", vocab_set.len());
         }
 
-        // 显示最终统计
         println!("\n✅ 文本处理完成！");
         println!("\n📊 分词处理统计:");
         println!("  • 处理文本总数: {} 个", total_texts);
