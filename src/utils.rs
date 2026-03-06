@@ -29,6 +29,11 @@ fn uniform_log_prob_value(class_count: usize) -> f32 {
 /// # 数值稳定性
 /// 1. 每行减去最大值，避免exp溢出
 /// 2. 除以总和时添加epsilon，避免除零错误
+///
+/// # 教学型容错边界
+/// - 当整行出现 `NaN/±Inf`，或归一化因子无效时，当前实现会**退化为均匀分布**；
+/// - 这样做是为了让教学/演示场景尽量继续运行，而不是立刻崩溃；
+/// - 但它会掩盖上游数值发散，因此不应误解为“严格训练模式”的最佳实践。
 pub fn softmax(logits: &Array2<f32>) -> Array2<f32> {
     let mut result = logits.clone();
 
@@ -71,6 +76,11 @@ pub fn softmax(logits: &Array2<f32>) -> Array2<f32> {
 ///
 /// 对每一行计算：log_softmax(x_i) = x_i - log(sum_j exp(x_j))，
 /// 使用减去行最大值的方式避免数值溢出。
+///
+/// # 教学型容错边界
+/// - 若输入行包含非有限值，当前实现会回退为“均匀对数概率”；
+/// - 该行为与 `softmax()` 保持一致，目的是让教学场景更容易继续观察后续行为；
+/// - 若需要严格暴露训练/推理发散，应改用 fail-fast 策略。
 pub fn log_softmax(logits: &Array2<f32>) -> Array2<f32> {
     let mut result = logits.clone();
 
