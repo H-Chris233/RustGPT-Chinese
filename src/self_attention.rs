@@ -137,7 +137,10 @@ fn stable_softmax(logits: &Array2<f32>) -> Array2<f32> {
         //   是未定义的（0/0）。此时我们返回“全 0 权重”，并让上层输出自然变为 0，避免把
         //   PAD/value 当成有效信息做均匀平均。
         if max_val.is_nan() {
-            log::warn!("stable_softmax: logits contains NaN; returning zero row (row={})", i);
+            log::warn!(
+                "stable_softmax: logits contains NaN; returning zero row (row={})",
+                i
+            );
             continue;
         }
         if max_val == f32::NEG_INFINITY {
@@ -400,7 +403,13 @@ impl SelfAttention {
         &self,
         ctx: &SelfAttentionContext,
         grads: &Array2<f32>,
-    ) -> Option<(Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>, Array2<f32>)> {
+    ) -> Option<(
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+        Array2<f32>,
+    )> {
         let input = &ctx.input;
         let attention_output = &ctx.attention_output;
 
@@ -502,7 +511,6 @@ impl SelfAttention {
         Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v))
     }
 
-
     /// 用于梯度累积：只累加参数梯度，不更新参数（ctx 驱动）。
     ///
     /// 教学说明：
@@ -522,7 +530,9 @@ impl SelfAttention {
         let Some((grad_input, grad_w_o, grad_w_q, grad_w_k, grad_w_v)) =
             self.compute_grads_from_ctx(ctx, grads)
         else {
-            log::warn!("SelfAttention.backward_accumulate_with_ctx 在未执行 forward 的情况下被调用，直接传递梯度");
+            log::warn!(
+                "SelfAttention.backward_accumulate_with_ctx 在未执行 forward 的情况下被调用，直接传递梯度"
+            );
             return grads.clone();
         };
 
@@ -582,6 +592,9 @@ impl SelfAttention {
     ///
     /// 约定：`1.0` 表示真实 token，`0.0` 表示 PAD。
     /// 对于 PAD 对应的 key 列，我们把整列置为 `-∞`，这样所有 query 都不会 attend 到它。
+    ///
+    /// 注意：这里**不会**同时把 PAD query 的整行输出清零；
+    /// 这属于上层训练语义（PAD query 不参与训练信号）的职责，而不是本函数的职责。
     fn apply_key_padding_mask(mask: &mut Array2<f32>, key_padding_mask: Option<&Array1<f32>>) {
         let Some(pad_mask) = key_padding_mask else {
             return;
@@ -828,6 +841,11 @@ impl SelfAttention {
     /// 这里我们采用“Key padding mask”的做法：
     /// - 对所有 query 位置 i，若 key 位置 j 是 PAD，则把 score(i,j) 设为 -∞；
     /// - 这样 softmax 后该位置权重为 0，从而不会读取 PAD 的 value。
+    ///
+    /// 语义边界（重要）：
+    /// - 当前实现**只屏蔽 key/value 列**，不主动把 PAD 位置作为 query 的整行输出清零；
+    /// - 因此右侧 PAD 位置仍可能 attend 到更早的真实 token；
+    /// - 训练侧必须继续保证：PAD query 位置不参与 loss / grads（否则会把补齐位置当成真实训练信号）。
     fn multi_head_attention_with_padding_mask(
         &mut self,
         input: &Array2<f32>,
