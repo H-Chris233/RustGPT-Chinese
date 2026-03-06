@@ -1142,12 +1142,18 @@ impl LLM {
                 self.step_accumulated(current_lr, Self::token_weighted_accum_scale(accum_tokens));
             }
 
+            if sample_count == 0 || total_tokens == 0 {
+                log::error!(
+                    "train_monitored: 没有有效训练样本（所有序列长度 < 2 或全部被跳过），无法继续训练。epoch={}",
+                    epoch
+                );
+                self.set_training_mode(false);
+                perf_monitor.print_report();
+                return epoch;
+            }
+
             let epoch_time = epoch_start.elapsed().as_secs_f32();
-            let avg_loss = if total_tokens > 0 {
-                total_nll / total_tokens as f32
-            } else {
-                0.0
-            };
+            let avg_loss = total_nll / total_tokens as f32;
             let avg_grad_norm = if sample_count > 0 {
                 total_grad_norm / sample_count as f32
             } else {
@@ -1328,12 +1334,18 @@ impl LLM {
                 }
             }
 
+            if sample_count == 0 || total_tokens == 0 {
+                log::error!(
+                    "train_bucketed_sequential: 没有有效训练样本（所有序列长度 < 2 或全部被跳过），无法继续训练。epoch={}",
+                    epoch
+                );
+                self.set_training_mode(false);
+                perf_monitor.print_report();
+                return epoch;
+            }
+
             let epoch_time = epoch_start.elapsed().as_secs_f32();
-            let avg_loss = if total_tokens > 0 {
-                total_nll / total_tokens as f32
-            } else {
-                0.0
-            };
+            let avg_loss = total_nll / total_tokens as f32;
             let avg_grad_norm = if sample_count > 0 {
                 total_grad_norm / sample_count as f32
             } else {
@@ -2563,5 +2575,25 @@ mod tests {
         let model = make_two_layer_training_model(vocab);
         let choice = model.sample_from_probs(&[0.0_f32, 0.0_f32, 0.0_f32]);
         assert_eq!(choice, 0);
+    }
+
+    #[test]
+    fn train_monitored_returns_zero_when_no_valid_samples_exist() {
+        let texts = vec!["示例".to_string()];
+        let vocab = Vocab::build_from_texts(&texts);
+        let mut model = make_two_layer_training_model(vocab);
+
+        let epochs = model.train_monitored(Vec::new(), 3, 0.01, 2, 1);
+        assert_eq!(epochs, 0);
+    }
+
+    #[test]
+    fn train_bucketed_sequential_returns_zero_when_no_valid_samples_exist() {
+        let texts = vec!["示例".to_string()];
+        let vocab = Vocab::build_from_texts(&texts);
+        let mut model = make_two_layer_training_model(vocab);
+
+        let epochs = model.train_bucketed_sequential(Vec::new(), 3, 0.01, 2, 2);
+        assert_eq!(epochs, 0);
     }
 }
