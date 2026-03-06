@@ -8,7 +8,7 @@ fn create_minimal_llm() -> LLM {
     let embeddings = Embeddings::new(vocab.clone());
     let output = OutputProjection::new(EMBEDDING_DIM, vocab_size);
 
-    LLM::new(vocab, vec![Box::new(embeddings), Box::new(output)])
+    LLM::new_experimental(vocab, vec![Box::new(embeddings), Box::new(output)])
 }
 
 /// `train_with_checkpointing` 在没有任何有效样本时不应除零/崩溃。

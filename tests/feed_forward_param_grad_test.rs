@@ -59,7 +59,10 @@ fn feed_forward_parameter_gradients_match_numerical() {
     // 固定参数（保证可复现），并让 ReLU 的激活/失活有明确 margin，避免在 0 附近数值不稳定。
     let w1 = make_w1(embedding_dim, hidden_dim);
     let w2 = make_w2(hidden_dim, embedding_dim);
-    let b1 = Array2::from_shape_fn((1, hidden_dim), |(_, c)| if c % 2 == 0 { 1.0 } else { -1.0 });
+    let b1 = Array2::from_shape_fn(
+        (1, hidden_dim),
+        |(_, c)| if c % 2 == 0 { 1.0 } else { -1.0 },
+    );
     let b2 = Array2::from_shape_vec((1, embedding_dim), vec![0.1, -0.2, 0.05, 0.0]).unwrap();
 
     let mut ffn = make_ffn_with_params(embedding_dim, hidden_dim, &w1, &b1, &w2, &b2);
@@ -73,9 +76,7 @@ fn feed_forward_parameter_gradients_match_numerical() {
     // 由于本测试已经固定了 (input, w1, b1)，我们直接按定义计算 pre-activation：
     //   h_pre = input · W1 + b1
     let h_pre = input.dot(&w1) + &b1;
-    let min_abs = h_pre
-        .iter()
-        .fold(f32::INFINITY, |m, &v| m.min(v.abs()));
+    let min_abs = h_pre.iter().fold(f32::INFINITY, |m, &v| m.min(v.abs()));
     assert!(
         min_abs > 1e-2,
         "ReLU pre-activation too close to 0; test construction unstable (min_abs={})",

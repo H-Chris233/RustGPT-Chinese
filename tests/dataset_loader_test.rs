@@ -4,10 +4,7 @@ use llm::Dataset;
 
 #[test]
 fn test_dataset_new_json() {
-    let dataset = Dataset::new(
-        "data/pretraining".to_string(),
-        "data/chat".to_string(),
-    );
+    let dataset = Dataset::new("data/pretraining".to_string(), "data/chat".to_string());
     assert!(
         !dataset.pretraining_data.is_empty(),
         "Pretraining data should not be empty"

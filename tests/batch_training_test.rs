@@ -116,7 +116,7 @@ fn test_batch_training_with_small_model() {
         Box::new(output_projection),
     ];
 
-    let mut model = LLM::new(vocab, network);
+    let mut model = LLM::new_experimental(vocab, network);
 
     // 准备训练数据
     let data = vec!["你好 世界", "测试"];
@@ -207,7 +207,7 @@ impl llm::Layer for BiasOnlyProbeLayer {
 fn build_probe_model(texts: &[String]) -> LLM {
     let vocab = Vocab::build_from_texts(texts);
     let vocab_size = vocab.len();
-    LLM::new(vocab, vec![Box::new(BiasOnlyProbeLayer::new(vocab_size))])
+    LLM::new_experimental(vocab, vec![Box::new(BiasOnlyProbeLayer::new(vocab_size))])
 }
 
 fn probe_bias(model: &LLM) -> Array2<f32> {

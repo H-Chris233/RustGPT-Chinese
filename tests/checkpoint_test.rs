@@ -33,7 +33,7 @@ fn create_test_model() -> (LLM, Vec<String>) {
     let transformer = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
     let output_projection = OutputProjection::new(EMBEDDING_DIM, vocab.words.len());
 
-    let llm = LLM::new(
+    let llm = LLM::new_experimental(
         vocab,
         vec![
             Box::new(embeddings),
@@ -376,7 +376,7 @@ fn test_checkpoint_loss_continuity_after_resume() {
     let transformer = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
     let output_projection = OutputProjection::new(EMBEDDING_DIM, vocab.words.len());
 
-    let mut llm = LLM::new(
+    let mut llm = LLM::new_experimental(
         vocab.clone(),
         vec![
             Box::new(embeddings),
@@ -859,7 +859,7 @@ fn test_compute_loss_eval_uses_token_weighted_mean() {
     logits_len2_data.extend(logits_row_for_target_loss(vocab_size, c_id, 1.0));
     let logits_len2 = Array2::from_shape_vec((2, vocab_size), logits_len2_data).unwrap();
 
-    let mut llm = LLM::new(
+    let mut llm = LLM::new_experimental(
         vocab,
         vec![Box::new(SeqLenAwareProbeLayer {
             logits_len1,

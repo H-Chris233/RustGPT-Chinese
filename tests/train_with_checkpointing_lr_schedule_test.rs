@@ -86,7 +86,7 @@ fn train_with_checkpointing_uses_cosine_with_warmup_no_restarts() {
     logits_vec[a_id] = 1.0;
     let logits = Array2::from_shape_vec((1, vocab_size), logits_vec).unwrap();
 
-    let mut llm = LLM::new(vocab, vec![Box::new(LrProbeLayer::new(logits))]);
+    let mut llm = LLM::new_experimental(vocab, vec![Box::new(LrProbeLayer::new(logits))]);
     let tokenized_data = vec![vec![a_id, b_id]];
 
     let max_epochs = 5usize;
@@ -114,7 +114,8 @@ fn train_with_checkpointing_uses_cosine_with_warmup_no_restarts() {
 
     for (i, &lr_seen) in probe.seen_lrs.iter().enumerate() {
         let epoch = resume_epoch + i;
-        let lr_expected = LLM::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
+        let lr_expected =
+            LLM::cosine_with_warmup_lr(initial_lr, epoch, max_epochs, 0, warmup_epochs);
         assert!(
             (lr_seen - lr_expected).abs() < 1e-9,
             "epoch {epoch}: expected lr {lr_expected}, got {lr_seen}"

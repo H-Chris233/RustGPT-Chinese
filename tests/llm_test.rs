@@ -49,12 +49,7 @@ impl Layer for TestOutputProjectionLayer {
     }
 
     // 该测试层当前只需覆盖基础 backward 行为。
-    fn backward(
-        &mut self,
-        ctx: &LayerContext,
-        grads: &Array2<f32>,
-        _lr: f32,
-    ) -> Array2<f32> {
+    fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, _lr: f32) -> Array2<f32> {
         let input = if let Some(input) = ctx.downcast_ref::<Array2<f32>>() {
             input
         } else if let Some(input) = self.cache_input.as_ref() {
@@ -95,7 +90,7 @@ impl TestOutputProjectionLayer {
 fn test_llm_tokenize() {
     let vocab = Vocab::default();
     let vocab_size = vocab.encode.len();
-    let llm = LLM::new(
+    let llm = LLM::new_experimental(
         vocab,
         vec![Box::new(TestOutputProjectionLayer::new(5, 5, vocab_size))],
     );
@@ -114,7 +109,7 @@ fn test_llm_tokenize() {
 fn test_llm_predict() {
     let vocab = Vocab::default();
     let vocab_size = vocab.encode.len();
-    let mut llm = LLM::new(
+    let mut llm = LLM::new_experimental(
         vocab.clone(),
         vec![Box::new(TestOutputProjectionLayer::new(5, 5, vocab_size))],
     );
@@ -133,7 +128,7 @@ fn test_llm_train() {
     let vocab = Vocab::default();
     let vocab_size = vocab.encode.len();
     let layer = Box::new(TestOutputProjectionLayer::new(5, 1, vocab_size));
-    let mut llm = LLM::new(vocab.clone(), vec![layer]);
+    let mut llm = LLM::new_experimental(vocab.clone(), vec![layer]);
 
     let training_data = vec!["hello world this is rust."];
 
@@ -148,7 +143,7 @@ fn test_llm_integration() {
     let embeddings = Box::new(Embeddings::new(vocab.clone()));
     let output_projection = Box::new(OutputProjection::new(EMBEDDING_DIM, vocab_size));
 
-    let mut llm = LLM::new(vocab.clone(), vec![embeddings, output_projection]);
+    let mut llm = LLM::new_experimental(vocab.clone(), vec![embeddings, output_projection]);
 
     let input_text = "hello world this is rust";
     llm.train(vec![input_text], 10, 0.01);
@@ -164,7 +159,7 @@ fn test_llm_total_parameters() {
     let transformer_block = Box::new(TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM));
     let output_projection = Box::new(OutputProjection::new(EMBEDDING_DIM, vocab_size));
 
-    let llm = LLM::new(
+    let llm = LLM::new_experimental(
         vocab.clone(),
         vec![embeddings, transformer_block, output_projection],
     );
@@ -174,17 +169,17 @@ fn test_llm_total_parameters() {
     assert!(param_count > 0);
 
     // 总参数量应等于各层参数量之和。
-    let embeddings_param_count = LLM::new(
+    let embeddings_param_count = LLM::new_experimental(
         vocab.clone(),
         vec![Box::new(Embeddings::new(vocab.clone()))],
     )
     .total_parameters();
-    let transformer_param_count = LLM::new(
+    let transformer_param_count = LLM::new_experimental(
         vocab.clone(),
         vec![Box::new(TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM))],
     )
     .total_parameters();
-    let output_param_count = LLM::new(
+    let output_param_count = LLM::new_experimental(
         vocab.clone(),
         vec![Box::new(OutputProjection::new(EMBEDDING_DIM, vocab_size))],
     )

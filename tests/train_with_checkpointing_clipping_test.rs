@@ -77,19 +77,11 @@ fn train_with_checkpointing_clips_grads_to_l2_norm_1() {
     logits_vec[a_id] = 1000.0;
     let logits = Array2::from_shape_vec((1, vocab_size), logits_vec).unwrap();
 
-    let mut llm = LLM::new(vocab, vec![Box::new(ProbeLayer::new(logits))]);
+    let mut llm = LLM::new_experimental(vocab, vec![Box::new(ProbeLayer::new(logits))]);
 
     let tokenized_data = vec![vec![a_id, b_id]]; // input=[a], target=[b]
 
-    llm.train_with_checkpointing(
-        tokenized_data,
-        1,
-        0.001,
-        100,
-        None,
-        "clip_test",
-        0,
-    );
+    llm.train_with_checkpointing(tokenized_data, 1, 0.001, 100, None, "clip_test", 0);
 
     let probe = llm.network[0]
         .as_any()

@@ -369,7 +369,16 @@ impl LLM {
     pub fn new(vocab: Vocab, network: Vec<Box<dyn Layer>>) -> Self {
         Self::validate_network_topology(&network)
             .unwrap_or_else(|error| panic!("LLM::new 收到不受支持的网络拓扑: {}", error));
+        Self::new_experimental(vocab, network)
+    }
 
+    /// 显式的实验性构造入口。
+    ///
+    /// 说明：
+    /// - 用于测试、教学探针或非常规网络拼装；
+    /// - 不承诺支持增量推理、梯度累积或其它依赖固定拓扑的高级路径；
+    /// - 若调用方需要当前教学主路径，请优先使用 `LLM::new(...)`。
+    pub fn new_experimental(vocab: Vocab, network: Vec<Box<dyn Layer>>) -> Self {
         let vocab_size = vocab.words.len();
         Self {
             vocab,

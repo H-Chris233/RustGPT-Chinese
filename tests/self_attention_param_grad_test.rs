@@ -66,13 +66,7 @@ fn self_attention_parameter_gradients_match_numerical() {
     let tol = 2e-2_f32; // 注意力含 softmax，允许略大误差
 
     // 抽样若干参数位置（避免测试过慢）
-    let samples: &[(usize, usize)] = &[
-        (0, 0),
-        (1, 2),
-        (3, 5),
-        (7, 8),
-        (15, 15),
-    ];
+    let samples: &[(usize, usize)] = &[(0, 0), (1, 2), (3, 5), (7, 8), (15, 15)];
 
     let check = |name: &str,
                  base: &Array2<f32>,
@@ -102,46 +96,26 @@ fn self_attention_parameter_gradients_match_numerical() {
     };
 
     // w_q
-    check(
-        "w_q",
-        &w_q,
-        &grad_w_q,
-        &|w_q_perturbed| {
-            let mut a = make_attn_with_weights(dim, w_q_perturbed, &w_k, &w_v, &w_o);
-            compute_loss(&mut a, &input, &grad_out)
-        },
-    );
+    check("w_q", &w_q, &grad_w_q, &|w_q_perturbed| {
+        let mut a = make_attn_with_weights(dim, w_q_perturbed, &w_k, &w_v, &w_o);
+        compute_loss(&mut a, &input, &grad_out)
+    });
 
     // w_k
-    check(
-        "w_k",
-        &w_k,
-        &grad_w_k,
-        &|w_k_perturbed| {
-            let mut a = make_attn_with_weights(dim, &w_q, w_k_perturbed, &w_v, &w_o);
-            compute_loss(&mut a, &input, &grad_out)
-        },
-    );
+    check("w_k", &w_k, &grad_w_k, &|w_k_perturbed| {
+        let mut a = make_attn_with_weights(dim, &w_q, w_k_perturbed, &w_v, &w_o);
+        compute_loss(&mut a, &input, &grad_out)
+    });
 
     // w_v
-    check(
-        "w_v",
-        &w_v,
-        &grad_w_v,
-        &|w_v_perturbed| {
-            let mut a = make_attn_with_weights(dim, &w_q, &w_k, w_v_perturbed, &w_o);
-            compute_loss(&mut a, &input, &grad_out)
-        },
-    );
+    check("w_v", &w_v, &grad_w_v, &|w_v_perturbed| {
+        let mut a = make_attn_with_weights(dim, &w_q, &w_k, w_v_perturbed, &w_o);
+        compute_loss(&mut a, &input, &grad_out)
+    });
 
     // w_o
-    check(
-        "w_o",
-        &w_o,
-        &grad_w_o,
-        &|w_o_perturbed| {
-            let mut a = make_attn_with_weights(dim, &w_q, &w_k, &w_v, w_o_perturbed);
-            compute_loss(&mut a, &input, &grad_out)
-        },
-    );
+    check("w_o", &w_o, &grad_w_o, &|w_o_perturbed| {
+        let mut a = make_attn_with_weights(dim, &w_q, &w_k, &w_v, w_o_perturbed);
+        compute_loss(&mut a, &input, &grad_out)
+    });
 }

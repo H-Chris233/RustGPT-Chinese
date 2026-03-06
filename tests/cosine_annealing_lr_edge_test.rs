@@ -12,4 +12,3 @@ fn cosine_annealing_lr_does_not_panic_when_cycle_length_zero() {
     assert!(lr.is_finite(), "lr should be finite, got {}", lr);
     assert!(lr > 0.0, "lr should be >0, got {}", lr);
 }
-
