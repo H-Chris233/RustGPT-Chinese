@@ -32,10 +32,10 @@
 //! use llm::{Layer, fused_ops::FusedLayerNormLinear};
 //! use ndarray::Array2;
 //!
-//! let mut fused_op = FusedLayerNormLinear::new(512, 1024);
-//! let input = Array2::zeros((10, 512));
+//! let mut fused_op = FusedLayerNormLinear::new(256, 512);
+//! let input = Array2::zeros((10, 256));
 //! let (output, _ctx) = fused_op.forward(&input);
-//! // output shape: (10, 1024)
+//! // 输出形状: (10, 512)
 //! ```
 
 use ndarray::{Array1, Array2, Axis};

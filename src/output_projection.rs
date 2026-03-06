@@ -4,7 +4,7 @@
 //!
 //! ## 作用
 //!
-//! 将 Transformer 的输出（512维向量）转换为词汇表大小的 logits（概率分数）：
+//! 将 Transformer 的输出隐藏状态投影到词汇表空间，得到 logits（未归一化分数）：
 //!
 //! ```text
 //! 输入: (seq_len, EMBEDDING_DIM) - Transformer 的隐藏状态
@@ -24,8 +24,8 @@
 //!
 //! 这是模型中参数最多的层之一：
 //! - **权重**: EMBEDDING_DIM × vocab_size
-//! - **偏置**: vocab_size ≈ 10,000 参数
-//! - **总计**: 约 512 万参数
+//! - **偏置**: `vocab_size`
+//! - **总计**: `embedding_dim * vocab_size + vocab_size`
 //!
 //! ## 权重共享（Weight Tying）
 //!
@@ -54,7 +54,7 @@ struct OutputProjectionContext {
 
 /// **输出投影层结构体**
 pub struct OutputProjection {
-    /// **权重矩阵** W: (embedding_dim, vocab_size) = (512, ~10000)
+    /// **权重矩阵** W：形状为 `(embedding_dim, vocab_size)`
     /// 将隐藏状态映射到词汇表空间
     pub w_out: Array2<f32>,
 
@@ -95,19 +95,16 @@ impl OutputProjection {
     /// **创建新的输出投影层**
     ///
     /// # 参数
-    /// - `embedding_dim`: 输入维度（512）
+    /// - `embedding_dim`: 输入隐藏状态维度
     /// - `vocab_size`: 词汇表大小（动态，通常5000-15000）
     ///
     /// # 初始化策略
     /// - **权重**: He 初始化 std = sqrt(2 / embedding_dim)
     /// - **偏置**: 全零初始化
     ///
-    /// # 参数规模示例
+    /// # 参数规模
     /// ```text
-    /// vocab_size = 10,000:
-    ///   权重: 512 × 10,000 = 5,120,000 参数
-    ///   偏置: 10,000 参数
-    ///   总计: 5,130,000 参数 (约占整个模型的一半！)
+    /// 总参数量 = embedding_dim × vocab_size + vocab_size
     /// ```
     pub fn new(embedding_dim: usize, vocab_size: usize) -> Self {
         let mut rng = rand::rng();
@@ -227,15 +224,15 @@ impl Layer for OutputProjection {
     /// ```
     ///
     /// # 参数
-    /// - `input`: (seq_len, 512) 隐藏状态
+    /// - `input`: `(seq_len, embedding_dim)` 隐藏状态
     ///
     /// # 返回值
     /// - `logits`: (seq_len, vocab_size) 未归一化的分数
     ///
     /// # 示例
     /// ```text
-    /// 输入: (4, 512) - 4个token的隐藏状态
-    /// 输出: (4, 10000) - 4个token，每个对10000个词的预测分数
+    /// 输入: `(4, embedding_dim)` - 4 个 token 的隐藏状态
+    /// 输出: `(4, vocab_size)` - 每个 token 对整个词表的预测分数
     ///
     /// 输出[0]的含义：
     ///   [3.2, -1.5, 0.8, ...]  // 10000个分数
@@ -286,7 +283,7 @@ impl Layer for OutputProjection {
     ///
     /// 返回: embedding_dim × vocab_size + vocab_size
     ///
-    /// 例如: 512 × 10000 + 10000 = 5,130,000 参数
+    /// 例如：`256 × 10000 + 10000 = 2,570,000`（仅示例，实际取决于当前配置与词表大小）
     fn parameters(&self) -> usize {
         self.w_out.len() + self.b_out.len()
     }

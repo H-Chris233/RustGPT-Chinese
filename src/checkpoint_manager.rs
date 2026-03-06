@@ -143,7 +143,7 @@ impl CheckpointManager {
         //
         // 教学说明（重要）：
         // - 旧实现的 BestAndLast/BestAndPeriodic 采用 “二选一” 策略：如果本轮是 best，就不写 last；
-        // - 这会让 `checkpoint_last.bin` 不是“最新状态”，从而导致恢复训练/测试出现不一致甚至 flaky；
+        // - 这会让 `checkpoint_last.bin` 不是“最新状态”，从而导致恢复训练/测试出现不一致，甚至偶发不稳定；
         // - 正确语义应当是：组合策略要同时写入多个目标（例如 best + last）。
         let mut checkpoint_names: Vec<String> = Vec::new();
         match &self.strategy {

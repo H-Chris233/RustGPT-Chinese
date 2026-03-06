@@ -1,8 +1,9 @@
 // 模型保存和加载示例程序
 //
-// 使用方法:
-// 1. 训练并保存: cargo run --bin save_model
-// 2. 加载并使用: cargo run --bin load_model
+// 使用方法：
+// 1. 训练并保存: cargo run --example model_persistence -- save
+// 2. 加载并使用: cargo run --example model_persistence -- load
+// 3. 从检查点继续训练: cargo run --example model_persistence -- continue
 
 use llm::{
     Dataset, EMBEDDING_DIM, Embeddings, HIDDEN_DIM, LLM, OutputProjection, TransformerBlock, Vocab,
@@ -44,19 +45,19 @@ fn print_usage() {
 ╚═══════════════════════════════════════════════════════════╝
 
 使用方法:
-  cargo run --bin model_persistence save       # 训练并保存模型
-  cargo run --bin model_persistence load       # 加载并使用模型
-  cargo run --bin model_persistence continue   # 从checkpoint继续训练
+  cargo run --example model_persistence -- save       # 训练并保存模型
+  cargo run --example model_persistence -- load       # 加载并使用模型
+  cargo run --example model_persistence -- continue   # 从检查点继续训练
 
 示例:
   # 训练100个epoch并保存
-  cargo run --bin model_persistence save
+  cargo run --example model_persistence -- save
 
   # 加载模型并进行对话
-  cargo run --bin model_persistence load
+  cargo run --example model_persistence -- load
 
-  # 从checkpoint继续训练50个epoch
-  cargo run --bin model_persistence continue
+  # 从检查点继续训练 50 个 epoch
+  cargo run --example model_persistence -- continue
 "
     );
 }
@@ -120,7 +121,7 @@ fn train_and_save() -> Result<(), Box<dyn std::error::Error>> {
 
     llm.train(pretraining_examples, 100, 0.0005);
 
-    // 保存checkpoint
+    // 保存预训练阶段的检查点。
     println!("\n💾 保存预训练checkpoint...");
     std::fs::create_dir_all("checkpoints")?;
     save_model_binary(&llm, "checkpoints/model_pretrained.bin")?;
@@ -143,7 +144,7 @@ fn train_and_save() -> Result<(), Box<dyn std::error::Error>> {
     println!("   模型已保存到:");
     println!("   • checkpoints/model_pretrained.bin (预训练checkpoint)");
     println!("   • checkpoints/model_final.bin (最终模型)");
-    println!("\n💡 提示: 使用 'cargo run --bin model_persistence load' 加载模型\n");
+    println!("\n💡 提示: 使用 'cargo run --example model_persistence -- load' 加载模型\n");
 
     Ok(())
 }
@@ -202,11 +203,11 @@ fn load_and_use() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// 从checkpoint继续训练
+/// 从检查点继续训练
 fn continue_training() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n📂 从checkpoint继续训练...\n");
 
-    // 1. 加载checkpoint
+    // 1. 加载检查点
     println!("加载预训练checkpoint...");
     let mut llm = load_model_binary("checkpoints/model_pretrained.bin")?;
     llm.set_training_mode(true);

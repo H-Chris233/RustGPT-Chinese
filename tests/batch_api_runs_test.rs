@@ -19,7 +19,7 @@ fn self_attention_forward_backward_batch_runs() {
     assert_eq!(out.dim(), (2, 4, EMBEDDING_DIM));
     assert_eq!(ctxs.len(), 2);
 
-    // dummy grads: same shape as out
+    // 构造与输出同形状的测试梯度。
     let grads = Array3::<f32>::ones(out.dim());
     let grad_input = attn.backward_batch(&ctxs, &grads, 0.001, None);
     assert_eq!(grad_input.dim(), input.dim());

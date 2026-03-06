@@ -158,7 +158,7 @@ fn test_checkpoint_best_loss_tracking() {
     manager.save_checkpoint(&llm, metadata2).ok();
     assert_eq!(manager.get_best_loss(), 2.5, "应该更新为更好的loss");
 
-    // 验证get_best_checkpoint返回最佳检查点
+    // 验证 `get_best_checkpoint()` 会返回最佳检查点。
     let best_checkpoint = manager.get_best_checkpoint();
     assert!(best_checkpoint.is_some(), "应该有最佳检查点");
 
@@ -406,7 +406,7 @@ fn test_checkpoint_loss_continuity_after_resume() {
     );
     println!("阶段1完成，训练了 {} epochs", phase1_epochs);
 
-    // 验证检查点被保存（使用last checkpoint确保是最新的状态）
+    // 验证检查点已保存；这里使用 last checkpoint 来保证拿到最新状态。
     let checkpoint_path = manager
         .get_last_checkpoint()
         .expect("应该有保存的last检查点");
@@ -476,7 +476,7 @@ fn test_checkpoint_loss_continuity_after_resume() {
 
     // 计算继续训练后的loss
     // 重要：这里使用 eval 模式计算 loss，与“阶段1结束 / 加载后”保持同一口径，
-    // 避免训练模式下 Dropout 引入噪声导致测试变 flaky。
+    // 避免训练模式下 Dropout 引入噪声，导致测试结果偶发不稳定。
     let loss_after_phase3 = compute_loss_eval(&mut loaded_llm, &tokenized_data);
     println!("阶段3结束时的loss: {:.6}", loss_after_phase3);
 

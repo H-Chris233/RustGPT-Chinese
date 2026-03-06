@@ -34,7 +34,9 @@
 //! 以后新增 `dataset4.json` / `dataset5.json` / `dataset6.json` 会自动被加载器纳入训练。
 //!
 //! ### 文件模式（兼容）
-//! 传入单个文件路径时，会自动尝试追加同目录下的 `*_extra.json`（若存在）。
+//! 传入单个文件路径时，会自动尝试拼接同目录下的 `*_extra.json`：
+//! - 例如 `foo.json` 会额外尝试加载 `foo_extra.json`
+//! - 这是兼容性约定；教学上更推荐直接传目录路径，规则更显式
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -80,7 +82,7 @@ impl Dataset {
 /// **从 JSON 文件加载数据**
 ///
 /// 读取 `path` 指向的 JSON 字符串数组，并支持：
-/// - 自动追加同目录下的 `*_extra.json`（若存在）
+/// - 自动拼接同目录下的 `*_extra.json`（例如 `foo.json -> foo_extra.json`）
 ///
 /// # 参数
 /// - `path`: JSON 文件路径

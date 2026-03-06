@@ -5,12 +5,12 @@ use ndarray::Array2;
 fn test_transformer_block() {
     let mut transformer = TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM);
 
-    // Create a simple input tensor
+    // 构造一个简单输入张量。
     let input = Array2::ones((1, EMBEDDING_DIM));
 
-    // Test forward pass
+    // 执行前向传播。
     let (output, _ctx) = transformer.forward(&input);
 
-    // Check output shape
+    // 输出形状应与输入匹配。
     assert_eq!(output.shape(), [1, EMBEDDING_DIM]);
 }

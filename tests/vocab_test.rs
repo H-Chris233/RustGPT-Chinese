@@ -5,12 +5,12 @@ fn test_vocab_encode_decode() {
     let words = vec!["hello", "world", "this", "is", "rust"];
     let vocab = Vocab::new(words);
 
-    // Test encoding - with special tokens, "hello" should be at index 7
+    // 验证编码结果：由于前 0-6 为特殊词元，`hello` 应从 7 开始。
     assert_eq!(vocab.encode("hello"), Some(7));
     assert_eq!(vocab.encode("world"), Some(8));
     assert_eq!(vocab.encode("unknown"), None);
 
-    // Test decoding
+    // 验证解码结果。
     assert_eq!(vocab.decode(7).map(|s| s.as_str()), Some("hello"));
     assert_eq!(vocab.decode(8).map(|s| s.as_str()), Some("world"));
     assert_eq!(vocab.decode(999), None);
@@ -20,13 +20,12 @@ fn test_vocab_encode_decode() {
 fn test_vocab_default() {
     let vocab = Vocab::default();
 
-    // Test that default vocab contains expected words - they should be at higher indices due to
-    // special tokens
+    // 默认词表应包含这些词；由于前面有特殊词元，它们的 ID 会更靠后。
     assert!(vocab.encode("hello").is_some());
     assert!(vocab.encode("world").is_some());
     assert!(vocab.encode("</s>").is_some()); // This is a special token at index 3
 
-    // Verify special token IDs
+    // 验证特殊词元 ID。
     assert_eq!(vocab.eos_token_id(), 3); // </s> is at index 3
     assert_eq!(vocab.pad_token_id(), 0); // <|pad|> is at index 0
     assert_eq!(vocab.unk_token_id(), 1); // <|unk|> is at index 1
@@ -36,7 +35,7 @@ fn test_vocab_default() {
 fn test_vocab_basic_operations() {
     let vocab = Vocab::new(vec!["hello", "world", "test"]);
 
-    // With special tokens, "hello" should be at index 7 (0-6 are special tokens)
+    // 带特殊词元时，`hello` 应位于 7（0-6 被特殊词元占用）。
     assert_eq!(vocab.encode("hello"), Some(7));
     assert_eq!(vocab.decode(7), Some(&"hello".to_string()));
     assert_eq!(vocab.len(), 10); // 3 words + 7 special tokens

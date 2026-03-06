@@ -61,8 +61,8 @@
 //! 位置 1 的编码 (前4维):
 //!   PE(1,0) = sin(1/10000^0) ≈ 0.841
 //!   PE(1,1) = cos(1/10000^0) ≈ 0.540
-//!   PE(1,2) = sin(1/10000^(2/512)) ≈ 0.841
-//!   PE(1,3) = cos(1/10000^(2/512)) ≈ 0.540
+//!   PE(1,2) = sin(1/10000^(2/EMBEDDING_DIM))
+//!   PE(1,3) = cos(1/10000^(2/EMBEDDING_DIM))
 //! ```
 
 use ndarray::Array2;
@@ -100,7 +100,7 @@ impl PositionEncoding {
     ///
     /// - 初始化时计算一次：O(MAX_SEQ_LEN × EMBEDDING_DIM)
     /// - 后续使用时直接查表：O(1)
-    /// - 内存占用：256 × 512 × 4 bytes ≈ 524 KB
+    /// - 内存占用：`MAX_SEQ_LEN × EMBEDDING_DIM × sizeof(f32)`
     pub fn new() -> Self {
         // 初始化位置编码矩阵 (MAX_SEQ_LEN × EMBEDDING_DIM)
         let mut encoding = Array2::zeros((MAX_SEQ_LEN, EMBEDDING_DIM));
@@ -159,7 +159,7 @@ impl PositionEncoding {
     /// ```rust
     /// use ndarray::Array2;
     /// use llm::position_encoding::PositionEncoding;
-    /// let mut embeddings = Array2::zeros((4, 512));  // 4个词的嵌入
+    /// let mut embeddings = Array2::zeros((4, 256));  // 4 个词的嵌入（示例维度）
     /// let pos_enc = PositionEncoding::new();
     /// pos_enc.apply_to_input(&mut embeddings);
     /// // 现在 embeddings 包含了位置信息
@@ -168,7 +168,7 @@ impl PositionEncoding {
     pub fn apply_to_input(&self, input: &mut Array2<f32>) {
         let (seq_len, embedding_dim) = input.dim();
 
-        // Determine how many positions we can encode based on input length
+        // 根据输入长度决定本次最多应用多少个位置编码。
         let positions_to_encode = std::cmp::min(seq_len, MAX_SEQ_LEN);
         let dims_to_encode = std::cmp::min(embedding_dim, EMBEDDING_DIM);
 
@@ -180,8 +180,8 @@ impl PositionEncoding {
     }
 }
 
-// For Chinese language, we might also want to implement relative position encoding
-// which works better with the structure of Chinese text
+// 对中文任务来说，相对位置编码也值得实验，它更强调词与词之间的距离关系。
+// 这里先保留实现雏形，但当前主线仍使用绝对位置编码。
 
 /// **相对位置编码结构体**
 ///
@@ -212,7 +212,7 @@ impl RelativePositionEncoding {
     /// 创建相对位置编码实例
     #[allow(dead_code)]
     pub fn new(max_offset: usize) -> Self {
-        // Create relative position encoding matrix
+        // 构造相对位置编码矩阵。
         let total_positions = 2 * max_offset + 1;
         let mut encoding = Array2::zeros((total_positions, EMBEDDING_DIM));
 

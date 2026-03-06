@@ -1,15 +1,15 @@
 //! 内存与缓存复用优化基准测试
 //!
 //! 测试目标：
-//! 1. 验证 Dataset::new 去除双重 clone 后的性能提升
-//! 2. 验证 Embeddings 位置编码缓存复用的性能提升
-//! 3. 验证采样/beam search 缓冲区复用的分配次数下降
-//! 4. 记录峰值内存使用
+//! 1. 验证 `Dataset::new` 去除双重 clone 后的耗时变化
+//! 2. 验证 Embeddings 位置编码缓存复用的耗时变化
+//! 3. 验证采样/beam search 缓冲区复用对运行时间的影响
+//! 4. 通过运行时间间接观察内存/分配优化效果（当前不直接记录峰值内存）
 
 use llm::{dataset_loader::Dataset, Embeddings, Layer, LLM, Vocab};
 use std::time::Instant;
 
-/// 统计内存分配信息（简化版本，通过多次运行对比时间）
+/// 基准统计结果（当前只记录运行耗时，不直接统计峰值内存或分配次数）。
 #[derive(Default)]
 struct BenchStats {
     elapsed_ms: f64,

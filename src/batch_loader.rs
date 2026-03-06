@@ -26,12 +26,12 @@
 //!
 //! ### 输出（Batch）
 //! ```text
-//! tokens: Array2<usize> shape (batch_size, max_seq_len)
+//! tokens: Array2<usize>，形状为 (batch_size, max_seq_len)
 //! [[12, 45, 78, 0],        // 填充到长度4
 //!  [23, 67, 89, 12],       // 无需填充
 //!  [45, 90, 0,  0]]        // 填充到长度4
 //!
-//! mask: Array2<f32> shape (batch_size, max_seq_len)
+//! mask: Array2<f32>，形状为 (batch_size, max_seq_len)
 //! [[1.0, 1.0, 1.0, 0.0],   // 最后一个是PAD
 //!  [1.0, 1.0, 1.0, 1.0],   // 全是真实token
 //!  [1.0, 1.0, 0.0, 0.0]]   // 后两个是PAD
@@ -46,7 +46,7 @@ pub const PAD_TOKEN_ID: usize = 0;
 /// **批次数据结构**
 #[derive(Debug, Clone)]
 pub struct Batch {
-    /// **Token IDs**: (batch_size, seq_len)
+    /// **Token ID 矩阵**：形状为 `(batch_size, seq_len)`
     pub tokens: Array2<usize>,
 
     /// **注意力掩码**: (batch_size, seq_len)

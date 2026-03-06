@@ -37,7 +37,7 @@ impl Layer for TestOutputProjectionLayer {
 
         let last_token_index = input.shape()[1] - 1;
 
-        // Force stop after 5 loops to match expected output
+        // 循环达到阈值后，强制输出结束词对应的位置。
         if self.loop_count >= self.stop_loop_count {
             mock_output[[last_token_index, self.stop_index]] = 1.0;
         } else {
@@ -48,7 +48,7 @@ impl Layer for TestOutputProjectionLayer {
         (mock_output, Box::new(input.clone()))
     }
 
-    // Need to test this next
+    // 该测试层当前只需覆盖基础 backward 行为。
     fn backward(
         &mut self,
         ctx: &LayerContext,
@@ -61,11 +61,11 @@ impl Layer for TestOutputProjectionLayer {
             // fallback：若 ctx 类型不匹配，仍尽量用旧缓存（测试层容错）
             input
         } else {
-            // If forward wasn't called, just pass gradients through
+            // 如果没有可用的 forward 输入，就直接透传梯度。
             return grads.clone();
         };
 
-        // use chain rule
+        // 使用链式法则把梯度传回输入侧。
         let grad_input = input.dot(grads);
         self.cached_grads = Some(grad_input.clone());
 
@@ -100,11 +100,11 @@ fn test_llm_tokenize() {
         vec![Box::new(TestOutputProjectionLayer::new(5, 5, vocab_size))],
     );
 
-    // Test tokenization
+    // 验证分词结果非空。
     let tokens = llm.tokenize("hello world");
     assert!(!tokens.is_empty());
 
-    // Test that tokens can be decoded back
+    // 验证 token 可以解码回词表项。
     for token in tokens {
         assert!(llm.vocab.decode(token).is_some());
     }
@@ -119,12 +119,12 @@ fn test_llm_predict() {
         vec![Box::new(TestOutputProjectionLayer::new(5, 5, vocab_size))],
     );
 
-    // Test prediction
+    // 验证预测流程能正常运行。
     let input_text = "hello world this is rust";
     let result = llm.predict(input_text);
     assert!(!result.is_empty());
 
-    // The test should only check that result is not empty and contains expected end token
+    // 这里只验证结果非空且包含预期结束词。
     assert!(result.contains("</s>"));
 }
 
@@ -159,7 +159,7 @@ fn test_llm_total_parameters() {
     let vocab = Vocab::default();
     let vocab_size = vocab.encode.len();
 
-    // Create an LLM with actual layers to get a meaningful parameter count
+    // 用真实层组合一个 LLM，以得到有意义的参数量统计。
     let embeddings = Box::new(Embeddings::new(vocab.clone()));
     let transformer_block = Box::new(TransformerBlock::new(EMBEDDING_DIM, HIDDEN_DIM));
     let output_projection = Box::new(OutputProjection::new(EMBEDDING_DIM, vocab_size));
@@ -169,11 +169,11 @@ fn test_llm_total_parameters() {
         vec![embeddings, transformer_block, output_projection],
     );
 
-    // The total parameters should be greater than 0 for a model with actual layers
+    // 含真实层的模型参数量应大于 0。
     let param_count = llm.total_parameters();
     assert!(param_count > 0);
 
-    // Verify that the parameter count matches the sum of individual layer parameters
+    // 总参数量应等于各层参数量之和。
     let embeddings_param_count = LLM::new(
         vocab.clone(),
         vec![Box::new(Embeddings::new(vocab.clone()))],

@@ -49,13 +49,13 @@ pub mod layer_norm; // 层归一化：稳定训练的归一化技术
 pub mod llm; // 语言模型主类：整合所有组件的核心模型
 pub mod model_serialization; // 模型序列化：保存和加载模型权重
 pub mod output_projection; // 输出投影层：将隐藏状态映射到词汇表概率
-pub mod performance_monitor;
+pub mod performance_monitor; // 性能监控：记录和分析训练/推理耗时
 pub mod position_encoding; // 位置编码：为序列注入位置信息
 pub mod self_attention; // 自注意力机制：Transformer的核心组件
 pub mod training_optimizations; // 训练优化：缓存、学习率调度、早停等
 pub mod transformer; // Transformer块：注意力+前馈的完整模块
 pub mod utils; // 工具函数：通用辅助函数
-pub mod vocab; // 词汇表：管理token和ID的映射关系 // 性能监控：记录和分析训练/推理性能
+pub mod vocab; // 词汇表：管理 token 与 ID 的映射关系
 
 // ============================================================================
 // 重导出核心类型（简化外部使用）
@@ -114,7 +114,7 @@ pub const EMBEDDING_DIM: usize = 256;
 /// **为什么是512？**
 /// - 遵循常见 Transformer 设计：hidden_dim ≈ 2 × embedding_dim
 /// - 更大的隐藏层能学习更复杂的特征变换
-/// - 512维足够处理中文语言的复杂模式（成语、多义词等）
+/// - 当前默认 512 维隐藏层能提供比嵌入层更充足的特征变换空间
 ///
 /// **作用**：
 /// - 在 FFN 中：256 → 512 → 256（先扩展再压缩）

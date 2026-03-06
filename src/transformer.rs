@@ -30,13 +30,13 @@
 //!
 //! **Pre-LN 的优势**：
 //! - 训练更稳定：归一化在残差路径之外，梯度流动更顺畅
-//! - 不需要学习率预热（Warmup）
+//! - 往往能降低对学习率预热的敏感性，但本项目训练主线仍会配合 warmup 提升稳定性
 //! - 更容易训练深层网络
 //!
 //! ## 数据流示意图
 //!
 //! ```text
-//! 输入 (seq_len, 512)
+//! 输入 `(seq_len, embedding_dim)`
 //!   │
 //!   ├─────────────────┐  [残差连接分支]
 //!   │                 │
@@ -65,7 +65,7 @@
 //!   └─────────(+)─────┘  [残差相加]
 //!   │
 //!   v
-//! 输出 (seq_len, 512)
+//! 输出 `(seq_len, embedding_dim)`
 //! ```
 
 use ndarray::{s, Array2, Array3, Axis};
@@ -126,12 +126,12 @@ impl TransformerBlock {
     /// **创建新的 Transformer 块**
     ///
     /// # 参数
-    /// - `embedding_dim`: 嵌入维度（通常为512），决定输入输出的大小
-    /// - `hidden_dim`: 前馈网络的隐藏层维度（通常为1024，是 embedding_dim 的2倍）
+    /// - `embedding_dim`: 嵌入维度，决定输入输出的大小
+    /// - `hidden_dim`: 前馈网络的隐藏层维度，通常取 `embedding_dim` 的 2-4 倍
     ///
     /// # 初始化细节
-    /// 1. **SelfAttention**: 8个注意力头，每个头处理 embedding_dim/8 = 64 维
-    /// 2. **FeedForward**: 512 → 1024 → 512 的两层网络，使用 ReLU 激活
+    /// 1. **SelfAttention**: 8 个注意力头，每个头处理 `embedding_dim / 8` 维
+    /// 2. **FeedForward**: `embedding_dim → hidden_dim → embedding_dim` 的两层网络，使用 ReLU 激活
     /// 3. **LayerNorm**: 对特征维度进行归一化，使用可学习的 scale/shift 参数
     /// 4. **Dropout**: 10% 的丢弃率，只在训练时生效
     pub fn new(embedding_dim: usize, hidden_dim: usize) -> Self {

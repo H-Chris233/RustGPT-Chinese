@@ -8,7 +8,7 @@
 //!
 //! **问题**：神经网络无法直接处理文本，需要将词转换为数字向量。
 //!
-//! **解决方案**：为每个词分配一个固定维度的向量（本项目中是512维）。
+//! **解决方案**：为每个词分配一个固定维度的向量（当前默认维度见 `EMBEDDING_DIM`）。
 //! 这些向量在训练过程中不断更新，相似的词会有相似的向量表示。
 //!
 //! **示例**：
@@ -203,7 +203,7 @@ impl Embeddings {
     ///
     /// # 参数
     /// - `vocab_size`: 词汇表大小（词的数量）
-    /// - `embedding_dim`: 每个词的嵌入维度（512）
+    /// - `embedding_dim`: 每个词的嵌入维度
     ///
     /// # 初始化方法
     /// 使用正态分布 N(0, 0.02) 随机初始化。
@@ -227,7 +227,7 @@ impl Embeddings {
     /// # 示例
     /// ```text
     /// token_ids = [5, 12, 3]  // 三个词的ID
-    /// embeddings = [[第5行], [第12行], [第3行]]  // 返回三个512维向量
+    /// embeddings = [[第5行], [第12行], [第3行]]  // 返回三个 embedding_dim 维向量
     /// ```
     fn get_token_embeddings(embeddings: &Array2<f32>, token_ids: &[usize]) -> Array2<f32> {
         let mut token_embeds = Array2::<f32>::zeros((token_ids.len(), embeddings.ncols()));
@@ -368,7 +368,7 @@ impl Layer for Embeddings {
     /// 例如：`[[5.0, 12.0, 3.0, 8.0]]` 表示4个token的ID。
     ///
     /// # 输出格式
-    /// 返回 (seq_len, embedding_dim) 的嵌入矩阵，每一行是一个512维的向量。
+    /// 返回 `(seq_len, embedding_dim)` 的嵌入矩阵，每一行都是一个嵌入向量。
     ///
     /// # 关于“显式上下文（ctx）”
     /// 在旧实现中，Embedding 层曾依赖 `self.cached_input` 在 backward 时取回 token_id。
@@ -407,7 +407,7 @@ impl Layer for Embeddings {
     /// # 示例
     /// ```text
     /// 假设输入: token_ids = [5, 12, 5]  (注意ID=5出现两次)
-    /// 梯度: grads = [grad_0, grad_1, grad_2]  (每个都是512维)
+    /// 梯度: grads = [grad_0, grad_1, grad_2]（每个都是 embedding_dim 维）
     ///
     /// 累积梯度:
     ///   token_grads[5] = grad_0 + grad_2  (ID=5的累积梯度)

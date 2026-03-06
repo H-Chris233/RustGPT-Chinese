@@ -7,11 +7,11 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // Test basic Chinese tokenization
+        // 验证基础中文分词。
         let text = "我爱中文";
         let tokens = llm.tokenize(text);
 
-        // The tokenizer should handle Chinese characters
+        // 分词器应能处理中文字符。
         assert!(!tokens.is_empty());
     }
 
@@ -20,11 +20,11 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // Test Chinese punctuation handling
+        // 验证中文标点处理。
         let text = "你好，世界！";
         let tokens = llm.tokenize(text);
 
-        // Should tokenize both words and punctuation
+        // 应能同时切出词语和标点。
         assert!(!tokens.is_empty());
     }
 
@@ -33,11 +33,11 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // Test recognition of a simple idiom/phrase
+        // 验证简单成语/短语识别。
         let text = "一心一意";
         let tokens = llm.tokenize(text);
 
-        // Should recognize as valid Chinese text
+        // 应能识别为有效中文文本。
         assert!(!tokens.is_empty());
     }
 
@@ -46,11 +46,11 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // Test mixed Chinese-English text
+        // 验证中英混合文本的分词。
         let text = "我爱AI人工智能";
         let tokens = llm.tokenize(text);
 
-        // Should handle mixed content
+        // 应能处理混合内容。
         assert!(!tokens.is_empty());
     }
 
@@ -59,14 +59,14 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let mut llm = LLM::new(vocab, vec![]);
 
-        // Test adding context
+        // 验证上下文追加。
         let tokens = llm.tokenize("今天天气好");
         llm.add_to_context(&tokens);
 
-        // Context should be set
+        // 上下文应已写入。
         assert!(!llm.get_context().is_empty());
 
-        // Context length should be reasonable
+        // 上下文长度不应超过最大限制。
         assert!(llm.get_context().len() <= llm.max_context_length);
     }
 
@@ -75,11 +75,11 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // Test post-processing removes extra spaces between Chinese chars
+        // 验证后处理会移除中文字符之间多余的空格。
         let raw_text = "我 爱 中 文";
         let processed = llm.post_process_chinese_text(raw_text);
 
-        // Should reduce spaces between Chinese characters
+        // 处理后空格应减少。
         assert!(processed.len() <= raw_text.len());
     }
 
@@ -88,11 +88,11 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let mut llm = LLM::new(vocab, vec![]);
 
-        // Add some tokens to context
+        // 先向上下文中加入若干 token。
         let tokens = llm.tokenize("父亲 母亲 儿子");
         llm.add_to_context(&tokens);
 
-        // Verify context management
+        // 验证上下文管理结果。
         assert_eq!(llm.get_context().len(), 3);
     }
 
@@ -105,23 +105,22 @@ mod chinese_language_tests {
         ];
         let mut vocab_set = HashSet::new();
 
-        // Process texts for vocabulary
+        // 从文本中提取词汇候选。
         Vocab::process_text_for_vocab(&texts, &mut vocab_set);
 
-        // Should include processed Chinese text
+        // 词汇集合不应为空。
         assert!(!vocab_set.is_empty());
-        // Note: We can't check specific Chinese words since they might be tokenized differently
+        // 具体词元会受分词策略影响，因此这里只验证数量级。
         assert!(vocab_set.len() >= 2);
     }
 
     #[test]
     fn test_chinese_sentence_completion() {
-        // This would test if the model can complete Chinese sentences
-        // For now, we'll just verify the components work together
+        // 这里本来可以进一步测试中文续写能力，当前先验证基础结构。
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // Verify the model has expected components
+        // 模型的基础组件应存在。
         assert!(llm.max_context_length > 0);
     }
 
@@ -130,14 +129,14 @@ mod chinese_language_tests {
         let vocab = Vocab::default();
         let mut llm = LLM::new(vocab, vec![]);
 
-        // Test conversation context addition
+        // 验证对话上下文追加。
         let input_tokens = llm.tokenize("你好");
         llm.add_to_context(&input_tokens);
 
         let response_tokens = llm.tokenize("你好，有什么可以帮助你的吗？");
         llm.add_to_context(&response_tokens);
 
-        // Combined context should exist
+        // 合并后的上下文应已存在。
         assert!(llm.get_context().len() >= input_tokens.len() + response_tokens.len());
     }
 }
@@ -148,13 +147,13 @@ mod chinese_model_evaluation_tests {
 
     #[test]
     fn test_chinese_generation_quality() {
-        // Test to ensure the model generates coherent Chinese text
+        // 这里先验证中文生成测试所需的基础结构。
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // This test would involve actually running the model
-        // For now, we just verify the structure is in place
-        assert!(llm.context_window.len() == 0); // Initially empty
+        // 若要真正评估生成质量，需要运行完整模型。
+        // 当前先验证基础状态已就绪。
+        assert!(llm.context_window.len() == 0); // 初始上下文窗口应为空。
     }
 
     #[test]
@@ -162,7 +161,7 @@ mod chinese_model_evaluation_tests {
         let vocab = Vocab::default();
         let llm = LLM::new(vocab, vec![]);
 
-        // Test with simple grammar pattern
+        // 用一个简单语法模式验证分词与流程可用。
         let tokens = llm.tokenize("我想要学习中文");
         assert!(!tokens.is_empty());
     }

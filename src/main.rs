@@ -564,7 +564,7 @@ fn train_new_model(perf_monitor: &mut PerformanceMonitor, freeze_attn: bool) -> 
 
     println!("✓ 预训练完成，实际训练 {} epochs", actual_epochs);
 
-    // 询问是否保存预训练checkpoint
+    // 询问是否保存预训练检查点。
     print!("\n💾 是否保存预训练checkpoint? (y/n): ");
     if let Err(e) = std::io::stdout().flush() {
         log::warn!("刷新标准输出失败: {}", e);

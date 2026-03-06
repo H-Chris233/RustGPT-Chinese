@@ -26,12 +26,12 @@
 //! ## 为什么需要 FFN？
 //!
 //! 1. **增加模型容量**：自注意力是线性操作（加权求和），FFN 引入非线性
-//! 2. **特征变换**：在更高维度空间（1024维）中进行特征提取
+//! 2. **特征变换**：在更高维度空间（即 `hidden_dim`）中进行特征提取
 //! 3. **位置独立**：对每个位置独立处理，不同于注意力的全局依赖
 //!
 //! ## "瓶颈"设计的优势
 //!
-//! 512 → 1024 → 512 的结构类似自编码器：
+//! `embedding_dim → hidden_dim → embedding_dim` 的结构类似一个“先展开、再压回”的瓶颈模块：
 //! - **扩展阶段**：学习丰富的中间表示
 //! - **压缩阶段**：提取最重要的特征
 //! - 这种设计有助于模型学习抽象的、压缩的特征表示
@@ -56,13 +56,13 @@ pub struct FeedForward {
     /// **第一层权重** W₁: (embedding_dim, hidden_dim)
     pub w1: Array2<f32>,
 
-    /// **第一层偏置** b₁: (1, hidden_dim) = (1, 1024)
+    /// **第一层偏置** b₁：形状为 `(1, hidden_dim)`
     pub b1: Array2<f32>,
 
     /// **第二层权重** W₂: (hidden_dim, embedding_dim)
     pub w2: Array2<f32>,
 
-    /// **第二层偏置** b₂: (1, embedding_dim) = (1, 512)
+    /// **第二层偏置** b₂：形状为 `(1, embedding_dim)`
     pub b2: Array2<f32>,
 
     // ========== 反向传播所需中间量（ctx 驱动） ==========
@@ -107,8 +107,8 @@ impl FeedForward {
     /// 使用 He 初始化（也称为 Kaiming 初始化），特别适合 ReLU 激活函数：
     ///
     /// ```text
-    /// std_w1 = sqrt(2 / embedding_dim) = sqrt(2 / 512) ≈ 0.0625
-    /// std_w2 = sqrt(2 / hidden_dim) = sqrt(2 / 1024) ≈ 0.0442
+    /// std_w1 = sqrt(2 / embedding_dim)
+    /// std_w2 = sqrt(2 / hidden_dim)
     /// ```
     ///
     /// **为什么用 He 初始化？**
@@ -323,17 +323,17 @@ impl Layer for FeedForward {
     /// # 计算步骤
     ///
     /// 1. **第一层线性变换**： h = x·W₁ + b₁
-    ///    - 输入：(seq_len, 512)
-    ///    - W₁：(512, 1024)
-    ///    - 输出：(seq_len, 1024)
+    ///    - 输入：`(seq_len, embedding_dim)`
+    ///    - W₁：`(embedding_dim, hidden_dim)`
+    ///    - 输出：`(seq_len, hidden_dim)`
     ///
     /// 2. **ReLU 激活**： h_activated = max(0, h)
     ///    - 将负值置零，保留正值
     ///
     /// 3. **第二层线性变换**： output = h_activated·W₂ + b₂
-    ///    - 输入：(seq_len, 1024)
-    ///    - W₂：(1024, 512)
-    ///    - 输出：(seq_len, 512)
+    ///    - 输入：`(seq_len, hidden_dim)`
+    ///    - W₂：`(hidden_dim, embedding_dim)`
+    ///    - 输出：`(seq_len, embedding_dim)`
     fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         // 第一层：线性变换
         let hidden_pre_activation = input.dot(&self.w1) + &self.b1;
@@ -360,11 +360,10 @@ impl Layer for FeedForward {
     /// **计算参数总数**
     ///
     /// 包括：
-    /// - W₁: 512 × 1024 = 524,288
-    /// - b₁: 1 × 1024 = 1,024
-    /// - W₂: 1024 × 512 = 524,288
-    /// - b₂: 1 × 512 = 512
-    /// - **总计**: 约 105万 参数
+    /// - `W₁`: `embedding_dim × hidden_dim`
+    /// - `b₁`: `hidden_dim`
+    /// - `W₂`: `hidden_dim × embedding_dim`
+    /// - `b₂`: `embedding_dim`
     fn parameters(&self) -> usize {
         self.b1.len() + self.b2.len() + self.w1.len() + self.w2.len()
     }

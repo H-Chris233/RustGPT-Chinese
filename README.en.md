@@ -62,7 +62,7 @@ This is just a toy project that demonstrates how Chinese LLMs work under the hoo
 ### v0.3.0 - Model Optimization for Small Datasets (2025-10-15)
 - ✅ **Reduced Model Size** - Optimized for limited training data: 2 layers (was 4), 256 embedding dim (was 512)
 - ✅ **Training Enhancement** - Increased epochs to 500 (was 100), higher learning rates (0.001/0.0005)
-- ✅ **Cleaner Output** - Removed `</s>` tokens from training data to prevent output contamination
+- ✅ **Cleaner sequence boundaries** - Training now injects BOS/EOS automatically so the model can learn when sequences start and end
 - ✅ **Parameter Reduction** - ~86% fewer parameters (10M vs 70M) for better convergence on small datasets
 - 🎯 **Target Use Case** - Optimized for 200-500 training samples, expected loss < 0.1
 

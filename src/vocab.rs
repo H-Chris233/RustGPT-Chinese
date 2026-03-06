@@ -438,7 +438,7 @@ impl Vocab {
         let mut encode = HashMap::new();
         let mut decode = HashMap::new();
 
-        // Add special tokens first with their predefined IDs
+        // 先按预定义 ID 写入特殊词元，确保这些 ID 稳定不变。
         println!("\n=== 初始化词汇表：添加特殊词元 ===");
         let mut special_tokens_sorted: Vec<_> = special_tokens.iter().collect();
         special_tokens_sorted.sort_by_key(|(_, id)| *id);
@@ -450,7 +450,7 @@ impl Vocab {
         }
         println!("特殊词元添加完成，共 {} 个\n", special_tokens.len());
 
-        // Add remaining words starting from the next available ID
+        // 再从下一个可用 ID 开始追加常规词汇。
         println!("=== 添加常规词汇 ===");
         let mut next_id = special_tokens.values().max().unwrap_or(&0) + 1;
         let mut added_count = 0;
@@ -622,7 +622,7 @@ impl Vocab {
     pub fn encode_sequence(&self, text: &str) -> Vec<usize> {
         let mut tokens = Vec::new();
 
-        // Check if the text contains Chinese characters
+        // 检查文本中是否包含中文字符。
         let has_chinese = text
             .chars()
             .any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF);
@@ -662,7 +662,7 @@ impl Vocab {
                 }
             }
         } else {
-            // For non-Chinese text, use simple tokenization
+            // 非中文文本退化为按空白切分，保持实现简单直观。
             for word in text.split_whitespace() {
                 let token_id = self.encode_with_unk(word);
                 tokens.push(token_id);
@@ -881,7 +881,7 @@ impl Vocab {
         println!("\n📝 开始分词处理...");
         let jieba = jieba_instance();
 
-        // Process all training examples for vocabulary
+        // 遍历全部训练文本，逐条抽取词元加入词汇集合。
         let total_texts = texts.len();
         let mut chinese_texts = 0;
         let mut english_texts = 0;
@@ -902,7 +902,7 @@ impl Vocab {
                 log::warn!("刷新标准输出失败: {}", e);
             }
 
-            // Check if the text contains Chinese characters
+            // 检查文本中是否包含中文字符。
             let has_chinese = text
                 .chars()
                 .any(|c| (c as u32) >= 0x4E00 && (c as u32) <= 0x9FFF);
@@ -911,7 +911,7 @@ impl Vocab {
                 chinese_texts += 1;
                 println!("     类型: 中文文本");
 
-                // Use Jieba for Chinese text tokenization
+                // 中文文本使用 Jieba 分词。
                 println!("     ⏳ 开始 Jieba 分词...");
                 if let Err(e) = std::io::stdout().flush() {
                     log::warn!("刷新标准输出失败: {}", e);
@@ -933,16 +933,16 @@ impl Vocab {
                     }
                 }
 
-                // Process common Chinese idioms and phrases that might be missed by Jieba
+                // 额外提取 Jieba 之外可能遗漏的常见成语和短语。
                 println!("     🔍 提取成语和短语...");
                 Self::extract_chinese_phrases(text, vocab_set);
             } else {
                 english_texts += 1;
                 println!("     类型: 英文/其他文本");
 
-                // Use the original method for non-Chinese text
+                // 非中文文本沿用按空白和标点切分的简单流程。
                 for word in text.split_whitespace() {
-                    // Handle punctuation by splitting it from words
+                    // 把标点从单词中拆开，避免与词干粘连。
                     let mut current = String::new();
                     for c in word.chars() {
                         if c.is_ascii_punctuation() {
@@ -1030,7 +1030,7 @@ impl Vocab {
             }
         }
 
-        // Common multi-character phrases that might be relevant
+        // 额外提取常见的多字短语，补充 Jieba 之外的词汇候选。
         let phrase_regex = match Regex::new(r"[\u4e00-\u9fff]{2,6}") {
             Ok(re) => re,
             Err(e) => {
@@ -1070,7 +1070,7 @@ impl Vocab {
         if !chars.all(|c| c.is_chinese()) {
             return false;
         }
-        common_idioms().contains(idiom) // This works because HashSet<String> implements contains for &str
+        common_idioms().contains(idiom) // `HashSet<String>` 支持用 `&str` 进行 contains 查询。
     }
 
     /// **检查是否为有意义的中文短语**
@@ -1152,9 +1152,9 @@ impl Vocab {
         Self::process_text_for_vocab(texts, &mut vocab_set);
 
         let mut vocab_words: Vec<String> = vocab_set.into_iter().collect();
-        vocab_words.sort(); // Sort for deterministic ordering
+        vocab_words.sort(); // 排序以保证词表构建结果稳定可复现。
 
-        // Create vectors of string references for the constructor
+        // 转成 `&str` 视图后交给构造函数，避免重复分配。
         let vocab_words_refs: Vec<&str> = vocab_words.iter().map(|s| s.as_str()).collect();
         let special_tokens = Self::default_special_tokens();
 

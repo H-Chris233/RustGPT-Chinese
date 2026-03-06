@@ -2,22 +2,22 @@
 //!
 //! 这是 Transformer 架构的核心创新，让模型能够捕捉序列中的长距离依赖关系。
 //!
-//! ## 性能优化（v0.3.2）
+//! ## 当前实现要点
 //!
 //! ### 1. 因果掩码缓存
-//! - **问题**: 每次前向传播都需要逐元素填充 NEG_INFINITY 创建掩码矩阵
-//! - **解决**: 使用 HashMap 缓存不同序列长度的掩码，避免重复创建
-//! - **收益**: 减少 O(seq_len²) 的掩码创建开销
+//! - **问题**: 每次前向传播都需要创建下三角掩码矩阵
+//! - **解决**: 使用 `HashMap` 缓存不同序列长度的掩码，避免重复分配
+//! - **收益**: 减少掩码构造的额外开销
 //!
-//! ### 2. 优化矩阵乘法
-//! - **策略**: 使用 ndarray 的优化 dot() 方法（基于 BLAS）
-//! - **掩码应用**: 使用矩阵加法替代逐元素设置
-//! - **并行处理**: 多头计算使用 rayon 并行化
+//! ### 2. 矩阵计算与掩码应用
+//! - **策略**: 优先复用 `ndarray` 的矩阵乘法与广播能力
+//! - **掩码应用**: 使用矩阵加法把屏蔽位置统一压到 `-∞`
+//! - **说明**: 若底层环境启用了 BLAS，可额外获得矩阵乘法加速；否则仍保持纯 Rust 路径可读可学
 //!
 //! ### 3. 稳定的 Softmax 实现
-//! - **数值稳定性**: 使用 log-sum-exp 技巧（减去最大值）
-//! - **避免溢出**: 处理极大/极小值时保持数值稳定
-//! - **梯度计算**: 简化但稳定的反向传播（注：完整梯度计算较复杂，当前使用近似）
+//! - **数值稳定性**: 使用减去行最大值的稳定 softmax
+//! - **边界情况**: 全被 mask 的行返回全 0，避免把 PAD 当作有效注意力
+//! - **梯度计算**: 反向传播走当前实现的精确 Jacobian 路径，而不是注释中的近似公式
 //!
 //! ## 核心思想：注意力即"权重分配"
 //!
@@ -46,7 +46,7 @@
 //! - **Q（Query）**: "我在寻找什么" - 当前位置的查询向量
 //! - **K（Key）**: "我能提供什么" - 所有位置的键向量（用于匹配）
 //! - **V（Value）**: "我具体是什么" - 所有位置的值向量（用于加权）
-//! - **d_k**: Key/Query 的维度（64），用于缩放防止梯度消失
+//! - **d_k**: 每个注意力头的 Key/Query 维度（即 `head_dim`），用于缩放防止分数过大
 //!
 //! ### 步骤详解
 //! 1. **计算相似度**: `Q·K^T` - 查询与每个键的点积（相似度越高，点积越大）
@@ -64,9 +64,9 @@
 //! - **Head 4-8**: 其他抽象模式
 //!
 //! **实现方式**：
-//! - 将 512 维分成 8 个头，每个头 64 维
-//! - 并行计算 8 个注意力
-//! - 最后拼接并投影回 512 维
+//! - 将 `embedding_dim` 按头数拆成多个 `head_dim` 子空间
+//! - 每个头独立计算注意力
+//! - 最后再拼接并投影回原始嵌入维度
 //!
 //! ## Causal Mask（因果掩码）
 //!
@@ -223,29 +223,29 @@ fn stable_softmax_gradient(softmax_output: &Array2<f32>, grad_output: &Array2<f3
 
 /// **多头自注意力机制结构体**
 pub struct SelfAttention {
-    /// **嵌入维度**: 512（输入/输出的向量维度）
+    /// **嵌入维度**：输入/输出隐藏状态的维度。
     pub embedding_dim: usize,
 
     /// **注意力头数**: 8（并行计算的注意力头数量）
     pub num_heads: usize,
 
-    /// **每个头的维度**: 64（512 / 8 = 64）
+    /// **每个头的维度**：`embedding_dim / num_heads`。
     pub head_dim: usize,
 
     // ========== 核心权重矩阵 ==========
-    /// **Query 投影矩阵** W_Q: (512, 512)
+    /// **Query 投影矩阵** W_Q: `(embedding_dim, embedding_dim)`
     /// 将输入转换为查询向量："我在寻找什么信息？"
     pub w_q: Array2<f32>,
 
-    /// **Key 投影矩阵** W_K: (512, 512)
+    /// **Key 投影矩阵** W_K: `(embedding_dim, embedding_dim)`
     /// 将输入转换为键向量："我能提供什么信息？"
     pub w_k: Array2<f32>,
 
-    /// **Value 投影矩阵** W_V: (512, 512)
+    /// **Value 投影矩阵** W_V: `(embedding_dim, embedding_dim)`
     /// 将输入转换为值向量："我具体包含什么内容？"
     pub w_v: Array2<f32>,
 
-    /// **输出投影矩阵** W_O: (512, 512)
+    /// **输出投影矩阵** W_O: `(embedding_dim, embedding_dim)`
     /// 将多头拼接后的结果投影回原始维度
     pub w_o: Array2<f32>,
 
@@ -254,10 +254,10 @@ pub struct SelfAttention {
     ///
     /// 存储历史 token 的 K 和 V 矩阵，避免重复计算。
     ///
-    /// **性能提升示例**：
-    /// - 不使用缓存：生成100个token需要 O(100²) = 10,000 次计算
-    /// - 使用缓存：生成100个token需要 O(100) = 100 次计算
-    /// - **加速比**: 100倍！
+    /// **复杂度收益示意**：
+    /// - 不使用缓存时，增量生成会不断重复计算历史 token 的 K/V；
+    /// - 使用缓存后，只需为新 token 追加一次 K/V，并复用历史结果；
+    /// - 理论复杂度会下降，但实际加速比取决于序列长度、设备和实现细节。
     pub kv_cache: Option<(Array2<f32>, Array2<f32>)>,
 
     /// **是否启用KV缓存**
@@ -302,27 +302,27 @@ impl SelfAttention {
     /// **创建新的多头自注意力层**
     ///
     /// # 参数
-    /// - `embedding_dim`: 嵌入维度（通常为512）
+    /// - `embedding_dim`: 嵌入维度（输入/输出隐藏状态的宽度）
     ///
     /// # 架构配置
     /// - **头数**: 8个（Transformer 论文的标准配置）
-    /// - **每头维度**: embedding_dim / num_heads = 64
-    /// - **总参数量**: 4 × 512² = 1,048,576 参数（Q、K、V、O 四个矩阵）
+    /// - **每头维度**: `embedding_dim / num_heads`
+    /// - **总参数量**: 4 个 `(embedding_dim, embedding_dim)` 投影矩阵
     ///
     /// # 权重初始化
     /// 使用 He 初始化：std = sqrt(2 / embedding_dim)
     ///
-    /// **为什么是 sqrt(2/512) ≈ 0.0625？**
+    /// **为什么使用 `sqrt(2 / embedding_dim)`？**
     /// - 保持激活值的方差在层与层之间稳定
     /// - 防止梯度爆炸或消失
     ///
     /// # 示例
     /// ```rust
     /// use llm::self_attention::SelfAttention;
-    /// let attention = SelfAttention::new(512);
-    /// // 创建 8 头注意力，每头 64 维
+    /// let attention = SelfAttention::new(256);
+    /// // 创建 8 头注意力，每头维度为 embedding_dim / 8
     /// assert_eq!(attention.num_heads, 8);
-    /// assert_eq!(attention.head_dim, 64);
+    /// assert_eq!(attention.head_dim, 32);
     /// ```
     pub fn new(embedding_dim: usize) -> Self {
         let mut rng = rand::rng();
@@ -584,10 +584,10 @@ impl SelfAttention {
     /// ```
     ///
     /// # 参数
-    /// - `input`: 输入张量 (seq_len, 512)
+    /// - `input`: 输入张量 `(seq_len, embedding_dim)`
     ///
     /// # 返回值
-    /// (Q, K, V) 三个矩阵，形状都是 (seq_len, 512)
+    /// `(Q, K, V)` 三个矩阵，形状都是 `(seq_len, embedding_dim)`
     fn compute_qkv(&self, input: &Array2<f32>) -> (Array2<f32>, Array2<f32>, Array2<f32>) {
         let q = input.dot(&self.w_q);
         let k = input.dot(&self.w_k);
@@ -616,9 +616,9 @@ impl SelfAttention {
     ///    - 根据注意力权重组合值向量
     ///
     /// # 参数
-    /// - `q`: Query 矩阵 (seq_len, head_dim=64)
-    /// - `k`: Key 矩阵 (seq_len, head_dim=64)
-    /// - `v`: Value 矩阵 (seq_len, head_dim=64)
+    /// - `q`: Query 矩阵 `(seq_len, head_dim)`
+    /// - `k`: Key 矩阵 `(seq_len, head_dim)`
+    /// - `v`: Value 矩阵 `(seq_len, head_dim)`
     /// - `mask`: 因果掩码 (seq_len, seq_len)
     ///
     /// # 返回值
@@ -670,9 +670,9 @@ impl SelfAttention {
     /// 这是注意力机制的核心：通过 Q 和 K 的相似度，对 V 进行加权求和。
     ///
     /// # 参数
-    /// - `q`: Query 矩阵 (seq_len, head_dim=64)
-    /// - `k`: Key 矩阵 (seq_len, head_dim=64)
-    /// - `v`: Value 矩阵 (seq_len, head_dim=64)
+    /// - `q`: Query 矩阵 `(seq_len, head_dim)`
+    /// - `k`: Key 矩阵 `(seq_len, head_dim)`
+    /// - `v`: Value 矩阵 `(seq_len, head_dim)`
     ///
     /// # 返回值
     /// - `output`: 注意力输出 (seq_len, head_dim)
@@ -685,7 +685,7 @@ impl SelfAttention {
     #[allow(dead_code)]
     fn attention(q: &Array2<f32>, k: &Array2<f32>, v: &Array2<f32>) -> (Array2<f32>, Array2<f32>) {
         // 步骤 1: 计算缩放点积注意力分数
-        let dk = (q.ncols() as f32).sqrt(); // √d_k = √64 = 8
+        let dk = (q.ncols() as f32).sqrt(); // √d_k，按当前 head_dim 动态计算。
         let k_t = k.t();
         let mut scores = q.dot(&k_t) / dk; // (seq_len, seq_len)
 
@@ -712,17 +712,17 @@ impl SelfAttention {
 
     /// **将矩阵重塑为多头格式**
     ///
-    /// 这个函数将 (seq_len, 512) 的矩阵转换为多头格式 (seq_len×8, 64)。
+    /// 这个函数将 `(seq_len, embedding_dim)` 的矩阵重排为多头格式。
     ///
     /// # 转换逻辑
     ///
-    /// **输入**: (seq_len, 512) - 一个大的嵌入矩阵
+    /// **输入**: `(seq_len, embedding_dim)` - 一整个嵌入矩阵
     /// ```text
     /// [向量0: [d0, d1, ..., d511]]
     /// [向量1: [d0, d1, ..., d511]]
     /// ```
     ///
-    /// **输出**: (seq_len×8, 64) - 8个头，每个头64维
+    /// **输出**: `(seq_len × num_heads, head_dim)` - 每行对应一个头上的一个位置
     /// ```text
     /// Head 0: [向量0的d0-d63, 向量1的d0-d63, ...]
     /// Head 1: [向量0的d64-d127, 向量1的d64-d127, ...]
@@ -732,15 +732,8 @@ impl SelfAttention {
     ///
     /// # 示例
     /// ```text
-    /// 输入: seq_len=2, embedding_dim=512
-    /// [[向量0: 512维], [向量1: 512维]]
-    ///
-    /// 输出: seq_len×num_heads=16 行，每行 64 维
-    /// 行0: 向量0的第0-63维 (Head 0)
-    /// 行1: 向量0的第64-127维 (Head 1)
-    /// ...
-    /// 行7: 向量0的第448-511维 (Head 7)
-    /// 行8: 向量1的第0-63维 (Head 0)
+    /// 输入: `seq_len=2`, `embedding_dim = num_heads * head_dim`
+    /// 每个向量会被按头切成若干连续片段，再按 `(位置, 头)` 展平。
     /// ...
     /// ```
     fn reshape_for_heads(&self, x: &Array2<f32>) -> Array2<f32> {
@@ -771,20 +764,19 @@ impl SelfAttention {
     ///
     /// # 转换逻辑
     ///
-    /// **输入**: (seq_len×8, 64) - 8个头的输出
+    /// **输入**: `(seq_len × num_heads, head_dim)` - 多头展开后的输出
     /// ```text
-    /// 行0: 向量0_Head0 (64维)
-    /// 行1: 向量0_Head1 (64维)
+    /// 行0: 向量0_Head0（head_dim 维）
+    /// 行1: 向量0_Head1（head_dim 维）
     /// ...
-    /// 行7: 向量0_Head7 (64维)
-    /// 行8: 向量1_Head0 (64维)
+    /// 行7: 向量0_Head7（head_dim 维）
+    /// 行8: 向量1_Head0（head_dim 维）
     /// ...
     /// ```
     ///
-    /// **输出**: (seq_len, 512) - 拼接所有头
+    /// **输出**: `(seq_len, embedding_dim)` - 把所有头重新拼回原始隐藏维度
     /// ```text
-    /// 向量0: [Head0的64维 | Head1的64维 | ... | Head7的64维] = 512维
-    /// 向量1: [Head0的64维 | Head1的64维 | ... | Head7的64维] = 512维
+    /// 每个位置都会按头顺序拼接：`[Head0 | Head1 | ... | HeadN]`。
     /// ```
     fn reverse_reshape_from_heads(&self, x: &Array2<f32>) -> Array2<f32> {
         let (seq_len_times_heads, _head_dim) = x.dim();
