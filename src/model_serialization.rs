@@ -189,6 +189,7 @@ pub struct SerializableOutputProjection {
     pub b_out_shape: (usize, usize),
     pub b_out_data: Vec<f32>,
     pub optimizer: SerializableAdam,
+    pub optimizer_bias: SerializableAdam,
 }
 
 #[derive(Clone, Encode, Decode, Serialize, Deserialize)]
@@ -442,6 +443,7 @@ impl SerializableLayer {
                 .map(|&x| if x.is_finite() { x } else { 0.0 })
                 .collect(),
             optimizer: SerializableAdam::from_adam(&op.optimizer),
+            optimizer_bias: SerializableAdam::from_adam(&op.optimizer_bias),
         }
     }
 
@@ -453,6 +455,7 @@ impl SerializableLayer {
             w_out: rebuild_array2_or_zeros(s.w_out_shape, &s.w_out_data, "w_out"),
             b_out: rebuild_array2_or_zeros(s.b_out_shape, &s.b_out_data, "b_out"),
             optimizer: s.optimizer.to_adam(),
+            optimizer_bias: s.optimizer_bias.to_adam(),
             grad_w_out_accum: Array2::zeros(s.w_out_shape),
             grad_b_out_accum: Array2::zeros(s.b_out_shape),
         }

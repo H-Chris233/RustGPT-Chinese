@@ -15,6 +15,8 @@ fn test_output_projection_creation() {
     // 检查优化器内部状态维度。
     assert_eq!(output_proj.optimizer.m.shape(), [EMBEDDING_DIM, vocab_size]);
     assert_eq!(output_proj.optimizer.v.shape(), [EMBEDDING_DIM, vocab_size]);
+    assert_eq!(output_proj.optimizer_bias.m.shape(), [1, vocab_size]);
+    assert_eq!(output_proj.optimizer_bias.v.shape(), [1, vocab_size]);
 }
 
 #[test]

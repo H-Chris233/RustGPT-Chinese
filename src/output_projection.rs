@@ -65,6 +65,9 @@ pub struct OutputProjection {
     /// **Adam 优化器**: 用于更新权重
     pub optimizer: Adam,
 
+    /// **Bias 的 Adam 优化器**：保持与权重相同的优化语义
+    pub optimizer_bias: Adam,
+
     // =====================================================================
     // 梯度累积支持（Gradient Accumulation）
     // =====================================================================
@@ -119,6 +122,7 @@ impl OutputProjection {
             w_out,
             b_out: Array2::zeros((1, vocab_size)),
             optimizer: Adam::new((embedding_dim, vocab_size)),
+            optimizer_bias: Adam::new((1, vocab_size)),
             grad_w_out_accum: Array2::zeros((embedding_dim, vocab_size)),
             grad_b_out_accum: Array2::zeros((1, vocab_size)),
         }
@@ -133,7 +137,6 @@ impl OutputProjection {
         self.grad_w_out_accum.fill(0.0);
         self.grad_b_out_accum.fill(0.0);
     }
-
 
     /// 仅做“梯度计算 + 累加”，不更新参数（ctx 驱动）。
     ///
@@ -153,7 +156,11 @@ impl OutputProjection {
     }
 
     /// 核心实现：给定 input，计算梯度并写入累积 buffer。
-    fn backward_accumulate_from_input(&mut self, input: &Array2<f32>, grads: &Array2<f32>) -> Array2<f32> {
+    fn backward_accumulate_from_input(
+        &mut self,
+        input: &Array2<f32>,
+        grads: &Array2<f32>,
+    ) -> Array2<f32> {
         let (grad_input, grad_w_out, grad_b_out) = Self::compute_grads(input, &self.w_out, grads);
 
         self.grad_w_out_accum += &grad_w_out;
@@ -172,10 +179,8 @@ impl OutputProjection {
         let grad_b_scaled = &self.grad_b_out_accum * scale;
 
         self.optimizer.step(&mut self.w_out, &grad_w_scaled, lr);
-
-        // bias 采用“纯 SGD 更新”（不走 Adam），以保持与历史 checkpoint 格式兼容。
-        // 同时我们在这里使用 **sum**（而不是 mean）来聚合 bias 梯度，避免多除一次 seq_len。
-        self.b_out -= &(lr * grad_b_scaled);
+        self.optimizer_bias
+            .step(&mut self.b_out, &grad_b_scaled, lr);
 
         self.zero_grad_accum();
     }
@@ -245,7 +250,12 @@ impl Layer for OutputProjection {
     /// ```
     fn forward(&mut self, input: &Array2<f32>) -> (Array2<f32>, LayerContext) {
         let out = input.dot(&self.w_out) + &self.b_out;
-        (out, Box::new(OutputProjectionContext { input: input.clone() }))
+        (
+            out,
+            Box::new(OutputProjectionContext {
+                input: input.clone(),
+            }),
+        )
     }
 
     /// **反向传播：计算梯度并更新参数**
@@ -274,7 +284,7 @@ impl Layer for OutputProjection {
 
         // 更新参数
         self.optimizer.step(&mut self.w_out, &grad_w_out, lr);
-        self.b_out -= &(lr * &grad_b_out);
+        self.optimizer_bias.step(&mut self.b_out, &grad_b_out, lr);
 
         grad_input
     }
