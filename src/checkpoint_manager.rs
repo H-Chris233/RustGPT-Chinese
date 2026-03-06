@@ -202,11 +202,6 @@ impl CheckpointManager {
     ) -> Result<PathBuf, String> {
         let is_best = metadata.loss < self.best_loss;
 
-        if is_best {
-            self.best_loss = metadata.loss;
-            self.best_epoch = metadata.epoch;
-        }
-
         // 构建需要写入的检查点列表。
         //
         // 教学说明（重要）：
@@ -367,8 +362,11 @@ impl CheckpointManager {
             saved_paths.push(checkpoint_path);
         }
 
-        // 清理旧的检查点
+        // 所有写盘成功后，再提交 best 状态。
+        // 这样即使中途 I/O 失败，也不会让 manager 的内存状态“超前于磁盘状态”。
         if is_best {
+            self.best_loss = metadata.loss;
+            self.best_epoch = metadata.epoch;
             self.cleanup_old_checkpoints()?;
         }
 

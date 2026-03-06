@@ -586,6 +586,66 @@ fn test_get_best_checkpoint_prefers_lowest_loss_over_latest_mtime() {
 }
 
 #[test]
+fn test_checkpoint_save_failure_does_not_advance_best_state() {
+    let checkpoint_dir = "test_checkpoints_save_failure";
+
+    if std::path::Path::new(checkpoint_dir).exists() {
+        fs::remove_dir_all(checkpoint_dir).ok();
+        fs::remove_file(checkpoint_dir).ok();
+    }
+
+    let (llm, _test_data) = create_test_model();
+    let mut manager = CheckpointManager::new(checkpoint_dir, CheckpointStrategy::Best, 3)
+        .expect("应该能创建检查点管理器");
+
+    // 先成功保存一个 baseline best。
+    manager
+        .save_checkpoint(
+            &llm,
+            CheckpointMetadata {
+                epoch: 10,
+                loss: 3.0,
+                learning_rate: 0.001,
+                timestamp: "2026-03-06 10:00:00".to_string(),
+                phase: "test".to_string(),
+            },
+        )
+        .expect("baseline checkpoint 应保存成功");
+
+    assert!((manager.get_best_loss() - 3.0).abs() < 1e-6);
+    assert_eq!(manager.get_best_epoch(), 10);
+
+    // 破坏保存目录：删除目录并在同一路径创建普通文件，确保后续 join/create 必然失败。
+    fs::remove_dir_all(checkpoint_dir).expect("应能删除原检查点目录");
+    fs::write(checkpoint_dir, b"not a directory").expect("应能创建同名普通文件");
+
+    let save_result = manager.save_checkpoint(
+        &llm,
+        CheckpointMetadata {
+            epoch: 20,
+            loss: 2.0,
+            learning_rate: 0.001,
+            timestamp: "2026-03-06 11:00:00".to_string(),
+            phase: "test".to_string(),
+        },
+    );
+    assert!(save_result.is_err(), "保存路径损坏时保存应失败");
+
+    // 即使失败，也不应把内存中的 best 状态提前推进到 2.0 / epoch=20。
+    assert!(
+        (manager.get_best_loss() - 3.0).abs() < 1e-6,
+        "保存失败后 best_loss 不应漂移"
+    );
+    assert_eq!(
+        manager.get_best_epoch(),
+        10,
+        "保存失败后 best_epoch 不应漂移"
+    );
+
+    fs::remove_file(checkpoint_dir).ok();
+}
+
+#[test]
 fn test_checkpoint_manager_restores_best_state_from_existing_dir() {
     let checkpoint_dir = "test_checkpoints_restore_best_state";
 
