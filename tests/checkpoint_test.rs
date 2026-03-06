@@ -884,16 +884,14 @@ fn test_compute_loss_eval_uses_token_weighted_mean() {
 fn test_checkpoint_adam_optimizer_state_preservation() {
     //! 测试Adam优化器状态的保存和恢复
     //!
-    //! 验证检查点中包含完整的Adam优化器状态（m, v, timestep）
+    //! 验证检查点中包含完整的Adam优化器状态（m, v, timestep 以及超参数）
 
     let checkpoint_dir = "test_checkpoints_adam_state";
 
-    // 清理之前的测试数据
     if std::path::Path::new(checkpoint_dir).exists() {
         fs::remove_dir_all(checkpoint_dir).ok();
     }
 
-    // 创建模型并训练
     let (mut llm, test_data) = create_test_model();
 
     let tokenized_data: Vec<Vec<usize>> = test_data
@@ -901,7 +899,6 @@ fn test_checkpoint_adam_optimizer_state_preservation() {
         .map(|text| LLM::tokenize_with_vocab(&llm.vocab, text))
         .collect();
 
-    // 训练几个epoch以确保Adam优化器状态不为零
     let mut manager = CheckpointManager::new(checkpoint_dir, CheckpointStrategy::BestAndLast, 3)
         .expect("应该能创建检查点管理器");
 
@@ -915,17 +912,14 @@ fn test_checkpoint_adam_optimizer_state_preservation() {
         0,
     );
 
-    // 保存检查点
     let checkpoint_path = manager
-        .get_best_checkpoint()
-        .or_else(|| manager.get_last_checkpoint())
+        .get_last_checkpoint()
+        .or_else(|| manager.get_best_checkpoint())
         .expect("应该有检查点");
 
-    // 加载检查点
     let (loaded_llm, _) =
         CheckpointManager::load_checkpoint(&checkpoint_path).expect("应该能加载检查点");
 
-    // 验证模型结构
     assert_eq!(
         loaded_llm.network.len(),
         llm.network.len(),
@@ -937,12 +931,81 @@ fn test_checkpoint_adam_optimizer_state_preservation() {
         "总参数数应该匹配"
     );
 
-    println!("\n✅ Adam优化器状态保存测试通过！");
-    println!("   • 模型层数: {}", loaded_llm.network.len());
-    println!("   • 总参数: {}", loaded_llm.total_parameters());
-    println!("   • 词汇表大小: {}", loaded_llm.vocab.len());
+    let max_diff = |a: &Array2<f32>, b: &Array2<f32>| {
+        a.iter()
+            .zip(b.iter())
+            .fold(0.0_f32, |m, (&x, &y)| m.max((x - y).abs()))
+    };
+    let assert_adam_eq = |name: &str, lhs: &llm::adam::Adam, rhs: &llm::adam::Adam| {
+        assert!(
+            (lhs.beta1 - rhs.beta1).abs() < 1e-12,
+            "{} beta1 应一致",
+            name
+        );
+        assert!(
+            (lhs.beta2 - rhs.beta2).abs() < 1e-12,
+            "{} beta2 应一致",
+            name
+        );
+        assert!(
+            (lhs.epsilon - rhs.epsilon).abs() < 1e-12,
+            "{} epsilon 应一致",
+            name
+        );
+        assert_eq!(lhs.timestep, rhs.timestep, "{} timestep 应一致", name);
+        assert!(max_diff(&lhs.m, &rhs.m) < 1e-12, "{} 一阶矩 m 应一致", name);
+        assert!(max_diff(&lhs.v, &rhs.v) < 1e-12, "{} 二阶矩 v 应一致", name);
+    };
 
-    // 清理
+    let embeddings = llm.network[0]
+        .as_any()
+        .downcast_ref::<Embeddings>()
+        .expect("首层应为 Embeddings");
+    let loaded_embeddings = loaded_llm.network[0]
+        .as_any()
+        .downcast_ref::<Embeddings>()
+        .expect("加载后的首层应为 Embeddings");
+    assert_adam_eq(
+        "embeddings.token_optimizer",
+        &embeddings.token_optimizer,
+        &loaded_embeddings.token_optimizer,
+    );
+
+    let transformer = llm.network[1]
+        .as_any()
+        .downcast_ref::<TransformerBlock>()
+        .expect("第二层应为 TransformerBlock");
+    let loaded_transformer = loaded_llm.network[1]
+        .as_any()
+        .downcast_ref::<TransformerBlock>()
+        .expect("加载后的第二层应为 TransformerBlock");
+    assert_adam_eq(
+        "transformer.attention.optimizer_w_q",
+        &transformer.attention.optimizer_w_q,
+        &loaded_transformer.attention.optimizer_w_q,
+    );
+
+    let output = llm
+        .network
+        .last()
+        .and_then(|layer| layer.as_any().downcast_ref::<OutputProjection>())
+        .expect("最后一层应为 OutputProjection");
+    let loaded_output = loaded_llm
+        .network
+        .last()
+        .and_then(|layer| layer.as_any().downcast_ref::<OutputProjection>())
+        .expect("加载后的最后一层应为 OutputProjection");
+    assert_adam_eq(
+        "output.optimizer",
+        &output.optimizer,
+        &loaded_output.optimizer,
+    );
+    assert_adam_eq(
+        "output.optimizer_bias",
+        &output.optimizer_bias,
+        &loaded_output.optimizer_bias,
+    );
+
     fs::remove_dir_all(checkpoint_dir).ok();
 }
 
