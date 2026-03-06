@@ -26,3 +26,30 @@ fn self_attention_forward_backward_batch_runs() {
     assert!(grad_input.iter().all(|v| v.is_finite()));
 }
 
+#[test]
+fn forward_batch_default_mask_contract_zeroes_masked_rows() {
+    use llm::layer_norm::LayerNorm;
+    use ndarray::{Array2, Array3};
+
+    let mut layer = LayerNorm::new(4);
+    let input = Array3::from_shape_fn((1, 3, 4), |(_, s, d)| 1.0 + s as f32 + d as f32 * 0.1);
+    let attention_mask = Array2::from_shape_vec((1, 3), vec![1.0, 0.0, 1.0]).unwrap();
+
+    let (out, ctxs) = layer.forward_batch(&input, Some(&attention_mask));
+    assert_eq!(out.dim(), (1, 3, 4));
+    assert_eq!(ctxs.len(), 1);
+    assert!(
+        out.slice(ndarray::s![0, 1, ..])
+            .iter()
+            .all(|v| v.abs() < 1e-6)
+    );
+
+    let grads = Array3::<f32>::ones(out.dim());
+    let grad_input = layer.backward_batch(&ctxs, &grads, 0.001, Some(&attention_mask));
+    assert!(
+        grad_input
+            .slice(ndarray::s![0, 1, ..])
+            .iter()
+            .all(|v| v.abs() < 1e-6)
+    );
+}

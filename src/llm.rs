@@ -184,6 +184,15 @@ pub trait Layer {
     fn backward(&mut self, ctx: &LayerContext, grads: &Array2<f32>, lr: f32) -> Array2<f32>;
 
     /// 批量前向传播（默认实现：逐样本循环）
+    ///
+    /// 默认 mask 契约：
+    /// - `attention_mask[b, s] < 0.5` 的位置会在层边界被视为“无效 token”；
+    /// - 因此默认实现会把这些位置的**输出行清零**；
+    /// - `backward_batch()` 也会对同样的位置把**输入梯度行清零**。
+    ///
+    /// 说明：
+    /// - 这只保证“层边界的一致零化语义”；
+    /// - 像注意力这类需要把 mask 参与内部计算（例如 key padding mask）的层，仍应覆写本方法。
     fn forward_batch(
         &mut self,
         input: &Array3<f32>,
@@ -198,12 +207,20 @@ pub trait Layer {
 
         for b in 0..batch_size {
             let sample = input.slice(ndarray::s![b, .., ..]).to_owned();
-            let (sample_out, ctx) = self.forward(&sample);
+            let (mut sample_out, ctx) = self.forward(&sample);
+
+            if let Some(mask) = attention_mask {
+                for s in 0..seq_len.min(sample_out.nrows()) {
+                    if mask[[b, s]] < 0.5 {
+                        sample_out.row_mut(s).fill(0.0);
+                    }
+                }
+            }
+
             output.slice_mut(ndarray::s![b, .., ..]).assign(&sample_out);
             ctxs.push(ctx);
         }
 
-        let _ = attention_mask;
         (output, ctxs)
     }
 

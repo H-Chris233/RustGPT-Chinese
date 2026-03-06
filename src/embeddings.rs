@@ -171,7 +171,6 @@ impl Embeddings {
         }
     }
 
-
     /// 用于梯度累积：只累加梯度，不更新参数（ctx 驱动）。
     ///
     /// 教学说明：
@@ -510,9 +509,10 @@ impl Layer for Embeddings {
             );
         }
 
-        let token_ids_mat: Array2<usize> = Array2::from_shape_fn((batch_size, seq_len), |(b, s)| {
-            input[[b, s, 0.min(token_dim.saturating_sub(1))]] as usize
-        });
+        let token_ids_mat: Array2<usize> =
+            Array2::from_shape_fn((batch_size, seq_len), |(b, s)| {
+                input[[b, s, 0.min(token_dim.saturating_sub(1))]] as usize
+            });
 
         // 为每个批次样本生成嵌入
         let mut output = Array3::zeros((batch_size, seq_len, EMBEDDING_DIM));
@@ -520,7 +520,16 @@ impl Layer for Embeddings {
 
         for b in 0..batch_size {
             let token_ids: Vec<usize> = token_ids_mat.row(b).to_vec();
-            let embeddings = self.embed_tokens(&token_ids);
+            let mut embeddings = self.embed_tokens(&token_ids);
+
+            if let Some(mask) = _attention_mask {
+                for s in 0..seq_len {
+                    if mask[[b, s]] < 0.5 {
+                        embeddings.row_mut(s).fill(0.0);
+                    }
+                }
+            }
+
             output.slice_mut(ndarray::s![b, .., ..]).assign(&embeddings);
             ctxs.push(Box::new(EmbeddingsContext { token_ids }));
         }

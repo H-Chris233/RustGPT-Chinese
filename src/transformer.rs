@@ -160,7 +160,6 @@ impl TransformerBlock {
         self.norm2.zero_grad_accum();
     }
 
-
     /// 梯度累积（ctx 驱动版本）：只累加子层参数梯度，不更新参数。
     ///
     /// 与 `Layer::backward()` 的关系：
@@ -341,9 +340,7 @@ impl Layer for TransformerBlock {
             let (attn_out_b, mut attn_ctxs) =
                 self.attention.forward_batch(&attn_in, attn_mask.as_ref());
             let attention_out = attn_out_b.index_axis(Axis(0), 0).to_owned();
-            let ctx_attention = attn_ctxs
-                .pop()
-                .unwrap_or_else(|| Box::new(()));
+            let ctx_attention = attn_ctxs.pop().unwrap_or_else(|| Box::new(()));
 
             let (dropout1_out, ctx_dropout1) = self.dropout1.forward(&attention_out);
             let x = &sample + &dropout1_out;
@@ -352,7 +349,14 @@ impl Layer for TransformerBlock {
             let (ffn_out, ctx_ffn) = self.feed_forward.forward(&norm2_out);
             let (dropout2_out, ctx_dropout2) = self.dropout2.forward(&ffn_out);
 
-            let sample_out = &x + &dropout2_out;
+            let mut sample_out = &x + &dropout2_out;
+            if let Some(mask) = attention_mask {
+                for s in 0..seq_len {
+                    if mask[[b, s]] < 0.5 {
+                        sample_out.row_mut(s).fill(0.0);
+                    }
+                }
+            }
             output.slice_mut(s![b, .., ..]).assign(&sample_out);
 
             ctxs.push(Box::new(TransformerBlockContext {

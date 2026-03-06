@@ -1064,8 +1064,17 @@ impl Layer for SelfAttention {
         for b in 0..batch_size {
             let sample = input.slice(s![b, .., ..]).to_owned();
             let key_padding_mask = attention_mask.map(|m| m.row(b).to_owned());
-            let (sample_out, ctx) =
+            let (mut sample_out, ctx) =
                 self.forward_with_padding_mask_owned_and_ctx(sample, key_padding_mask.as_ref());
+
+            if let Some(mask) = attention_mask {
+                for s in 0..seq_len {
+                    if mask[[b, s]] < 0.5 {
+                        sample_out.row_mut(s).fill(0.0);
+                    }
+                }
+            }
+
             output.slice_mut(s![b, .., ..]).assign(&sample_out);
             ctxs.push(Box::new(ctx));
         }
