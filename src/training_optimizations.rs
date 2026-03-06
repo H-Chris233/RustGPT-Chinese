@@ -31,6 +31,22 @@ struct CheckpointEpochMetrics {
 }
 
 impl LLM {
+    /// 判定当前 loss 在“真实最佳模型”与“早停阈值”两个维度上的进展情况。
+    ///
+    /// 返回值：
+    /// - 第 1 项：是否刷新了历史真实 best（只要 loss 更低就算）
+    /// - 第 2 项：是否达到 early stopping 所需的“显著改善”（需要超过 `min_delta`）
+    fn classify_checkpoint_progress(
+        true_best_loss: f32,
+        early_stop_best_loss: f32,
+        current_loss: f32,
+        min_delta: f32,
+    ) -> (bool, bool) {
+        let is_true_best = current_loss < true_best_loss;
+        let is_significant_improvement = current_loss < early_stop_best_loss - min_delta;
+        (is_true_best, is_significant_improvement)
+    }
+
     /// 执行一个 epoch 的 checkpoint 训练主循环，并返回该轮聚合指标。
     ///
     /// 教学说明：
@@ -203,15 +219,20 @@ impl LLM {
         self.set_training_mode(true);
         let pad_token_id = self.vocab.pad_token_id();
 
-        let mut best_loss = if let Some(ref manager) = checkpoint_manager {
+        let mut true_best_loss = if let Some(ref manager) = checkpoint_manager {
             manager.get_best_loss()
         } else {
             f32::INFINITY
         };
+        let mut early_stop_best_loss = true_best_loss;
         let mut counter = 0;
         // 与 `train_monitored()` 保持一致：避免 resume 训练与主训练的早停判据不一致。
         let min_delta = 0.01f32;
-        let mut best_epoch = resume_epoch;
+        let mut best_epoch = if let Some(ref manager) = checkpoint_manager {
+            manager.get_best_epoch()
+        } else {
+            resume_epoch
+        };
         let start_time = std::time::Instant::now();
 
         for epoch in resume_epoch..max_epochs {
@@ -262,11 +283,17 @@ impl LLM {
             }
 
             //  🔥  检查早停条件和保存检查点
-            if metrics.avg_loss < best_loss - min_delta {
-                best_loss = metrics.avg_loss;
-                best_epoch = epoch;
-                counter = 0;
+            let (is_true_best, is_significant_improvement) = Self::classify_checkpoint_progress(
+                true_best_loss,
+                early_stop_best_loss,
+                metrics.avg_loss,
+                min_delta,
+            );
 
+            // 真实 best：只要 loss 更低，就更新最佳模型与 checkpoint。
+            if is_true_best {
+                true_best_loss = metrics.avg_loss;
+                best_epoch = epoch;
                 saved_checkpoint_this_epoch = self.maybe_save_checkpoint(
                     checkpoint_manager.as_mut().map(|manager| &mut **manager),
                     epoch,
@@ -274,12 +301,18 @@ impl LLM {
                     metrics.current_lr,
                     phase,
                 );
+            }
+
+            // 早停判据：只有“超过 min_delta 的显著改善”才重置 patience。
+            if is_significant_improvement {
+                early_stop_best_loss = metrics.avg_loss;
+                counter = 0;
             } else {
                 counter += 1;
                 if counter >= patience {
                     println!("\n🛑  早停触发:");
                     println!("        •  最佳epoch:  {}", best_epoch);
-                    println!("        •  最佳loss:  {:.4}", best_loss);
+                    println!("        •  最佳loss:  {:.4}", true_best_loss);
                     println!("        •  停止epoch:  {}", epoch);
                     println!("        •  节省时间:  {}  epochs\n", max_epochs - epoch);
 
@@ -311,5 +344,31 @@ impl LLM {
 
         self.set_training_mode(false);
         max_epochs
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LLM;
+
+    #[test]
+    fn checkpoint_progress_decouples_true_best_from_min_delta() {
+        let (is_true_best, is_significant_improvement) =
+            LLM::classify_checkpoint_progress(0.500, 0.500, 0.495, 0.01);
+
+        assert!(is_true_best, "loss 只要更低，就应视为真实 best");
+        assert!(
+            !is_significant_improvement,
+            "小于 min_delta 的改善不应重置 early stopping patience"
+        );
+    }
+
+    #[test]
+    fn checkpoint_progress_marks_large_improvement_for_both_dimensions() {
+        let (is_true_best, is_significant_improvement) =
+            LLM::classify_checkpoint_progress(0.500, 0.500, 0.480, 0.01);
+
+        assert!(is_true_best);
+        assert!(is_significant_improvement);
     }
 }
