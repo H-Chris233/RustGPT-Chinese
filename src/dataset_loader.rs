@@ -24,7 +24,7 @@
 //! ```
 //!
 //! ### 目录模式（推荐）
-//! 传入目录路径时，会加载目录下所有 `.json` 文件（按文件名中的数字序号排序）并合并语料。
+//! 传入目录路径时，会加载目录下所有 `.json` 文件（按文件名中的所有数字段做自然排序）并合并语料。
 //!
 //! 例如：
 //! - `data/pretraining/set1.json`
@@ -170,7 +170,50 @@ fn compare_dataset_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
     let a_name = a.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
     let b_name = b.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
 
-    natural_compare_names(&a_name, &b_name)
+    let a_numbers = extract_number_segments(&a_name);
+    let b_numbers = extract_number_segments(&b_name);
+
+    compare_number_segments(&a_numbers, &b_numbers)
+        .then_with(|| natural_compare_names(&a_name, &b_name))
+}
+
+fn extract_number_segments(s: &str) -> Vec<u64> {
+    let mut numbers = Vec::new();
+    let mut start: Option<usize> = None;
+
+    for (i, ch) in s.char_indices() {
+        if ch.is_ascii_digit() {
+            start.get_or_insert(i);
+        } else if let Some(st) = start.take() {
+            if let Ok(value) = s[st..i].parse() {
+                numbers.push(value);
+            }
+        }
+    }
+
+    if let Some(st) = start {
+        if let Ok(value) = s[st..].parse() {
+            numbers.push(value);
+        }
+    }
+
+    numbers
+}
+
+fn compare_number_segments(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    match (a.is_empty(), b.is_empty()) {
+        (false, false) => a
+            .iter()
+            .zip(b.iter())
+            .find_map(|(x, y)| {
+                let ord = x.cmp(y);
+                (ord != std::cmp::Ordering::Equal).then_some(ord)
+            })
+            .unwrap_or_else(|| a.len().cmp(&b.len())),
+        (false, true) => std::cmp::Ordering::Less,
+        (true, false) => std::cmp::Ordering::Greater,
+        (true, true) => std::cmp::Ordering::Equal,
+    }
 }
 
 fn natural_compare_names(a: &str, b: &str) -> std::cmp::Ordering {
@@ -300,11 +343,12 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn compare_dataset_paths_uses_natural_sort_for_all_numeric_segments() {
+    fn compare_dataset_paths_orders_by_all_numeric_segments() {
         let mut paths = vec![
             PathBuf::from("dataset2_qa_p10.json"),
             PathBuf::from("dataset10_realtime_boundary_p2.json"),
             PathBuf::from("dataset2_qa_p2.json"),
+            PathBuf::from("set1.json"),
             PathBuf::from("dataset9_realtime_boundary_p3.json"),
             PathBuf::from("dataset2_qa_p02.json"),
         ];
@@ -319,6 +363,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "set1.json",
                 "dataset2_qa_p2.json",
                 "dataset2_qa_p02.json",
                 "dataset2_qa_p10.json",
