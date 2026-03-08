@@ -3,7 +3,7 @@ use std::collections::BinaryHeap;
 use std::time::Instant;
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, Axis};
-use rand::{rng, seq::SliceRandom, Rng};
+use rand::{rng, rngs::StdRng, seq::SliceRandom, Rng, SeedableRng};
 
 use crate::{
     output_projection::OutputProjection,
@@ -570,12 +570,12 @@ impl LLM {
         }
     }
 
-    pub(crate) fn shuffle_training_rows<T>(rows: &mut [T]) {
+    pub(crate) fn shuffle_training_rows<T>(rows: &mut [T], seed: u64) {
         if rows.len() <= 1 {
             return;
         }
 
-        let mut local_rng = rng();
+        let mut local_rng = StdRng::seed_from_u64(seed);
         rows.shuffle(&mut local_rng);
     }
 
@@ -597,7 +597,7 @@ impl LLM {
             .collect::<Vec<Vec<usize>>>();
 
         for epoch in 0..epochs {
-            Self::shuffle_training_rows(&mut tokenized_data);
+            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
             let decay_rate: f32 = 0.95;
             let decay_steps = 10.0;
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
@@ -1008,7 +1008,7 @@ impl LLM {
         let training_start_time = std::time::Instant::now();
 
         for epoch in 0..max_epochs {
-            Self::shuffle_training_rows(&mut tokenized_data);
+            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
             let epoch_start = std::time::Instant::now();
 
             // 🔥 余弦退火 + Warmup（禁用重启以提升稳定性）
@@ -1209,7 +1209,7 @@ impl LLM {
         let training_start_time = std::time::Instant::now();
 
         for epoch in 0..max_epochs {
-            Self::shuffle_training_rows(&mut tokenized_data);
+            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
             let epoch_start = std::time::Instant::now();
 
             // 余弦退火 + Warmup
@@ -2422,10 +2422,11 @@ mod tests {
         let epochs = monitored.train_monitored(vec!["a", "a b"], 1, 0.05, 10, 2);
         assert_eq!(epochs, 1);
 
-        let tokenized_data: Vec<Vec<usize>> = ["a", "a b"]
+        let mut tokenized_data: Vec<Vec<usize>> = ["a", "a b"]
             .iter()
             .map(|input| LLM::tokenize_training_with_vocab(&manual.vocab, input))
             .collect();
+        LLM::shuffle_training_rows(&mut tokenized_data, 0);
         let pad_token_id = manual.vocab.pad_token_id();
         let warmup_epochs = LLM::recommend_warmup_epochs(1);
         let current_lr = LLM::cosine_with_warmup_lr(0.05, 0, 1, 0, warmup_epochs);
@@ -2561,10 +2562,11 @@ mod tests {
         let epochs = monitored.train_monitored(vec!["a", "a b", "b"], 1, 0.05, 10, 2);
         assert_eq!(epochs, 1);
 
-        let tokenized_data: Vec<Vec<usize>> = ["a", "a b", "b"]
+        let mut tokenized_data: Vec<Vec<usize>> = ["a", "a b", "b"]
             .iter()
             .map(|input| LLM::tokenize_training_with_vocab(&manual.vocab, input))
             .collect();
+        LLM::shuffle_training_rows(&mut tokenized_data, 0);
         let pad_token_id = manual.vocab.pad_token_id();
         let warmup_epochs = LLM::recommend_warmup_epochs(1);
         let current_lr = LLM::cosine_with_warmup_lr(0.05, 0, 1, 0, warmup_epochs);

@@ -222,7 +222,7 @@ impl LLM {
         let start_time = std::time::Instant::now();
 
         for epoch in resume_epoch..max_epochs {
-            Self::shuffle_training_rows(&mut tokenized_data);
+            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
             let metrics = match self.run_checkpoint_epoch(
                 &tokenized_data,
                 pad_token_id,
