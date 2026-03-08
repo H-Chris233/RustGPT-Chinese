@@ -44,7 +44,7 @@ fn test_binary_save_and_load() {
 
 #[test]
 fn test_json_save_and_load() {
-    let test_dir = "test_exports_serialization_basic";
+    let test_dir = "target/test_exports_serialization_basic";
     assert!(fs::create_dir_all(test_dir).is_ok());
 
     let llm = LLM::default();
@@ -125,7 +125,7 @@ fn test_binary_save_rejects_non_finite_weights() {
 
 #[test]
 fn test_json_load_rejects_shape_mismatch_in_serialized_weights() {
-    let test_dir = "test_exports_corrupted_model";
+    let test_dir = "target/test_exports_corrupted_model";
     assert!(fs::create_dir_all(test_dir).is_ok());
 
     let llm = LLM::default();
