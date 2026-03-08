@@ -194,7 +194,7 @@ impl LLM {
     ///  - 若在 resume 训练中立即遇到零样本，则返回传入的 `resume_epoch`。
     pub fn train_with_checkpointing(
         &mut self,
-        tokenized_data: Vec<Vec<usize>>,
+        mut tokenized_data: Vec<Vec<usize>>,
         max_epochs: usize,
         initial_lr: f32,
         patience: usize,
@@ -222,6 +222,7 @@ impl LLM {
         let start_time = std::time::Instant::now();
 
         for epoch in resume_epoch..max_epochs {
+            Self::shuffle_training_rows(&mut tokenized_data);
             let metrics = match self.run_checkpoint_epoch(
                 &tokenized_data,
                 pad_token_id,

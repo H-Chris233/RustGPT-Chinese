@@ -3,7 +3,7 @@ use std::collections::BinaryHeap;
 use std::time::Instant;
 
 use ndarray::{Array1, Array2, Array3, ArrayView1, Axis};
-use rand::{rng, Rng};
+use rand::{rng, seq::SliceRandom, Rng};
 
 use crate::{
     output_projection::OutputProjection,
@@ -570,6 +570,15 @@ impl LLM {
         }
     }
 
+    pub(crate) fn shuffle_training_rows<T>(rows: &mut [T]) {
+        if rows.len() <= 1 {
+            return;
+        }
+
+        let mut local_rng = rng();
+        rows.shuffle(&mut local_rng);
+    }
+
     /// 最基础的教学训练入口。
     ///
     /// 说明：
@@ -581,13 +590,14 @@ impl LLM {
 
         let pad_token_id = self.vocab.pad_token_id();
 
-        let tokenized_data = data
+        let mut tokenized_data = data
             .iter()
             // 教学要点：训练序列应包含 BOS/EOS，否则模型难以学会“什么时候结束”。
             .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
             .collect::<Vec<Vec<usize>>>();
 
         for epoch in 0..epochs {
+            Self::shuffle_training_rows(&mut tokenized_data);
             let decay_rate: f32 = 0.95;
             let decay_steps = 10.0;
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
@@ -971,7 +981,7 @@ impl LLM {
         // - 早期版本的注释中提到“Rayon 并行 tokenization”，但当前仓库并未引入 rayon 依赖；
         // - 为避免教学误导，我们在这里采用明确的单线程实现，并保留计时监控。
         perf_monitor.start("tokenization_single_thread");
-        let tokenized_data: Vec<Vec<usize>> = data
+        let mut tokenized_data: Vec<Vec<usize>> = data
             .iter()
             // 训练序列必须包含 BOS/EOS（否则模型学不到“何时结束”）
             .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
@@ -998,6 +1008,7 @@ impl LLM {
         let training_start_time = std::time::Instant::now();
 
         for epoch in 0..max_epochs {
+            Self::shuffle_training_rows(&mut tokenized_data);
             let epoch_start = std::time::Instant::now();
 
             // 🔥 余弦退火 + Warmup（禁用重启以提升稳定性）
@@ -1179,7 +1190,7 @@ impl LLM {
         let preprocess_start = std::time::Instant::now();
 
         // 先把所有训练文本转成带 BOS/EOS 的 token 序列。
-        let tokenized_data: Vec<Vec<usize>> = data
+        let mut tokenized_data: Vec<Vec<usize>> = data
             .iter()
             // 训练序列必须包含 BOS/EOS（否则模型学不到“何时结束”）
             .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
@@ -1198,6 +1209,7 @@ impl LLM {
         let training_start_time = std::time::Instant::now();
 
         for epoch in 0..max_epochs {
+            Self::shuffle_training_rows(&mut tokenized_data);
             let epoch_start = std::time::Instant::now();
 
             // 余弦退火 + Warmup
