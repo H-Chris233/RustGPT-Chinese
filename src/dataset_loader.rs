@@ -170,30 +170,64 @@ fn compare_dataset_paths(a: &Path, b: &Path) -> std::cmp::Ordering {
     let a_name = a.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
     let b_name = b.file_name().map(|s| s.to_string_lossy()).unwrap_or_default();
 
-    let a_num = extract_first_number(&a_name);
-    let b_num = extract_first_number(&b_name);
+    natural_compare_names(&a_name, &b_name)
+}
 
-    match (a_num, b_num) {
-        (Some(x), Some(y)) => x.cmp(&y).then_with(|| a_name.cmp(&b_name)),
-        (Some(_), None) => std::cmp::Ordering::Less,
-        (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a_name.cmp(&b_name),
+fn natural_compare_names(a: &str, b: &str) -> std::cmp::Ordering {
+    let mut a_pos = 0usize;
+    let mut b_pos = 0usize;
+
+    loop {
+        match (next_name_chunk(a, a_pos), next_name_chunk(b, b_pos)) {
+            (Some((a_chunk, a_is_digit, next_a)), Some((b_chunk, b_is_digit, next_b))) => {
+                let ord = match (a_is_digit, b_is_digit) {
+                    (true, true) => compare_numeric_chunk(a_chunk, b_chunk),
+                    _ => a_chunk.cmp(b_chunk),
+                };
+                if ord != std::cmp::Ordering::Equal {
+                    return ord;
+                }
+                a_pos = next_a;
+                b_pos = next_b;
+            }
+            (None, None) => return a.cmp(b),
+            (None, Some(_)) => return std::cmp::Ordering::Less,
+            (Some(_), None) => return std::cmp::Ordering::Greater,
+        }
     }
 }
 
-fn extract_first_number(s: &str) -> Option<u64> {
-    let mut start: Option<usize> = None;
-    for (i, ch) in s.char_indices() {
-        if ch.is_ascii_digit() {
-            if start.is_none() {
-                start = Some(i);
-            }
-        } else if let Some(st) = start {
-            return s[st..i].parse().ok();
+fn next_name_chunk(s: &str, start: usize) -> Option<(&str, bool, usize)> {
+    if start >= s.len() {
+        return None;
+    }
+
+    let mut chars = s[start..].char_indices();
+    let (_, first) = chars.next()?;
+    let is_digit = first.is_ascii_digit();
+    let mut end = s.len();
+
+    for (offset, ch) in chars {
+        if ch.is_ascii_digit() != is_digit {
+            end = start + offset;
+            break;
         }
     }
 
-    start.and_then(|st| s[st..].parse().ok())
+    Some((&s[start..end], is_digit, end))
+}
+
+fn compare_numeric_chunk(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_trimmed = a.trim_start_matches('0');
+    let b_trimmed = b.trim_start_matches('0');
+    let a_norm = if a_trimmed.is_empty() { "0" } else { a_trimmed };
+    let b_norm = if b_trimmed.is_empty() { "0" } else { b_trimmed };
+
+    a_norm
+        .len()
+        .cmp(&b_norm.len())
+        .then_with(|| a_norm.cmp(b_norm))
+        .then_with(|| a.len().cmp(&b.len()))
 }
 
 fn build_extra_dataset_path(path: &str) -> Option<PathBuf> {
@@ -256,5 +290,41 @@ fn load_json_string_list(path: &str) -> Vec<String> {
             log::error!("读取数据文件失败 ({}): {}", path, e);
             Vec::new()
         }
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::compare_dataset_paths;
+    use std::path::PathBuf;
+
+    #[test]
+    fn compare_dataset_paths_uses_natural_sort_for_all_numeric_segments() {
+        let mut paths = vec![
+            PathBuf::from("dataset2_qa_p10.json"),
+            PathBuf::from("dataset10_realtime_boundary_p2.json"),
+            PathBuf::from("dataset2_qa_p2.json"),
+            PathBuf::from("dataset9_realtime_boundary_p3.json"),
+            PathBuf::from("dataset2_qa_p02.json"),
+        ];
+
+        paths.sort_by(|a, b| compare_dataset_paths(a, b));
+
+        let names: Vec<String> = paths
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+
+        assert_eq!(
+            names,
+            vec![
+                "dataset2_qa_p2.json",
+                "dataset2_qa_p02.json",
+                "dataset2_qa_p10.json",
+                "dataset9_realtime_boundary_p3.json",
+                "dataset10_realtime_boundary_p2.json",
+            ]
+        );
     }
 }
