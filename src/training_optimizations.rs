@@ -62,6 +62,7 @@ impl LLM {
     fn run_checkpoint_epoch(
         &mut self,
         tokenized_data: &[Vec<usize>],
+        row_order: &[usize],
         pad_token_id: usize,
         epoch: usize,
         max_epochs: usize,
@@ -75,7 +76,8 @@ impl LLM {
 
         let mut epoch_accumulator = EpochAccumulator::default();
 
-        for training_row in tokenized_data {
+        for row_idx in row_order {
+            let training_row = &tokenized_data[*row_idx];
             if training_row.len() < 2 {
                 continue;
             }
@@ -194,7 +196,7 @@ impl LLM {
     ///  - 若在 resume 训练中立即遇到零样本，则返回传入的 `resume_epoch`。
     pub fn train_with_checkpointing(
         &mut self,
-        mut tokenized_data: Vec<Vec<usize>>,
+        tokenized_data: Vec<Vec<usize>>,
         max_epochs: usize,
         initial_lr: f32,
         patience: usize,
@@ -222,9 +224,10 @@ impl LLM {
         let start_time = std::time::Instant::now();
 
         for epoch in resume_epoch..max_epochs {
-            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
+            let row_order = Self::shuffled_row_indices(tokenized_data.len(), epoch as u64);
             let metrics = match self.run_checkpoint_epoch(
                 &tokenized_data,
+                &row_order,
                 pad_token_id,
                 epoch,
                 max_epochs,

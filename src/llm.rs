@@ -570,13 +570,15 @@ impl LLM {
         }
     }
 
-    pub(crate) fn shuffle_training_rows<T>(rows: &mut [T], seed: u64) {
-        if rows.len() <= 1 {
-            return;
+    pub(crate) fn shuffled_row_indices(len: usize, seed: u64) -> Vec<usize> {
+        let mut indices: Vec<usize> = (0..len).collect();
+        if indices.len() <= 1 {
+            return indices;
         }
 
         let mut local_rng = StdRng::seed_from_u64(seed);
-        rows.shuffle(&mut local_rng);
+        indices.shuffle(&mut local_rng);
+        indices
     }
 
     /// 最基础的教学训练入口。
@@ -590,21 +592,22 @@ impl LLM {
 
         let pad_token_id = self.vocab.pad_token_id();
 
-        let mut tokenized_data = data
+        let tokenized_data = data
             .iter()
             // 教学要点：训练序列应包含 BOS/EOS，否则模型难以学会“什么时候结束”。
             .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
             .collect::<Vec<Vec<usize>>>();
 
         for epoch in 0..epochs {
-            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
+            let row_order = Self::shuffled_row_indices(tokenized_data.len(), epoch as u64);
             let decay_rate: f32 = 0.95;
             let decay_steps = 10.0;
             let current_lr = initial_lr * decay_rate.powf(epoch as f32 / decay_steps);
 
             // 训练指标口径：统一使用 token-weighted mean，避免短序列被隐式加权。
             let mut epoch_accumulator = EpochAccumulator::default();
-            for training_row in &tokenized_data {
+            for row_idx in &row_order {
+                let training_row = &tokenized_data[*row_idx];
                 if training_row.len() < 2 {
                     continue;
                 }
@@ -981,7 +984,7 @@ impl LLM {
         // - 早期版本的注释中提到“Rayon 并行 tokenization”，但当前仓库并未引入 rayon 依赖；
         // - 为避免教学误导，我们在这里采用明确的单线程实现，并保留计时监控。
         perf_monitor.start("tokenization_single_thread");
-        let mut tokenized_data: Vec<Vec<usize>> = data
+        let tokenized_data: Vec<Vec<usize>> = data
             .iter()
             // 训练序列必须包含 BOS/EOS（否则模型学不到“何时结束”）
             .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
@@ -1008,7 +1011,7 @@ impl LLM {
         let training_start_time = std::time::Instant::now();
 
         for epoch in 0..max_epochs {
-            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
+            let row_order = Self::shuffled_row_indices(tokenized_data.len(), epoch as u64);
             let epoch_start = std::time::Instant::now();
 
             // 🔥 余弦退火 + Warmup（禁用重启以提升稳定性）
@@ -1027,7 +1030,8 @@ impl LLM {
             // 每个 epoch 重新开始累积
             self.zero_grad_accum();
 
-            for training_row in &tokenized_data {
+            for row_idx in &row_order {
+                let training_row = &tokenized_data[*row_idx];
                 if training_row.len() < 2 {
                     continue;
                 }
@@ -1190,7 +1194,7 @@ impl LLM {
         let preprocess_start = std::time::Instant::now();
 
         // 先把所有训练文本转成带 BOS/EOS 的 token 序列。
-        let mut tokenized_data: Vec<Vec<usize>> = data
+        let tokenized_data: Vec<Vec<usize>> = data
             .iter()
             // 训练序列必须包含 BOS/EOS（否则模型学不到“何时结束”）
             .map(|input| Self::tokenize_training_with_vocab(&self.vocab, input))
@@ -1209,7 +1213,7 @@ impl LLM {
         let training_start_time = std::time::Instant::now();
 
         for epoch in 0..max_epochs {
-            Self::shuffle_training_rows(&mut tokenized_data, epoch as u64);
+            let row_order = Self::shuffled_row_indices(tokenized_data.len(), epoch as u64);
             let epoch_start = std::time::Instant::now();
 
             // 余弦退火 + Warmup
@@ -1221,7 +1225,11 @@ impl LLM {
             let mut epoch_accumulator = EpochAccumulator::default();
 
             // 创建训练批次
-            let training_batches = create_training_batches(&batch_loader, &tokenized_data);
+            let shuffled_rows: Vec<Vec<usize>> = row_order
+                .iter()
+                .map(|idx| tokenized_data[*idx].clone())
+                .collect();
+            let training_batches = create_training_batches(&batch_loader, &shuffled_rows);
 
             for (input_batch, targets) in training_batches {
                 // 跳过空批次
@@ -2412,6 +2420,35 @@ mod tests {
     }
 
     #[test]
+    fn shuffled_row_indices_are_resume_stable() {
+        let base: Vec<usize> = (0..6).collect();
+        let epoch_zero_order = LLM::shuffled_row_indices(base.len(), 0);
+        let epoch_one_direct: Vec<usize> = LLM::shuffled_row_indices(base.len(), 1)
+            .iter()
+            .map(|idx| base[*idx])
+            .collect();
+
+        let after_epoch_zero: Vec<usize> = epoch_zero_order.iter().map(|idx| base[*idx]).collect();
+        let epoch_one_stateful: Vec<usize> = LLM::shuffled_row_indices(after_epoch_zero.len(), 1)
+            .iter()
+            .map(|idx| after_epoch_zero[*idx])
+            .collect();
+
+        assert_eq!(
+            epoch_one_direct,
+            LLM::shuffled_row_indices(base.len(), 1)
+                .iter()
+                .map(|idx| base[*idx])
+                .collect::<Vec<_>>()
+        );
+        assert_ne!(
+            epoch_one_direct,
+            epoch_one_stateful,
+            "epoch permutations should be derived from the original sample order so resume stays reproducible"
+        );
+    }
+
+    #[test]
     fn train_monitored_accumulation_matches_manual_epoch_replay() {
         let texts = vec!["a".to_string(), "a b".to_string()];
         let vocab = Vocab::build_from_texts(&texts);
@@ -2422,11 +2459,11 @@ mod tests {
         let epochs = monitored.train_monitored(vec!["a", "a b"], 1, 0.05, 10, 2);
         assert_eq!(epochs, 1);
 
-        let mut tokenized_data: Vec<Vec<usize>> = ["a", "a b"]
+        let tokenized_data: Vec<Vec<usize>> = ["a", "a b"]
             .iter()
             .map(|input| LLM::tokenize_training_with_vocab(&manual.vocab, input))
             .collect();
-        LLM::shuffle_training_rows(&mut tokenized_data, 0);
+        let row_order = LLM::shuffled_row_indices(tokenized_data.len(), 0);
         let pad_token_id = manual.vocab.pad_token_id();
         let warmup_epochs = LLM::recommend_warmup_epochs(1);
         let current_lr = LLM::cosine_with_warmup_lr(0.05, 0, 1, 0, warmup_epochs);
@@ -2436,7 +2473,8 @@ mod tests {
         let mut accum_counter = 0usize;
         let mut accum_tokens = 0usize;
 
-        for training_row in &tokenized_data {
+        for row_idx in &row_order {
+            let training_row = &tokenized_data[*row_idx];
             let input_ids = &training_row[..training_row.len() - 1];
             let target_ids = &training_row[1..];
             let Some(mut step) = manual.prepare_training_step(input_ids, target_ids, pad_token_id)
@@ -2562,11 +2600,11 @@ mod tests {
         let epochs = monitored.train_monitored(vec!["a", "a b", "b"], 1, 0.05, 10, 2);
         assert_eq!(epochs, 1);
 
-        let mut tokenized_data: Vec<Vec<usize>> = ["a", "a b", "b"]
+        let tokenized_data: Vec<Vec<usize>> = ["a", "a b", "b"]
             .iter()
             .map(|input| LLM::tokenize_training_with_vocab(&manual.vocab, input))
             .collect();
-        LLM::shuffle_training_rows(&mut tokenized_data, 0);
+        let row_order = LLM::shuffled_row_indices(tokenized_data.len(), 0);
         let pad_token_id = manual.vocab.pad_token_id();
         let warmup_epochs = LLM::recommend_warmup_epochs(1);
         let current_lr = LLM::cosine_with_warmup_lr(0.05, 0, 1, 0, warmup_epochs);
@@ -2576,7 +2614,8 @@ mod tests {
         let mut accum_counter = 0usize;
         let mut accum_tokens = 0usize;
 
-        for training_row in &tokenized_data {
+        for row_idx in &row_order {
+            let training_row = &tokenized_data[*row_idx];
             let input_ids = &training_row[..training_row.len() - 1];
             let target_ids = &training_row[1..];
             let Some(mut step) = manual.prepare_training_step(input_ids, target_ids, pad_token_id)
